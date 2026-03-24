@@ -1,0 +1,29 @@
+# API server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+
+# Async HTTP client for LLM backends
+httpx>=0.28.0
+
+# Config and validation
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# Caching and rate limiting
+redis>=5.2.0
+
+# Retry and failover
+tenacity>=9.0.0
+
+# Observability
+prometheus-client>=0.21.0
+structlog>=24.4.0
+
+# Token counting
+tiktoken>=0.8.0
+
+# Environment config
+python-dotenv>=1.0.0
+
+# WebSocket support for dashboard
+websockets>=14.0
