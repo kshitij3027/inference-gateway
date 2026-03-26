@@ -33,14 +33,14 @@ def _mock_response():
 class TestAuthenticatedChatFlow:
     """Test the full auth flow through the real app."""
 
-    @patch("gateway.routes.chat.ollama.chat_completion", new_callable=AsyncMock)
-    async def test_valid_key_returns_200(self, mock_chat, client):
-        mock_chat.return_value = _mock_response()
-        resp = await client.post(
-            "/v1/chat/completions",
-            json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
-            headers={"Authorization": "Bearer test-alpha-key"},
-        )
+    async def test_valid_key_returns_200(self, client):
+        mock_chat = AsyncMock(return_value=_mock_response())
+        with patch.dict("gateway.routes.chat.TRANSLATORS", {"ollama": mock_chat}):
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer test-alpha-key"},
+            )
         assert resp.status_code == 200
         data = resp.json()
         assert data["choices"][0]["message"]["content"] == "Hello!"
@@ -62,26 +62,28 @@ class TestAuthenticatedChatFlow:
         )
         assert resp.status_code == 401
 
-    @patch("gateway.routes.chat.ollama.chat_completion", new_callable=AsyncMock)
-    async def test_disallowed_model_returns_403(self, mock_chat, client):
+    async def test_disallowed_model_returns_403(self, client):
         """tenant-alpha only has tinyllama in allowed_models."""
-        resp = await client.post(
-            "/v1/chat/completions",
-            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
-            headers={"Authorization": "Bearer test-alpha-key"},
-        )
+        mock_chat = AsyncMock(return_value=_mock_response())
+        with patch.dict("gateway.routes.chat.TRANSLATORS", {"ollama": mock_chat}):
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer test-alpha-key"},
+            )
         assert resp.status_code == 403
         assert "not allowed" in resp.json()["detail"]
         mock_chat.assert_not_called()
 
-    @patch("gateway.routes.chat.ollama.chat_completion", new_callable=AsyncMock)
-    async def test_wildcard_tenant_passes_auth(self, mock_chat, client):
+    async def test_wildcard_tenant_passes_auth(self, client):
         """tenant-beta has allowed_models: ["*"], should pass auth but get 404 for unknown model."""
-        resp = await client.post(
-            "/v1/chat/completions",
-            json={"model": "nonexistent-model", "messages": [{"role": "user", "content": "Hi"}]},
-            headers={"Authorization": "Bearer test-beta-key"},
-        )
+        mock_chat = AsyncMock(return_value=_mock_response())
+        with patch.dict("gateway.routes.chat.TRANSLATORS", {"ollama": mock_chat}):
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "nonexistent-model", "messages": [{"role": "user", "content": "Hi"}]},
+                headers={"Authorization": "Bearer test-beta-key"},
+            )
         # Auth passes (wildcard), but no backend serves this model -> 404
         assert resp.status_code == 404
         assert "No backend available" in resp.json()["detail"]

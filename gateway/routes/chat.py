@@ -4,12 +4,20 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from gateway.auth import get_current_tenant
+from gateway.backends import anthropic as anthropic_backend
 from gateway.backends import ollama
+from gateway.backends import openai as openai_backend
 from gateway.config import TenantConfig
 from gateway.models import ChatCompletionRequest, ChatCompletionResponse
 
 router = APIRouter()
 logger = structlog.get_logger()
+
+TRANSLATORS = {
+    "ollama": ollama.chat_completion,
+    "openai": openai_backend.chat_completion,
+    "anthropic": anthropic_backend.chat_completion,
+}
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -34,18 +42,27 @@ async def chat_completions(
             detail=f"No backend available for model: {chat_request.model}",
         )
 
+    # Dispatch to provider-specific translator
+    translator = TRANSLATORS.get(backend.provider)
+    if translator is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported provider: {backend.provider}",
+        )
+
     logger.info(
         "chat_request_received",
         model=chat_request.model,
         tenant_id=tenant.id,
         backend=backend.name,
+        provider=backend.provider,
         message_count=len(chat_request.messages),
     )
 
     start = time.perf_counter()
-    result = await ollama.chat_completion(
+    result = await translator(
         client=request.app.state.http_client,
-        base_url=backend.base_url,
+        backend=backend,
         request=chat_request,
     )
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -55,6 +72,7 @@ async def chat_completions(
         model=chat_request.model,
         tenant_id=tenant.id,
         backend=backend.name,
+        provider=backend.provider,
         prompt_tokens=result.usage.prompt_tokens,
         completion_tokens=result.usage.completion_tokens,
         duration_ms=duration_ms,
