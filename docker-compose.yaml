@@ -6,8 +6,12 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - CONFIG_PATH=config/backends.yaml
       - LOG_LEVEL=info
+      - TENANT_ALPHA_KEY=test-alpha-key
+      - TENANT_BETA_KEY=test-beta-key
+    volumes:
+      - ./config:/app/config:ro
     depends_on:
       ollama:
         condition: service_started

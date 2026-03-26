@@ -10,7 +10,15 @@ def anyio_backend():
 
 
 @pytest.fixture
-async def client():
+def test_env(monkeypatch):
+    """Set environment variables required by the gateway app."""
+    monkeypatch.setenv("TENANT_ALPHA_KEY", "test-alpha-key")
+    monkeypatch.setenv("TENANT_BETA_KEY", "test-beta-key")
+    monkeypatch.setenv("CONFIG_PATH", "config/backends.yaml")
+
+
+@pytest.fixture
+async def client(test_env):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
