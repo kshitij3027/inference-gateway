@@ -1,0 +1,40 @@
+[project]
+name = "inference-gateway"
+version = "0.1.0"
+description = "High-performance LLM inference gateway proxy"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "redis>=5.2.0",
+    "tenacity>=9.0.0",
+    "prometheus-client>=0.21.0",
+    "structlog>=24.4.0",
+    "tiktoken>=0.8.0",
+    "python-dotenv>=1.0.0",
+    "websockets>=14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-httpx>=0.35.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

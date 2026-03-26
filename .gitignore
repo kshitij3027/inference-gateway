@@ -26,7 +26,10 @@ env/
 
 # Claude
 .claude/skills/
+.claude/plans/
 InferenceGateway_PRD.md
+InferenceGateway_Breakdown.md
+SYSTEM_OVERVIEW.md
 
 # OS
 .DS_Store

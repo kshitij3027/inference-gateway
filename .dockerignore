@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.env
+.env.*
+.claude/
+.vscode/
+.idea/
+.DS_Store
+*.md
+!requirements.txt
+InferenceGateway_*.md
+AGENTS.md
+CLAUDE.md
