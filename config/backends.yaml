@@ -1,0 +1,23 @@
+backends:
+  - name: ollama-local
+    provider: ollama
+    base_url: http://ollama:11434
+    models:
+      - tinyllama
+    weight: 1
+    max_concurrent: 5
+    timeout_ms: 120000
+
+tenants:
+  - id: tenant-alpha
+    name: Alpha Corp
+    api_key_env: TENANT_ALPHA_KEY
+    allowed_models:
+      - tinyllama
+    priority: 1
+  - id: tenant-beta
+    name: Beta Corp
+    api_key_env: TENANT_BETA_KEY
+    allowed_models:
+      - "*"
+    priority: 2
