@@ -10,6 +10,8 @@ services:
       - LOG_LEVEL=info
       - TENANT_ALPHA_KEY=test-alpha-key
       - TENANT_BETA_KEY=test-beta-key
+      - OPENAI_API_KEY=test-openai-key
+      - ANTHROPIC_API_KEY=test-anthropic-key
     volumes:
       - ./config:/app/config:ro
     depends_on:
@@ -17,6 +19,10 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      mock-openai-1:
+        condition: service_started
+      mock-anthropic-1:
+        condition: service_started
     restart: unless-stopped
 
   ollama:
@@ -37,6 +43,46 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  mock-openai-1:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9001:3000"
+
+  mock-openai-2:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9002:3000"
+
+  mock-openai-3:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9003:3000"
+
+  mock-openai-4:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9004:3000"
+
+  mock-openai-5:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9005:3000"
+
+  mock-anthropic-1:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9006:3000"
+
+  mock-anthropic-2:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9007:3000"
+
+  mock-anthropic-3:
+    image: zerob13/mock-openai-api:latest
+    ports:
+      - "9008:3000"
 
 volumes:
   ollama_data:

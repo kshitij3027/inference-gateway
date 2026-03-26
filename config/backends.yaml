@@ -8,12 +8,34 @@ backends:
     max_concurrent: 5
     timeout_ms: 120000
 
+  - name: mock-openai-1
+    provider: openai
+    base_url: http://mock-openai-1:3000
+    api_key_env: OPENAI_API_KEY
+    models:
+      - mock-gpt-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-anthropic-1
+    provider: anthropic
+    base_url: http://mock-anthropic-1:3000/anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    models:
+      - mock-claude-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
 tenants:
   - id: tenant-alpha
     name: Alpha Corp
     api_key_env: TENANT_ALPHA_KEY
     allowed_models:
       - tinyllama
+      - mock-gpt-markdown
+      - mock-claude-markdown
     priority: 1
   - id: tenant-beta
     name: Beta Corp

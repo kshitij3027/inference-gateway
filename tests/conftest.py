@@ -15,6 +15,8 @@ def test_env(monkeypatch):
     monkeypatch.setenv("TENANT_ALPHA_KEY", "test-alpha-key")
     monkeypatch.setenv("TENANT_BETA_KEY", "test-beta-key")
     monkeypatch.setenv("CONFIG_PATH", "config/backends.yaml")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
 
 
 @pytest.fixture
