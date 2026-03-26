@@ -78,3 +78,43 @@ class OllamaResponse(BaseModel):
     prompt_eval_duration: int | None = None
     eval_count: int | None = None
     eval_duration: int | None = None
+
+
+# --- Anthropic internal models ---
+
+
+class AnthropicContentBlock(BaseModel):
+    type: str = "text"
+    text: str
+
+
+class AnthropicMessage(BaseModel):
+    role: str
+    content: list[AnthropicContentBlock]
+
+
+class AnthropicRequest(BaseModel):
+    model: str
+    messages: list[AnthropicMessage]
+    system: str | None = None
+    max_tokens: int = 4096
+    temperature: float | None = None
+    top_p: float | None = None
+    stop_sequences: list[str] | None = None
+
+
+class AnthropicUsage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+
+
+class AnthropicResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    type: str = "message"
+    role: str = "assistant"
+    content: list[AnthropicContentBlock]
+    model: str
+    stop_reason: str | None = None
+    usage: AnthropicUsage
