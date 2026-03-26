@@ -8,6 +8,7 @@ import structlog
 from fastapi import FastAPI, Request, Response
 
 from gateway.observability.logging import setup_logging
+from gateway.routes.chat import router as chat_router
 from gateway.routes.health import router as health_router
 
 setup_logging(log_level=os.getenv("LOG_LEVEL", "info"))
@@ -25,6 +26,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Inference Gateway", lifespan=lifespan)
 app.include_router(health_router)
+app.include_router(chat_router)
 
 
 @app.middleware("http")
