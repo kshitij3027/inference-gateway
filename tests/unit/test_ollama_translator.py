@@ -6,6 +6,7 @@ from gateway.backends.ollama import (
     translate_request,
     translate_response,
 )
+from gateway.config import BackendConfig
 from gateway.models import (
     ChatCompletionRequest,
     ChatMessage,
@@ -112,7 +113,13 @@ class TestChatCompletion:
             messages=[ChatMessage(role="user", content="Hello")],
         )
 
-        result = await chat_completion(client, "http://ollama:11434", req)
+        backend = BackendConfig(
+            name="ollama-local",
+            provider="ollama",
+            base_url="http://ollama:11434",
+            models=["tinyllama"],
+        )
+        result = await chat_completion(client, backend, req)
         assert result.model == "tinyllama"
         assert result.choices[0].message.content == "Hello!"
         assert result.usage.prompt_tokens == 8
@@ -129,8 +136,14 @@ class TestChatCompletion:
             messages=[ChatMessage(role="user", content="Hello")],
         )
 
+        backend = BackendConfig(
+            name="ollama-local",
+            provider="ollama",
+            base_url="http://ollama:11434",
+            models=["tinyllama"],
+        )
         with pytest.raises(Exception) as exc_info:
-            await chat_completion(client, "http://ollama:11434", req)
+            await chat_completion(client, backend, req)
         assert exc_info.value.status_code == 504
         await client.aclose()
 
@@ -144,8 +157,14 @@ class TestChatCompletion:
             messages=[ChatMessage(role="user", content="Hello")],
         )
 
+        backend = BackendConfig(
+            name="ollama-local",
+            provider="ollama",
+            base_url="http://ollama:11434",
+            models=["tinyllama"],
+        )
         with pytest.raises(Exception) as exc_info:
-            await chat_completion(client, "http://ollama:11434", req)
+            await chat_completion(client, backend, req)
         assert exc_info.value.status_code == 500
         await client.aclose()
 
@@ -159,7 +178,13 @@ class TestChatCompletion:
             messages=[ChatMessage(role="user", content="Hello")],
         )
 
+        backend = BackendConfig(
+            name="ollama-local",
+            provider="ollama",
+            base_url="http://ollama:11434",
+            models=["tinyllama"],
+        )
         with pytest.raises(Exception) as exc_info:
-            await chat_completion(client, "http://ollama:11434", req)
+            await chat_completion(client, backend, req)
         assert exc_info.value.status_code == 502
         await client.aclose()

@@ -5,6 +5,7 @@ import structlog
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from gateway.config import BackendConfig
 from gateway.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -64,7 +65,9 @@ def translate_response(ollama_response: OllamaResponse, model: str) -> ChatCompl
 
 
 async def chat_completion(
-    client: httpx.AsyncClient, base_url: str, request: ChatCompletionRequest
+    client: httpx.AsyncClient,
+    backend: BackendConfig,
+    request: ChatCompletionRequest,
 ) -> ChatCompletionResponse:
     """Send a chat completion request to Ollama and return OpenAI-format response."""
     ollama_request = translate_request(request)
@@ -72,17 +75,17 @@ async def chat_completion(
     start = time.perf_counter()
     try:
         response = await client.post(
-            f"{base_url}/api/chat",
+            f"{backend.base_url}/api/chat",
             json=ollama_request.model_dump(exclude_none=True),
         )
         response.raise_for_status()
     except httpx.TimeoutException:
-        logger.error("ollama_timeout", base_url=base_url, model=request.model)
+        logger.error("ollama_timeout", base_url=backend.base_url, model=request.model)
         raise HTTPException(status_code=504, detail="Backend request timed out")
     except httpx.HTTPStatusError as e:
         logger.error(
             "ollama_error",
-            base_url=base_url,
+            base_url=backend.base_url,
             model=request.model,
             status_code=e.response.status_code,
         )
