@@ -809,3 +809,167 @@ Consistent hashing solves this by distributing requests across backends proporti
 
 **Q: "How does the ring handle weighted backends?"**
 **A:** Weight maps directly to virtual node count. A weight-1 backend gets 150 virtual nodes; a weight-3 backend gets 450. Because virtual nodes are uniformly distributed by the hash function, a backend with 3x the virtual nodes occupies approximately 3x the ring arc and receives approximately 3x the traffic. This is validated in the unit test `test_weight_proportional_distribution`, which verifies that a weight-3 node in a `(1, 3)` ring receives 70-80% of 10,000 sample keys (expected: 75%).
+
+## Circuit Breaker & Failover
+
+### Why this exists
+
+Without circuit breakers, a dead backend causes repeated failures until it is manually removed from the configuration. Every request that the hash ring routes to the unhealthy backend fails, and the gateway dutifully forwards the error to the client. With consistent hashing, the problem is worse: the routing key `tenant_id:model` is deterministic, so the same tenant always hits the same backend. If that backend is down, that specific tenant experiences 100% failure rate while other tenants on healthy backends are fine. The gateway has no mechanism to detect that a backend is unhealthy, exclude it from routing, or resume traffic once it recovers.
+
+Circuit breakers solve this by tracking per-backend failure rates in a rolling window, tripping to OPEN when the error rate exceeds a threshold, excluding OPEN backends from the hash ring via the `exclude` parameter designed into Phase 5, probing for recovery after a cooldown period with exponential backoff, and resuming traffic automatically when a probe succeeds. Combined with a retry loop that accumulates an exclude set per request, the gateway can fail over to the next clockwise node on the ring within the same request -- the client sees a successful response even when one backend is down.
+
+### How it works
+
+1. Each backend has a `CircuitBreaker` instance with three states: `CLOSED`, `OPEN`, and `HALF_OPEN`.
+2. **CLOSED** (normal operation): All requests flow through to the backend. Every request outcome (success or failure) is recorded in a rolling window -- a `deque` of `(timestamp, success_bool)` tuples. Entries older than 60 seconds are pruned via `popleft()` on each `_should_trip()` check.
+3. **Trip condition**: When the failure rate reaches 50% or higher (`failure_threshold=0.5`) with at least 10 requests in the window (`min_requests=10`), the breaker transitions from `CLOSED` to `OPEN`. The `min_requests` guard prevents a single failure from tripping the breaker on low-traffic backends.
+4. **OPEN** (backend excluded): The `CircuitBreakerRegistry.get_open_backends()` method calls `allow_request()` on each breaker and returns the names of those that deny requests. This `frozenset` is passed to `registry.find_backend_for_model(model, routing_key=routing_key, exclude=exclude)`, which calls `ring.get_node(routing_key, exclude=exclude)`. The hash ring walks clockwise past the excluded backend's virtual nodes to the next healthy backend, so traffic that was destined for the failed backend shifts to the next clockwise neighbor.
+5. **Cooldown with exponential backoff**: After the initial cooldown period (30 seconds), the breaker transitions from `OPEN` to `HALF_OPEN` on the next `allow_request()` call. If the probe fails, the cooldown doubles: 30s, 60s, 120s, 240s, capping at 300s (`max_cooldown`). If the probe succeeds, the cooldown resets to the initial 30s.
+6. **HALF_OPEN** (one probe allowed): Exactly one request is permitted through to the backend. The `_half_open_probe_sent` flag prevents concurrent probes. If the probe succeeds (`record_success()`), the breaker transitions back to `CLOSED` and the cooldown resets. If it fails (`record_failure()`), the breaker transitions back to `OPEN` with a doubled cooldown.
+7. **Non-streaming retry loop**: The route handler in `gateway/routes/chat.py` runs a `for attempt in range(3)` loop. On each iteration, it calls `find_backend_for_model` with the current `exclude` set. If the backend returns a 5xx or raises `httpx.ConnectError`, the failure is recorded on the circuit breaker, the backend name is added to `exclude` via `exclude = exclude | {backend.name}`, and the loop continues. The next iteration routes to a different backend because the failed one is now in the exclude set. If all attempts exhaust or no backend is available, the last error is raised (or 404 if no backend was found).
+8. **Streaming path**: Streaming requests do not use the retry loop (retrying a partially-consumed stream is not feasible). Instead, the route handler wraps the async generator with `_wrap_stream_with_circuit_breaker()`, which monitors the stream for errors. If the stream contains `"stream_error"` in any SSE data line, or if the generator raises an exception, `record_failure()` is called in the `finally` block. Otherwise, `record_success()` is called. This ensures the circuit breaker learns from streaming outcomes.
+9. **All backends OPEN**: If `find_backend_for_model` returns `None` (the hash ring has no non-excluded nodes), the route handler raises `HTTPException(503, "All backends unavailable for this model")`.
+
+### Implementation
+
+**CircuitBreaker class** (`gateway/circuit_breaker.py: CircuitBreaker`):
+- Constructor parameters: `backend_name`, `window_size=60.0` (seconds), `failure_threshold=0.5` (50%), `min_requests=10`, `cooldown=30.0` (initial), `max_cooldown=300.0` (cap).
+- `_requests: deque[tuple[float, bool]]` -- rolling window of `(monotonic_timestamp, is_success)` tuples. Uses `deque` for O(1) `popleft()` during pruning.
+- `allow_request() -> bool` -- returns `True` if CLOSED, `True` for one probe if OPEN and cooldown expired (triggers HALF_OPEN transition), `True` for one probe if HALF_OPEN and `_half_open_probe_sent` is `False`, `False` otherwise.
+- `record_success()` -- appends `(time.monotonic(), True)` to the window. If HALF_OPEN, transitions to CLOSED and resets cooldown to `_initial_cooldown`.
+- `record_failure()` -- appends `(time.monotonic(), False)`. If HALF_OPEN, doubles `_current_cooldown` (capped at `max_cooldown`), resets `_half_open_probe_sent`, and transitions to OPEN. If CLOSED, calls `_should_trip()`.
+- `_should_trip() -> bool` -- calls `_prune_window()`, checks `len(self._requests) >= min_requests`, then computes `failures / total >= failure_threshold`.
+- `_prune_window()` -- pops entries where `timestamp <= time.monotonic() - window_size` from the left of the deque.
+- `_transition(new_state)` -- sets `self.state`, records `_opened_at = time.monotonic()` if transitioning to OPEN, logs `circuit_state_change` with old state, new state, and current cooldown.
+- `snapshot() -> dict` -- prunes the window and returns `{"state", "error_rate", "requests_in_window", "current_cooldown_s"}` for the admin endpoint.
+
+**CircuitBreakerRegistry class** (`gateway/circuit_breaker.py: CircuitBreakerRegistry`):
+- `__init__(backend_names, **kwargs)` -- creates a `CircuitBreaker` for each backend name. `kwargs` are forwarded to the `CircuitBreaker` constructor (used in tests to override thresholds).
+- `get(backend_name) -> CircuitBreaker | None` -- returns the breaker for a specific backend.
+- `get_open_backends() -> frozenset[str]` -- iterates all breakers, calls `allow_request()` on each, returns names of those that return `False`. The side effect of `allow_request()` is intentional: calling it on an OPEN breaker past its cooldown triggers the HALF_OPEN transition (passive probing).
+- `get_all_snapshots() -> dict[str, dict]` -- returns `snapshot()` for every breaker, used by the admin endpoint.
+- `sync_backends(backend_names)` -- adds breakers for new backends, removes breakers for removed backends, preserves state for existing backends. Called on config reload (SIGHUP and `POST /admin/reload`).
+
+**Non-streaming retry loop** (`gateway/routes/chat.py: chat_completions()`):
+- Lines 112-205: initializes `exclude = cb_registry.get_open_backends()` and `last_error = None`.
+- `for attempt in range(3)`: calls `find_backend_for_model(model, routing_key=routing_key, exclude=exclude)`. If `None`, breaks out of the loop.
+- On `HTTPException` with `status_code >= 500`: calls `cb.record_failure()`, adds backend to exclude via `exclude = exclude | {backend.name}`, stores `last_error`, logs `backend_failed_trying_next`, and `continue`s.
+- On `httpx.ConnectError`: same pattern -- `record_failure()`, extend exclude, store `last_error` as a 502, log `backend_connect_failed`, and `continue`.
+- On 4xx `HTTPException`: re-raised immediately (not a backend failure).
+- After the loop: raises `last_error` if set, otherwise raises 404.
+
+**Streaming circuit breaker wrapper** (`gateway/routes/chat.py: _wrap_stream_with_circuit_breaker()`):
+- Wraps an async generator. Iterates through all chunks, checking each for `'"stream_error"'` substring. In the `finally` block, calls `record_failure()` if any error was detected, otherwise `record_success()`.
+- The route handler passes the raw streaming generator and the `CircuitBreaker` instance to this wrapper, then wraps the result in `StreamingResponse`.
+
+**Lifespan initialization** (`gateway/main.py: lifespan()`):
+- Line 36-38: `app.state.circuit_breakers = CircuitBreakerRegistry(list(app.state.registry.backends.keys()))` -- creates breakers for all backends at startup.
+- Line 46-47: `app.state.circuit_breakers.sync_backends(list(app.state.registry.backends.keys()))` -- called inside `handle_sighup()` on config reload.
+
+**Admin endpoint** (`gateway/routes/admin.py: list_backends()`):
+- Line 48-49: retrieves `cb_registry` from `app.state`, calls `get_all_snapshots()`.
+- Lines 51-60: each backend in the response includes `"health": cb_snapshots.get(b.name, {}).get("state", "unknown")` and `"circuit_breaker": cb_snapshots.get(b.name, {})` containing `state`, `error_rate`, `requests_in_window`, and `current_cooldown_s`.
+
+**Config reload** (`gateway/routes/admin.py: reload_config()` and `gateway/main.py: handle_sighup()`):
+- Both call `app.state.circuit_breakers.sync_backends(list(new_registry.backends.keys()))` after swapping the registry. This preserves circuit breaker state for existing backends while adding breakers for new backends (starting CLOSED) and removing breakers for deleted backends.
+
+### Key design decisions
+
+1. **In-memory state, not Redis.** Each gateway instance maintains its own circuit breaker state. In a multi-instance deployment, instances have independent views of backend health. This is acceptable because a backend that is truly down will fail on all instances -- they all trip independently, with slight timing divergence. The alternative (Redis-shared state) adds latency to every request (reading and writing CB state) and introduces a dependency on Redis availability for the core routing path. If Redis is down, the gateway cannot make routing decisions. In-memory state has zero additional latency and no external dependencies.
+
+2. **Rolling window with deque for efficient pruning.** The `_requests` deque stores timestamped outcomes. Since entries are appended in monotonic order, expired entries are always at the front. `_prune_window()` calls `popleft()` in a `while` loop -- O(k) where k is the number of expired entries, typically a small number per call. A fixed-size counter (e.g., "last 10 requests") would lose temporal information -- 10 failures over 60 seconds is different from 10 failures over 1 second. The rolling window captures both the rate and recency of failures.
+
+3. **Exponential backoff on probe failure (30s to 300s cap).** A backend that fails its first probe is unlikely to recover in another 30 seconds. Doubling the cooldown (30s, 60s, 120s, 240s, 300s cap) reduces probe frequency for persistently unhealthy backends, preventing the gateway from repeatedly sending traffic to a backend that is clearly not recovering. The cap at 300 seconds (5 minutes) ensures that even the worst case recovers eventually -- the backend is never permanently excluded. When a probe succeeds, the cooldown resets to 30s, so a recovered backend quickly returns to full service.
+
+4. **Passive probing, no background thread.** The breaker transitions from OPEN to HALF_OPEN when the next real request calls `allow_request()` after the cooldown expires. There is no background health check thread. This is simpler (no thread management, no additional backend load from health probes) and sufficient for the gateway's traffic patterns -- if a backend is in the routing path, there will be requests that trigger the probe. The tradeoff is that a backend with zero traffic (e.g., serving a model nobody is currently requesting) stays in whatever state it is in until a request arrives.
+
+5. **`time.monotonic()` for all timestamps.** `time.monotonic()` is immune to system clock adjustments (NTP corrections, manual changes, daylight saving). Using `time.time()` would risk incorrect cooldown calculations if the system clock jumps backward (cooldown appears to not have elapsed) or forward (cooldown expires prematurely). All timestamps in the circuit breaker -- window entries, `_opened_at`, and pruning cutoffs -- use `monotonic()`.
+
+6. **Retry loop with exclude accumulation for within-request failover.** The non-streaming path retries up to 3 times, accumulating failed backends in the `exclude` set on each iteration. This means a single client request can transparently fail over through up to 3 backends. The exclude set starts with `cb_registry.get_open_backends()` (already-tripped breakers) and grows as new failures are discovered. This combines proactive exclusion (known-bad backends) with reactive exclusion (just-failed backends) in the same request.
+
+7. **`sync_backends()` preserves state on config reload.** When config is reloaded, `sync_backends()` compares the current breaker set with the new backend names. Existing backends keep their `CircuitBreaker` instances (and their state -- OPEN, CLOSED, window data, cooldown). New backends get fresh breakers starting in CLOSED. Removed backends have their breakers deleted. This prevents a config reload from resetting a tripped circuit breaker, which would immediately send traffic back to a backend that was just failing.
+
+8. **`_half_open_probe_sent` flag prevents concurrent probes.** In HALF_OPEN state, only one request should probe the backend. Without this flag, multiple concurrent `allow_request()` calls could all see HALF_OPEN and all return `True`, sending multiple probes simultaneously. The flag is set to `True` on the first `allow_request()` that returns `True` in HALF_OPEN, and subsequent calls return `False`. The flag is reset on `record_success()` (transition to CLOSED) or `record_failure()` (transition to OPEN).
+
+9. **Streaming error detection via `"stream_error"` substring check.** The `_wrap_stream_with_circuit_breaker()` wrapper checks each SSE chunk for the `'"stream_error"'` substring. This matches the error event format established in Phase 4 (streaming normalization), where backend errors during streaming are emitted as `data: {"error": {"message": "...", "type": "stream_error"}}`. The substring check is deliberately simple -- it avoids JSON parsing every chunk for performance.
+
+### Alternatives considered
+
+1. **Active health checks (background thread) vs passive probing.** Active health checks would send periodic requests to a health endpoint on each backend (e.g., `GET /health`). This detects failures faster (no waiting for a real request to trigger the probe) and can detect unhealthy backends that are not currently receiving traffic. However, it adds complexity (thread management, health endpoint configuration per provider, additional backend load from probes) and is unnecessary for the gateway's use case -- backends in the routing path always have traffic to trigger passive probes. Active health checks also require knowledge of each provider's health endpoint, which varies (Ollama: `GET /`, OpenAI: none, Anthropic: none).
+
+2. **Redis-shared circuit breaker state vs in-memory.** Sharing CB state across gateway instances via Redis would ensure all instances have the same view of backend health, eliminating the window where one instance has tripped a breaker but others have not yet. However, this adds a Redis read/write on every request (to check and update CB state), increasing latency. It also makes the circuit breaker dependent on Redis availability -- if Redis is down, the gateway cannot determine backend health. Since a truly failing backend will trip breakers on all instances independently (just with slight timing differences), the convergence time is acceptable. The slight divergence is a feature, not a bug: it provides natural load spreading during transitions.
+
+3. **Simple retry without circuit breaker state.** A retry loop without circuit breaker state would try the next backend on failure, but it would not remember which backends are unhealthy across requests. Every request would start by trying the same (potentially dead) backend, fail, then retry. The circuit breaker's OPEN state means subsequent requests skip the known-bad backend entirely, avoiding the wasted first attempt. This is the difference between O(1) routing to a healthy backend and O(k) retries where k is the number of unhealthy backends.
+
+4. **Fixed cooldown vs exponential backoff.** A fixed 30-second cooldown would probe the backend at a constant rate regardless of how many probes have failed. If the backend is down for 10 minutes, it would receive 20 probe requests (one every 30 seconds), each of which fails and adds latency for one client. Exponential backoff with a 300-second cap means the same 10-minute outage receives approximately 7 probes (at 30s, 60s, 120s, 240s, 300s, 300s, 300s). Fewer probes mean fewer clients experience the probe-failure latency.
+
+### Failure modes and edge cases
+
+- **All backends OPEN for a model.** `find_backend_for_model` returns `None` because the hash ring's `get_node()` cannot find a non-excluded node. The non-streaming path raises `HTTPException(503, "All backends unavailable for this model")`. The streaming path raises the same 503 before returning `StreamingResponse`, so the client receives a proper HTTP error status (not a 200 with an error in the body).
+- **HALF_OPEN probe fails.** `record_failure()` doubles `_current_cooldown` (up to `max_cooldown=300`), resets `_half_open_probe_sent`, and transitions back to OPEN. The next probe attempt occurs after the doubled cooldown. The client that served as the probe receives the error (5xx or ConnectError) and, in the non-streaming path, the retry loop tries the next backend.
+- **`httpx.ConnectError` before any response bytes.** Caught in the retry loop's `except httpx.ConnectError` block. `record_failure()` is called, the backend is added to the exclude set, and the loop continues with the next attempt. The client is unaware of the failed attempt if the next backend succeeds.
+- **Mid-stream error.** The `_wrap_stream_with_circuit_breaker()` wrapper detects the error (via `"stream_error"` substring or raised exception) and calls `record_failure()` in the `finally` block. The client receives the partial stream followed by the error SSE event. There is no retry for streaming -- retrying would require re-sending the entire request and discarding the partial stream the client already received.
+- **Config reload while backends are OPEN.** `sync_backends()` preserves existing breaker instances. An OPEN breaker for `mock-openai-1` stays OPEN through the reload. If the backend is removed from config, its breaker is deleted (the backend no longer exists, so no breaker is needed). If a new backend is added, it starts CLOSED.
+- **Split-brain across gateway instances.** In a multi-instance deployment, each instance has independent CB state. Instance A may have `mock-openai-1` OPEN while Instance B still has it CLOSED (because B received fewer failures or started later). This is acceptable: Instance B will trip its own breaker after accumulating enough failures. The convergence time is bounded by the rolling window size (60 seconds) and the min_requests threshold (10 requests). During the divergence window, some traffic from Instance B still hits the unhealthy backend, but the retry loop provides per-request failover.
+- **Low-traffic backend never reaches `min_requests`.** If a backend receives fewer than 10 requests in the 60-second window, the breaker never trips regardless of the failure rate. This prevents false positives on backends with sporadic traffic -- 2 failures out of 3 requests is a 67% failure rate, but it could be transient. The `min_requests` threshold ensures that the breaker only acts on statistically meaningful sample sizes.
+- **Clock skew with `time.monotonic()`.** Not an issue -- `time.monotonic()` is per-process and monotonically increasing. It cannot jump backward or be affected by NTP. The only scenario where it misbehaves is if the process is suspended (e.g., `SIGSTOP`) for longer than the window size, in which case old entries would still be in the deque but would be pruned on the next `_prune_window()` call.
+
+### Observability
+
+**Structured log events:**
+- `circuit_state_change` -- logged on every state transition with `backend`, `old_state`, `new_state`, and `current_cooldown`. Enables operators to track breaker state changes across backends and correlate them with incident timelines.
+- `backend_failed_trying_next` -- logged in the retry loop when a backend returns 5xx. Includes `backend`, `status_code`, and `attempt` number.
+- `backend_connect_failed` -- logged when `httpx.ConnectError` occurs. Includes `backend` and `attempt` number.
+
+**Admin endpoint** (`GET /admin/backends`):
+- Each backend includes a `circuit_breaker` object with `state` (CLOSED/OPEN/HALF_OPEN), `error_rate` (float, 0.0-1.0), `requests_in_window` (int), and `current_cooldown_s` (float). The top-level `health` field mirrors the `state` value for quick scanning.
+- Operators can poll this endpoint to monitor backend health across the fleet. Example: `curl /admin/backends | jq '.[] | select(.health != "CLOSED")'` shows all unhealthy backends.
+
+**Request-level logging:**
+- `chat_request_received` and `chat_request_completed` log events include `backend` name, enabling per-backend traffic analysis and failure correlation.
+- The `X-Backend` response header (from Phase 5) shows which backend ultimately handled the request, including after failover.
+
+### Testing
+
+**Unit tests -- circuit breaker** (`tests/unit/test_circuit_breaker.py`, 19 tests):
+- `TestCircuitBreakerTransitions` (9 tests): starts CLOSED, stays CLOSED below threshold (4 failures out of 10 = 40%), trips to OPEN at threshold (5 failures out of 10 = 50%), does not trip below `min_requests` (5 failures out of 5), `allow_request()` returns `False` when OPEN, transitions to HALF_OPEN after cooldown (mocked `time.monotonic`), HALF_OPEN success transitions to CLOSED, HALF_OPEN failure transitions back to OPEN, HALF_OPEN allows only one probe (`_half_open_probe_sent` flag).
+- `TestExponentialBackoff` (3 tests): cooldown doubles on repeated HALF_OPEN failure (30 -> 60 -> 120), cooldown caps at `max_cooldown` (30 -> 60 -> 120 -> 240 -> 300 -> 300), cooldown resets to initial on HALF_OPEN success (60 -> 30).
+- `TestRollingWindow` (1 test): entries older than `window_size` are pruned by `_prune_window()` (10 entries at t=0, all gone at t=61).
+- `TestCircuitBreakerRegistry` (6 tests): `get_open_backends` returns names of tripped breakers, `get_all_snapshots` returns snapshot for every breaker, `sync_backends` adds new backends, `sync_backends` removes stale backends, `sync_backends` preserves existing state, `snapshot` includes state/error_rate/requests_in_window/current_cooldown_s.
+
+**Integration tests -- circuit breaker** (`tests/integration/test_circuit_breaker.py`, 7 tests):
+- `TestNonStreamingFailover` (3 tests): failover to next backend on 5xx (first call raises 500, second succeeds, client sees 200), failover on `httpx.ConnectError` (same pattern), 503 when all backends fail (always_fail mock, response status >= 500).
+- `TestStreamingCircuitBreaker` (2 tests): streaming records success on circuit breaker (mock stream completes normally, response is 200 with `text/event-stream`), streaming error records failure (mock stream emits `stream_error` event, circuit breaker `record_failure` is called).
+- `TestAdminCircuitState` (2 tests): `GET /admin/backends` includes `health` and `circuit_breaker` fields with correct structure, circuit breaker state reflects failures after making requests that fail.
+
+**E2E (Docker):**
+- `docker compose stop mock-openai-2` followed by requests to `mock-gpt-markdown` from a tenant that normally routes to `mock-openai-2`. After enough failures to trip the breaker, subsequent requests return the `X-Backend` header showing a different backend (e.g., `mock-openai-3`). `docker compose start mock-openai-2` followed by waiting for cooldown expiry shows the breaker transitioning back to CLOSED and traffic returning to `mock-openai-2`.
+
+### Production gaps
+
+- **No distributed circuit breaker state.** Each gateway instance maintains independent CB state. In a multi-instance deployment, there is a convergence window where instances disagree on backend health. A centralized CB state store (Redis, etcd) would eliminate this divergence but adds latency and an availability dependency.
+- **No active health probes.** The circuit breaker relies on real traffic to detect failures. A backend that serves a low-traffic model could stay in OPEN state for a long time before a request triggers the HALF_OPEN probe. Active health checks (background thread pinging each backend) would detect recovery faster.
+- **No Prometheus metrics.** Circuit breaker state changes, error rates, and failover events are logged but not exported as Prometheus metrics. Phase 10 adds `circuit_breaker_state` gauge, `circuit_breaker_trip_total` counter, and `failover_total` counter.
+- **No admin endpoint to manually open/close circuits.** Operators cannot force a backend into OPEN state (for maintenance) or force it back to CLOSED (to override a false positive). A `POST /admin/backends/{name}/circuit` endpoint with `{"state": "OPEN"}` or `{"state": "CLOSED"}` would enable manual intervention.
+- **No per-backend timeout configuration.** The circuit breaker uses the same `window_size`, `failure_threshold`, `min_requests`, and `cooldown` for all backends. In production, different backends may have different reliability profiles -- a flaky backend might need a lower threshold while a stable one could tolerate a higher one. Per-backend CB configuration in `backends.yaml` would address this.
+- **Streaming does not retry.** If the first backend fails during streaming, the client receives a partial stream with an error event. There is no mechanism to retry the stream on a different backend. This is inherent to HTTP streaming -- once bytes are sent, they cannot be unsent.
+
+### Interview talking points
+
+- **Why circuit breaker over simple retry.** Simple retry without state means every request starts by trying the same dead backend, wastes an attempt, then falls through to a healthy backend. The circuit breaker's OPEN state remembers that the backend is unhealthy, so subsequent requests skip it entirely -- O(1) routing to a healthy backend instead of O(k) retries through k dead backends. The breaker also gives the backend time to recover by reducing probe frequency via exponential backoff, rather than hammering it with retries.
+- **Three-state model and why HALF_OPEN exists.** HALF_OPEN is the safe path back to healthy. Without it, the breaker would have to choose between staying OPEN forever (never recovering) or jumping directly from OPEN to CLOSED (sending full traffic to a possibly-still-broken backend). HALF_OPEN allows exactly one probe request. If it succeeds, the backend is likely healthy and full traffic resumes. If it fails, the backend stays excluded with a longer cooldown. This single-probe approach avoids the thundering herd problem where a recovered backend is suddenly hit with 100% of its traffic before it has fully warmed up.
+- **Interaction with consistent hashing.** The circuit breaker and hash ring are composed, not coupled. The breaker produces an exclude set; the ring's `get_node(key, exclude=...)` walks clockwise past excluded nodes to the next healthy backend. The ring does not know about circuit breakers, and the breaker does not know about hash rings. This separation means either component can be replaced or modified independently. The `exclude` parameter was designed into the ring in Phase 5 specifically to enable this composition.
+
+### Likely interview questions
+
+**Q: "What happens during the cooldown period?"**
+**A:** All requests to that model that would have been routed to the failed backend are instead routed to the next clockwise node on the hash ring. The `get_open_backends()` call returns the failed backend's name, which is passed to `find_backend_for_model(exclude=...)`, and the ring's `get_node()` skips past its virtual nodes. The failed backend receives zero traffic until the cooldown expires and a probe request is allowed through. If the probe succeeds, the breaker closes and traffic resumes. If it fails, the cooldown doubles and the backend stays excluded for longer.
+
+**Q: "Why in-memory and not distributed state?"**
+**A:** Each gateway instance has its own view of backend health. A backend that is truly down will fail on all instances, so they all trip their breakers independently -- the timing differs by at most the window size (60 seconds) plus the min_requests threshold (10 requests at whatever the request rate is). The slight divergence in timing is acceptable because the retry loop provides per-request failover even before the breaker trips. The alternative -- Redis-shared state -- adds a Redis read/write on the critical path of every request and makes the routing layer dependent on Redis availability. If Redis is down, the gateway cannot determine which backends are healthy. In-memory state has zero additional latency, zero external dependencies, and convergence time measured in seconds.
+
+**Q: "How does the exponential backoff prevent thundering herd on recovery?"**
+**A:** When a backend recovers, the first probe request in HALF_OPEN succeeds and the breaker closes. Traffic resumes to that backend gradually because only requests whose routing key maps to that backend (approximately 1/N of total traffic) start flowing to it. There is no sudden redirect of all traffic. The exponential backoff during the outage means fewer probes hit the recovering backend (7 probes over 10 minutes instead of 20), giving it more time to stabilize. When the breaker closes, the cooldown resets to 30 seconds, so if the backend fails again, the probing starts at a reasonable frequency rather than at the escalated interval.
+
+**Q: "What happens if a circuit breaker is stuck OPEN due to a transient issue that resolved?"**
+**A:** The circuit breaker cannot get permanently stuck. After the current cooldown period expires (at most 300 seconds / 5 minutes), `allow_request()` transitions to HALF_OPEN and allows one probe. If the issue has resolved, the probe succeeds, the breaker closes, and traffic resumes. The maximum time a backend can be excluded after a transient issue is the current cooldown period -- in the worst case, 300 seconds. There is no mechanism for permanent exclusion; the exponential backoff always caps and the probe always fires eventually.
