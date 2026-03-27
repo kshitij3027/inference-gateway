@@ -1,5 +1,8 @@
+import json
 import os
 import time
+import uuid
+from collections.abc import AsyncGenerator
 
 import httpx
 import structlog
@@ -155,3 +158,90 @@ async def chat_completion(
     )
 
     return result
+
+
+async def stream_chat_completion(
+    client: httpx.AsyncClient,
+    backend: BackendConfig,
+    request: ChatCompletionRequest,
+) -> AsyncGenerator[str, None]:
+    """Stream chat completion from Anthropic, translating SSE events to OpenAI SSE format."""
+    from gateway.models import ChatCompletionChunk, ChunkChoice, ChunkDelta
+
+    body, headers = translate_request(request, backend)
+    body["stream"] = True
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    # First chunk: announce role
+    first_chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=request.model,
+        choices=[ChunkChoice(delta=ChunkDelta(role="assistant"))],
+    )
+    yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+    finish_reason = "stop"
+
+    try:
+        async with client.stream(
+            "POST",
+            f"{backend.base_url}/v1/messages",
+            json=body,
+            headers=headers,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = data.get("type", "")
+
+                if event_type == "content_block_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            chunk = ChatCompletionChunk(
+                                id=chunk_id,
+                                created=created,
+                                model=request.model,
+                                choices=[ChunkChoice(delta=ChunkDelta(content=text))],
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+
+                elif event_type == "message_delta":
+                    stop_reason = data.get("delta", {}).get("stop_reason", "")
+                    if stop_reason:
+                        finish_reason = STOP_REASON_MAP.get(stop_reason, "stop")
+
+                elif event_type == "message_stop":
+                    break
+
+    except httpx.HTTPStatusError as e:
+        logger.error("anthropic_stream_error", status_code=e.response.status_code)
+        error_data = {"error": {"message": f"Backend error: {e.response.status_code}", "type": "stream_error"}}
+        yield f"data: {json.dumps(error_data)}\n\n"
+    except Exception as e:
+        logger.error("anthropic_stream_error", error=str(e))
+        error_data = {"error": {"message": str(e), "type": "stream_error"}}
+        yield f"data: {json.dumps(error_data)}\n\n"
+
+    # Final chunk with finish_reason
+    final_chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=request.model,
+        choices=[ChunkChoice(delta=ChunkDelta(), finish_reason=finish_reason)],
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
