@@ -15,6 +15,25 @@ from gateway.models import ChatCompletionRequest, ChatCompletionResponse
 router = APIRouter()
 logger = structlog.get_logger()
 
+
+async def _wrap_stream_with_circuit_breaker(gen, circuit_breaker):
+    """Wrap a streaming generator to record circuit breaker outcomes."""
+    error_detected = False
+    try:
+        async for chunk in gen:
+            if not error_detected and '"stream_error"' in chunk:
+                error_detected = True
+            yield chunk
+    except Exception:
+        error_detected = True
+        raise
+    finally:
+        if circuit_breaker:
+            if error_detected:
+                circuit_breaker.record_failure()
+            else:
+                circuit_breaker.record_success()
+
 TRANSLATORS = {
     "ollama": ollama.chat_completion,
     "openai": openai_backend.chat_completion,
@@ -45,15 +64,17 @@ async def chat_completions(
     registry = request.app.state.registry
     routing_key = f"{tenant.id}:{chat_request.model}"
 
-    # Streaming path — single-attempt lookup (failover added later)
+    # Streaming path with circuit breaker wrapper
     if chat_request.stream:
+        cb_registry = request.app.state.circuit_breakers
+        exclude = cb_registry.get_open_backends()
         backend = registry.find_backend_for_model(
-            chat_request.model, routing_key=routing_key
+            chat_request.model, routing_key=routing_key, exclude=exclude
         )
         if backend is None:
             raise HTTPException(
-                status_code=404,
-                detail=f"No backend available for model: {chat_request.model}",
+                status_code=503,
+                detail="All backends unavailable for this model",
             )
 
         request.state.backend_name = backend.name
@@ -75,12 +96,15 @@ async def chat_completions(
             message_count=len(chat_request.messages),
         )
 
+        cb = cb_registry.get(backend.name)
+        raw_gen = stream_translator(
+            client=request.app.state.http_client,
+            backend=backend,
+            request=chat_request,
+        )
+
         return StreamingResponse(
-            stream_translator(
-                client=request.app.state.http_client,
-                backend=backend,
-                request=chat_request,
-            ),
+            _wrap_stream_with_circuit_breaker(raw_gen, cb),
             media_type="text/event-stream",
         )
 

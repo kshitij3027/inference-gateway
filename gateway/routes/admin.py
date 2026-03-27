@@ -43,14 +43,18 @@ async def ring_state(request: Request):
 
 @router.get("/backends")
 async def list_backends(request: Request):
-    """List all registered backends."""
+    """List all registered backends with circuit breaker state."""
     registry = request.app.state.registry
+    cb_registry = getattr(request.app.state, "circuit_breakers", None)
+    cb_snapshots = cb_registry.get_all_snapshots() if cb_registry else {}
+
     return [
         {
             "name": b.name,
             "provider": b.provider,
             "models": b.models,
-            "health": "unknown",
+            "health": cb_snapshots.get(b.name, {}).get("state", "unknown"),
+            "circuit_breaker": cb_snapshots.get(b.name, {}),
         }
         for b in registry.backends.values()
     ]

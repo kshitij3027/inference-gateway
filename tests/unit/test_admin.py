@@ -50,7 +50,9 @@ class TestListBackends:
         assert data[0]["name"] == "test-backend"
         assert data[0]["provider"] == "ollama"
         assert data[0]["models"] == ["tinyllama"]
-        assert data[0]["health"] == "unknown"
+        assert data[0]["health"] == "CLOSED"
+        assert "circuit_breaker" in data[0]
+        assert data[0]["circuit_breaker"]["state"] == "CLOSED"
 
 
 class TestReloadConfig:
