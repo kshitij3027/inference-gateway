@@ -1,4 +1,7 @@
+import json
 import time
+import uuid
+from collections.abc import AsyncGenerator
 
 import httpx
 import structlog
@@ -7,10 +10,13 @@ from pydantic import ValidationError
 
 from gateway.config import BackendConfig
 from gateway.models import (
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessageResponse,
     Choice,
+    ChunkChoice,
+    ChunkDelta,
     OllamaMessage,
     OllamaRequest,
     OllamaResponse,
@@ -113,3 +119,82 @@ async def chat_completion(
     )
 
     return result
+
+
+async def stream_chat_completion(
+    client: httpx.AsyncClient,
+    backend: BackendConfig,
+    request: ChatCompletionRequest,
+) -> AsyncGenerator[str, None]:
+    """Stream chat completion from Ollama, translating NDJSON to OpenAI SSE format."""
+    ollama_request = translate_request(request)
+    ollama_request.stream = True
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    # First chunk: announce role
+    first_chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=request.model,
+        choices=[ChunkChoice(delta=ChunkDelta(role="assistant"))],
+    )
+    yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+    try:
+        async with client.stream(
+            "POST",
+            f"{backend.base_url}/api/chat",
+            json=ollama_request.model_dump(exclude_none=True),
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+
+                data = json.loads(line)
+                content = data.get("message", {}).get("content", "")
+                done = data.get("done", False)
+
+                if content:
+                    chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=request.model,
+                        choices=[ChunkChoice(delta=ChunkDelta(content=content))],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+                if done:
+                    final_chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=request.model,
+                        choices=[
+                            ChunkChoice(delta=ChunkDelta(), finish_reason="stop")
+                        ],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    break
+
+    except httpx.HTTPStatusError as e:
+        logger.error("ollama_stream_error", status_code=e.response.status_code)
+        error_data = {
+            "error": {
+                "message": f"Backend error: {e.response.status_code}",
+                "type": "stream_error",
+            }
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
+    except Exception as e:
+        logger.error("ollama_stream_error", error=str(e))
+        error_data = {
+            "error": {
+                "message": str(e),
+                "type": "stream_error",
+            }
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
+
+    yield "data: [DONE]\n\n"
