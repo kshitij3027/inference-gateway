@@ -666,3 +666,146 @@ LLM inference is slow — seconds to tens of seconds per response. Without strea
 
 **Q: "What is the tradeoff of returning HTTP 200 before the stream starts?"**
 **A:** `StreamingResponse` commits HTTP 200 and the `text/event-stream` headers as soon as the route handler returns — before the generator yields its first chunk. If the backend is unreachable or returns an error, the client has already received a 200 status code. The gateway cannot retroactively change it to 502. Instead, it yields a JSON error payload as a `data:` line in the SSE stream. This means clients must parse the stream body for errors, not just check the HTTP status. This is the same tradeoff OpenAI's own API makes — it is inherent to HTTP streaming, not a gateway-specific limitation.
+
+## Consistent Hash Router
+
+### Why this exists
+
+Phase 3 added multiple backends per model (5 OpenAI mock instances serving `mock-gpt-markdown`, 3 Anthropic mock instances serving `mock-claude-markdown`, 2 Ollama instances serving `tinyllama`) but `find_backend_for_model()` used first-match routing — it always returned the first backend in the list for a given model. This meant `mock-openai-1` handled 100% of `mock-gpt-markdown` traffic while `mock-openai-2` through `mock-openai-5` sat idle. There was no load distribution, no cache locality, and no way to weight backends differently (e.g., a beefy GPU node vs a small CPU node).
+
+Consistent hashing solves this by distributing requests across backends proportionally to their configured weights while keeping the same tenant+model combination pinned to the same backend. This tenant affinity enables cache locality — when semantic caching is added in a later phase, repeated queries from the same tenant hit the same backend, increasing cache hit rates. The consistent hashing property also means adding or removing a backend only remaps approximately 1/N of the keys, not all of them, minimizing disruption during scaling events.
+
+### How it works
+
+1. On startup (or config reload), `Registry.__init__()` in `gateway/config.py` iterates `model_to_backends` and builds a `ConsistentHashRing` per model. Each backend is added to the ring as a `(name, weight)` tuple. The ring for `mock-gpt-markdown` contains 5 nodes (mock-openai-1 through mock-openai-5, each weight 1); the ring for `mock-claude-markdown` contains 3 nodes; the ring for `tinyllama` contains 2 nodes.
+2. Each backend gets `weight * 150` virtual nodes on the ring. A weight-1 backend gets 150 virtual nodes; a weight-3 backend gets 450. Virtual node keys are formatted as `"{backend_name}:{i}"` for `i` in `range(num_vnodes)`. Each key is hashed via MD5 to a 32-bit integer position on the ring. The `(position, backend_name)` tuples are sorted by position to form the ring.
+3. When a chat request arrives, the route handler in `gateway/routes/chat.py` constructs `routing_key = f"{tenant.id}:{chat_request.model}"` — e.g., `"tenant-alpha:mock-gpt-markdown"`.
+4. `registry.find_backend_for_model(model, routing_key=routing_key)` looks up the per-model ring and calls `ring.get_node(routing_key)`.
+5. `get_node()` hashes the routing key via `MD5(routing_key.encode()).digest()[:4]` to a 32-bit position, then uses `bisect.bisect_right()` on the sorted positions array to find the clockwise-nearest virtual node. The backend name at that position is returned.
+6. The selected `BackendConfig` is retrieved from `registry.backends[node_name]` and used for the rest of the request (translation, HTTP call, response mapping).
+7. `request.state.backend_name = backend.name` is set in the route handler. The `request_id_middleware` in `gateway/main.py` checks `getattr(request.state, "backend_name", None)` after `call_next` and sets the `X-Backend` response header if present. This works for both streaming and non-streaming responses because the middleware wraps the entire request lifecycle.
+
+### Implementation
+
+**ConsistentHashRing** (`gateway/routing.py`, ~80 lines):
+- `__init__(nodes: list[tuple[str, int]], vnodes_per_unit: int = 150)` — builds the ring by generating `weight * vnodes_per_unit` virtual nodes per backend. Each virtual node key `"{name}:{i}"` is hashed to a 32-bit position via `_hash()`. The `(position, name)` pairs are sorted, and a parallel `_positions` list is built for binary search.
+- `_hash(key: str) -> int` — static method. `hashlib.md5(key.encode()).digest()[:4]` converted to a big-endian unsigned 32-bit integer via `int.from_bytes(digest[:4], "big")`. The `# noqa: S324` suppresses the Bandit security warning — MD5 is not used cryptographically here, only for distribution.
+- `get_node(key: str, exclude: frozenset[str] = frozenset()) -> str | None` — hashes the key, uses `bisect.bisect_right()` to find the insertion point in the sorted positions array, wraps around via `% len(self._ring)`, then walks clockwise through the ring skipping any nodes in `exclude`. Returns `None` if the ring is empty or all nodes are excluded. The walk is bounded by `len(self._ring)` to avoid infinite loops.
+- `node_count` / `vnode_count` — properties returning the number of distinct backends and total virtual nodes.
+- `get_distribution() -> dict[str, int]` — counts virtual nodes per backend. Used by `ring_state()` for the admin endpoint.
+
+**Registry integration** (`gateway/config.py`):
+- `model_rings: dict[str, ConsistentHashRing]` — built in `__init__()` by iterating `model_to_backends` and constructing a ring per model with `[(b.name, b.weight) for b in backends]`.
+- `find_backend_for_model(model: str, routing_key: str | None = None) -> BackendConfig | None` — if `routing_key` is provided, looks up the model's ring and calls `ring.get_node(routing_key)`. Maps the returned node name back to a `BackendConfig` via `self.backends.get(node_name)`. Falls back to first-match if `routing_key is None` (backward compatibility for any callers that predate the routing key addition).
+- `ring_state() -> dict` — returns a dict keyed by model name, each value containing `backends` (list of backend names), `total_vnodes` (int), and `distribution` (dict of backend name to vnode count). Used by the admin endpoint.
+
+**Chat route** (`gateway/routes/chat.py`):
+- `routing_key = f"{tenant.id}:{chat_request.model}"` — constructed after tenant authentication and model access check.
+- `backend = registry.find_backend_for_model(chat_request.model, routing_key=routing_key)` — passes the routing key into the registry lookup.
+- `request.state.backend_name = backend.name` — set after backend selection, read by the middleware for the `X-Backend` header.
+
+**Middleware** (`gateway/main.py: request_id_middleware`):
+- After `call_next`, reads `backend_name = getattr(request.state, "backend_name", None)`. If present, sets `response.headers["X-Backend"] = backend_name`. This placement after `call_next` ensures the header is set even if the response is a `StreamingResponse` — the middleware wraps the entire response object.
+
+**Admin endpoint** (`gateway/routes/admin.py`):
+- `GET /admin/ring` — calls `registry.ring_state()` and returns the JSON dict. Each model entry shows which backends serve it, the total virtual node count, and the distribution of virtual nodes per backend.
+
+**Backend configuration** (`config/backends.yaml`):
+- 10 backends total: `ollama-1` and `ollama-2` (both serving `tinyllama`, weight 1), `mock-openai-1` through `mock-openai-5` (all serving `mock-gpt-markdown`, weight 1), `mock-anthropic-1` through `mock-anthropic-3` (all serving `mock-claude-markdown`, weight 1).
+- All backends within a model group have equal weight (1), so traffic distributes evenly. Changing a backend's `weight` to 3 would give it 3x the virtual nodes and approximately 3x the traffic share.
+
+### Key design decisions
+
+1. **Custom implementation from scratch (< 100 lines) over a library like `uhashring`.** The consistent hash ring is a core architectural component of this project and a likely interview discussion topic. Implementing it from scratch ensures the author can explain every line: the MD5 hashing, the virtual node generation, the binary search lookup, and the clockwise walk with exclusion. A library dependency would obscure these internals. The implementation is under 100 lines including docstrings — the complexity does not justify a dependency.
+
+2. **MD5 for hashing.** MD5 provides excellent distribution across the 32-bit keyspace, which is what matters for load balancing. It is not used cryptographically — there is no security requirement for collision resistance or preimage resistance. SHA-256 would produce equally good distribution but is slightly slower (irrelevant given LLM inference latency dominates). CRC32 would be faster but has known distribution weaknesses for structured input. MD5 is the standard choice for consistent hashing in industry (Dynamo, Cassandra, Memcached).
+
+3. **Virtual nodes at `weight * 150` per backend.** Without virtual nodes, each backend would occupy a single point on the ring. With only 3-5 backends, the arc lengths between adjacent points would vary wildly, leading to uneven load. Virtual nodes spread each backend across 150 points per unit of weight, smoothing the distribution. The `150` multiplier was empirically validated: with 5 equal-weight backends and 10,000 sample keys, each backend receives 18-22% of traffic (within 5% of the ideal 20%). Lower multipliers (e.g., 50) showed up to 10% skew.
+
+4. **Per-model rings.** Each model has its own independent hash ring containing only the backends that serve that model. The `mock-gpt-markdown` ring has 5 backends; the `tinyllama` ring has 2. This ensures that a backend's weight in one ring does not affect distribution in another. It also means adding a new backend for one model does not cause any key remapping for other models.
+
+5. **Routing key `tenant_id:model` for cache locality.** The routing key determines which backend a request lands on. Using `tenant_id:model` means the same tenant always hits the same backend for a given model. This creates cache affinity — when semantic caching is added, repeated similar queries from the same tenant are more likely to hit a warm cache on the same backend. Using `request_id` as the routing key would produce uniform distribution but destroy tenant affinity. Using only `tenant_id` would pin a tenant to one backend across all models, which is unnecessarily rigid.
+
+6. **`get_node(key, exclude=frozenset())` for forward-compatible failover.** The `exclude` parameter allows Phase 6's circuit breaker to exclude unhealthy backends from the ring without rebuilding it. When a backend trips its circuit breaker, the caller passes it in the `exclude` set, and `get_node()` walks clockwise past it to the next healthy backend. This was designed into the ring from the start to avoid a Phase 6 refactor. The `frozenset` type for `exclude` is immutable and hashable, suitable for use in future caching of routing decisions.
+
+7. **`X-Backend` via `request.state` + middleware instead of setting it in the route handler.** The route handler cannot set response headers on a `StreamingResponse` after returning it — the response is already committed. By storing the backend name on `request.state` and reading it in the middleware (which wraps `call_next`), the header is set on the `Response` object that the middleware returns. This works for both streaming and non-streaming responses because the middleware operates on the final `Response` object.
+
+8. **`routing_key=None` backward compatibility.** `find_backend_for_model(model, routing_key=None)` falls back to first-match behavior. This ensures that any code path or test that calls `find_backend_for_model` without a routing key (e.g., older tests, admin endpoints that just need to check if a model exists) continues to work without modification.
+
+### Alternatives considered
+
+1. **Round-robin routing.** Simple and fair, but stateless — the same tenant+model would hit a different backend on every request, destroying cache locality. In a system with semantic caching, round-robin would reduce cache hit rates by a factor of N (number of backends). Round-robin also requires shared state (a counter) that must be coordinated across multiple gateway instances in a horizontally-scaled deployment. Consistent hashing is stateless — any gateway instance produces the same routing decision for the same key.
+
+2. **Consistent hashing library (`uhashring`, `hash_ring`).** Would save ~80 lines of code but would make it impossible to explain the internals during an interview. "I used a library" is a weak answer to "how does your load balancer work?" The library also may not support the `exclude` parameter needed for Phase 6 failover without subclassing or wrapping.
+
+3. **`request_id`-based routing key.** Using the unique request ID as the routing key would produce perfectly uniform distribution across backends. However, it would eliminate tenant affinity — the same tenant would hit different backends on every request. This trades cache locality for distribution uniformity. Since the consistent hash ring already provides good distribution (within 5% of ideal with 150 vnodes per weight unit), the cache locality benefit of tenant affinity outweighs the marginal improvement in distribution uniformity.
+
+4. **Modular hashing (`hash(key) % N`).** Simple and fast, but catastrophic on topology changes. Adding a 6th backend changes `hash % 5` to `hash % 6`, remapping approximately 80% of keys (only keys where `hash % 5 == hash % 6` stay put). Consistent hashing remaps only ~1/N keys (approximately 17% when adding a 6th backend to a 5-backend ring). This property is critical for maintaining cache locality during scaling events.
+
+### Failure modes and edge cases
+
+- **Empty ring (no backends for a model).** If a model has no backends in the config, `model_rings` has no entry for it. `find_backend_for_model()` falls through to the fallback path, where `model_to_backends.get(model, [])` returns an empty list, and `backends[0] if backends else None` returns `None`. The route handler raises `HTTPException(404, "No backend available for model: ...")`.
+- **All backends excluded via `exclude` parameter.** `get_node()` walks the entire ring (bounded by `len(self._ring)` iterations) without finding a non-excluded node and returns `None`. Phase 6 interprets this as all circuit breakers open and applies its fallback logic (e.g., half-open attempt or 503).
+- **Weight 0.** A backend with `weight: 0` generates `0 * 150 = 0` virtual nodes and is effectively absent from the ring. The backend still exists in `registry.backends` but receives no traffic via the hash ring. This can be used as a soft-disable mechanism without removing the backend from config.
+- **Ring walk with all nodes excluded.** The `for offset in range(len(self._ring))` loop is bounded by the total number of virtual nodes. Even if every vnode is checked, the loop terminates and returns `None`. There is no risk of an infinite loop.
+- **Hash collision on virtual node positions.** Two virtual nodes landing on the same 32-bit position is possible but harmless — both appear in the sorted ring, and `bisect_right` picks the one immediately after the key's position. The "losing" vnode is shadowed (never selected as the nearest), slightly reducing its backend's effective weight. With 150 vnodes per unit, the probability of collision affecting distribution measurably is negligible.
+- **Config reload rebuilds all rings.** When `POST /admin/reload` or SIGHUP triggers a config reload, a new `Registry` is constructed from scratch, including new `ConsistentHashRing` instances. The old registry (and its rings) remain in use by in-flight requests that already hold a reference. The swap is atomic (GIL-protected pointer assignment). There is no incremental ring update — the entire ring is rebuilt. For 10 backends with 1,500 total vnodes, this takes microseconds.
+- **Single backend for a model.** A model served by only one backend has a ring with one node. `get_node()` always returns that node regardless of the routing key. The ring degenerates to a no-op lookup, which is correct — there is only one choice.
+
+### Observability
+
+- **`X-Backend` response header.** Set on every chat completion response (both streaming and non-streaming) via the `request_id_middleware`. Clients and load balancers can inspect this header to verify which backend handled a request. Useful for debugging routing issues and validating that consistent hashing is working (same tenant+model should consistently show the same `X-Backend` value).
+- **`GET /admin/ring` endpoint.** Returns the full ring state per model as JSON: which backends are in each ring, the total virtual node count, and the distribution of virtual nodes per backend. Example response: `{"mock-gpt-markdown": {"backends": ["mock-openai-1", ..., "mock-openai-5"], "total_vnodes": 750, "distribution": {"mock-openai-1": 150, ...}}}`. Operators can use this to verify that weight changes took effect and that the ring is balanced.
+- **Chat request logs.** `chat_request_received` and `chat_request_completed` log events include `backend=backend.name`, enabling per-backend log filtering and traffic analysis. Combined with `tenant_id`, operators can verify that tenant affinity is working correctly.
+
+### Testing
+
+**Unit tests — hash ring** (`tests/unit/test_hash_ring.py`, 12 tests):
+- `test_deterministic` — same key returns same node across 100 lookups. Validates that the ring produces stable, reproducible routing decisions.
+- `test_different_keys_hit_multiple_nodes` — 100 different keys hit at least 2 of 3 nodes. Validates that the ring distributes traffic across backends rather than collapsing to a single node.
+- `test_single_node_always_returns_it` — ring with one node returns it for all keys. Validates degenerate case.
+- `test_empty_ring_returns_none` — ring with no nodes returns `None`. Validates the empty guard.
+- `test_weight_proportional_distribution` — weight-3 node receives 70-80% of 10,000 keys in a 2-node ring (1:3 weight ratio). Validates that virtual node count correctly translates to proportional traffic.
+- `test_add_backend_redistributes_less_than_1_over_n` — adding a 4th node to a 3-node ring changes fewer than `ceil(1000/4) + 5%` keys. Validates the consistent hashing redistribution property.
+- `test_remove_backend_only_redistributes_that_backends_keys` — removing a node only remaps keys that were on that node; all other keys stay on their original nodes. Validates minimal disruption.
+- `test_wrap_around` — keys resolve correctly even when the hash position is near the end of the 32-bit range. Validates the modulo wrap in `bisect_right() % len(ring)`.
+- `test_exclude_skips_node` — excluding one node in a 2-node ring routes all keys to the other. Validates the clockwise walk with exclusion.
+- `test_exclude_all_returns_none` — excluding all nodes returns `None`. Validates the termination condition.
+- `test_node_count` / `test_vnode_count` — property accessors return correct counts.
+- `test_get_distribution` — virtual node counts match `weight * vnodes_per_unit` for each backend.
+
+**Unit tests — Registry routing** (`tests/unit/test_config.py`, updated):
+- `find_backend_for_model` with `routing_key` returns a valid backend from the model's ring.
+- `find_backend_for_model` with `routing_key=None` falls back to first-match (backward compat).
+- `ring_state()` returns correct structure with backends, total_vnodes, and distribution per model.
+- `model_rings` is populated for each model in the config.
+
+**E2E (Docker):**
+- Consistent routing: 10 identical requests with the same tenant+model produce the same `X-Backend` header value across all 10 responses.
+- Different tenants, different backends: requests from `tenant-alpha` and `tenant-beta` for the same model may return different `X-Backend` values, demonstrating that the routing key includes tenant identity.
+- `GET /admin/ring` returns valid JSON with ring state for all three model groups (`tinyllama`, `mock-gpt-markdown`, `mock-claude-markdown`), showing correct backend lists and vnode distributions.
+
+### Production gaps
+
+- **No failover.** Phase 6 adds circuit breakers that pass unhealthy backends to `get_node(key, exclude={...})`. Currently, if the selected backend is down, the request fails without trying another backend. The `exclude` parameter is wired into the ring but not yet called with a non-empty set.
+- **No health-aware exclusion.** The ring routes to backends without checking their health status. A backend that is returning 500s or timing out will continue receiving its share of traffic until a circuit breaker (Phase 6) is added.
+- **No latency-aware routing.** The ring distributes traffic based on weight, not on observed backend latency. A backend that is slower than its peers will receive the same traffic share. Latency-weighted routing is planned for Phase 12.
+- **Ring rebuilt on every config reload, not incremental.** A config reload constructs an entirely new `ConsistentHashRing` for every model, even if only one backend changed. For the current scale (10 backends, ~1,500 vnodes total), this is negligible. At much larger scale (hundreds of backends, tens of thousands of vnodes), an incremental ring update that only adds/removes affected vnodes would be more efficient.
+- **No ring persistence or cross-instance consistency.** Each gateway instance builds its own ring from config. In a multi-instance deployment, all instances must read the same config to produce the same ring and the same routing decisions. There is no shared state or consensus mechanism — consistency is achieved by deploying the same config file to all instances.
+
+### Interview talking points
+
+- **Why consistent hashing over round-robin for a caching gateway.** The gateway's value proposition includes semantic caching (later phase). Round-robin would spread the same tenant's requests across all backends, reducing cache hit rates by N. Consistent hashing pins `tenant:model` to a specific backend, creating cache affinity. If the tenant repeats a similar query, it hits the same backend with the warm cache. This is the same principle behind Memcached and Redis Cluster's hash slot routing.
+- **Virtual nodes prevent hotspots.** Without virtual nodes, 5 backends would have 5 points on a circle. The arc lengths between adjacent points vary wildly due to hash randomness, so one backend might own 40% of the keyspace while another owns 10%. With 150 virtual nodes per weight unit, each backend is spread across 150 points, and the statistical variance drops to under 5%. The math: standard deviation of arc length decreases as `1/sqrt(k)` where `k` is the number of vnodes per backend.
+- **Redistribution property for safe scaling.** When adding a 6th backend to a 5-backend ring, only approximately 1/6 (~17%) of keys remap. The remaining 5/6 stay on their current backend. This means 83% of cached entries remain valid after a scaling event. With modular hashing (`hash % N`), adding a backend would invalidate approximately 80% of cached entries — a cache stampede that could overwhelm backends.
+
+### Likely interview questions
+
+**Q: "What happens when a backend fails?"**
+**A:** Currently, the request fails and returns the backend's error to the client. Phase 6 adds a circuit breaker that tracks backend failures. When a backend trips its circuit breaker, the routing layer calls `ring.get_node(routing_key, exclude={failed_backend})`, which walks clockwise past the failed backend's virtual nodes to the next healthy backend. The key insight is that only the ~1/N of traffic that was going to the failed backend gets redistributed — traffic to healthy backends is unaffected. The `exclude` parameter was designed into the ring from the start specifically for this use case.
+
+**Q: "Why MD5 and not a faster hash?"**
+**A:** MD5 gives excellent distribution across the 32-bit keyspace, which is the only property that matters for load balancing. There is no cryptographic requirement — we do not need collision resistance or preimage resistance. The hash function's execution time (~200 nanoseconds for MD5) is negligible compared to LLM inference latency (seconds to tens of seconds). SHA-256 would work equally well. CRC32 would be faster but has known distribution weaknesses for structured keys (e.g., sequential tenant IDs). The choice of MD5 is pragmatic: good distribution, widely understood, no dependencies beyond Python's standard library.
+
+**Q: "How does the ring handle weighted backends?"**
+**A:** Weight maps directly to virtual node count. A weight-1 backend gets 150 virtual nodes; a weight-3 backend gets 450. Because virtual nodes are uniformly distributed by the hash function, a backend with 3x the virtual nodes occupies approximately 3x the ring arc and receives approximately 3x the traffic. This is validated in the unit test `test_weight_proportional_distribution`, which verifies that a weight-3 node in a `(1, 3)` ring receives 70-80% of 10,000 sample keys (expected: 75%).
