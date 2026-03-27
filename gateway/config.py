@@ -8,6 +8,8 @@ import structlog
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from gateway.routing import ConsistentHashRing
+
 logger = structlog.get_logger()
 
 
@@ -106,7 +108,41 @@ class Registry:
                 continue
             self.api_key_to_tenant[api_key] = tenant
 
-    def find_backend_for_model(self, model: str) -> BackendConfig | None:
-        """Return the first backend that serves the given model, or None."""
+        # Build per-model consistent hash rings
+        self.model_rings: dict[str, ConsistentHashRing] = {}
+        for model, backends in self.model_to_backends.items():
+            self.model_rings[model] = ConsistentHashRing(
+                [(b.name, b.weight) for b in backends]
+            )
+
+    def find_backend_for_model(
+        self, model: str, routing_key: str | None = None
+    ) -> BackendConfig | None:
+        """Find a backend for the given model.
+
+        If routing_key is provided, uses the consistent hash ring for
+        deterministic backend selection. Falls back to first match otherwise.
+        """
+        if routing_key is not None:
+            ring = self.model_rings.get(model)
+            if ring is not None:
+                node_name = ring.get_node(routing_key)
+                if node_name is not None:
+                    return self.backends.get(node_name)
+                return None
+
+        # Fallback: first match (backward compat)
         backends = self.model_to_backends.get(model, [])
         return backends[0] if backends else None
+
+    def ring_state(self) -> dict:
+        """Return hash ring state per model for admin endpoint."""
+        state = {}
+        for model, ring in self.model_rings.items():
+            backends_for_model = self.model_to_backends.get(model, [])
+            state[model] = {
+                "backends": [b.name for b in backends_for_model],
+                "total_vnodes": ring.vnode_count,
+                "distribution": ring.get_distribution(),
+            }
+        return state

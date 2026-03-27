@@ -268,3 +268,83 @@ class TestRegistry:
         reg = Registry(config)
         assert "key1" in reg.api_key_to_tenant
         assert len(reg.api_key_to_tenant) == 1  # t2 excluded
+
+    def test_find_backend_with_routing_key(self, monkeypatch):
+        """Same routing key always returns same backend."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = GatewayConfig.model_validate({
+            "backends": [
+                {
+                    "name": "ollama-1",
+                    "provider": "ollama",
+                    "base_url": "http://ollama-1:11434",
+                    "models": ["tinyllama"],
+                },
+                {
+                    "name": "ollama-2",
+                    "provider": "ollama",
+                    "base_url": "http://ollama-2:11434",
+                    "models": ["tinyllama"],
+                },
+            ],
+            "tenants": [{
+                "id": "t1",
+                "api_key_env": "T1_KEY",
+                "allowed_models": ["tinyllama"],
+            }],
+        })
+        reg = Registry(config)
+        # Same key -> same backend (deterministic)
+        results = {reg.find_backend_for_model("tinyllama", routing_key="tenant-a:tinyllama").name for _ in range(10)}
+        assert len(results) == 1
+
+    def test_find_backend_routing_key_none_falls_back(self, monkeypatch):
+        """routing_key=None falls back to first match."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = GatewayConfig.model_validate({
+            "backends": [
+                {
+                    "name": "first",
+                    "provider": "ollama",
+                    "base_url": "http://first:11434",
+                    "models": ["tinyllama"],
+                },
+                {
+                    "name": "second",
+                    "provider": "ollama",
+                    "base_url": "http://second:11434",
+                    "models": ["tinyllama"],
+                },
+            ],
+            "tenants": [{
+                "id": "t1",
+                "api_key_env": "T1_KEY",
+                "allowed_models": ["tinyllama"],
+            }],
+        })
+        reg = Registry(config)
+        result = reg.find_backend_for_model("tinyllama", routing_key=None)
+        assert result.name == "first"
+
+    def test_ring_state_returns_correct_structure(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        monkeypatch.setenv("T2_KEY", "key2")
+        config = self._make_config()
+        reg = Registry(config)
+        state = reg.ring_state()
+        # Should have entries for each model
+        assert "tinyllama" in state
+        assert "gpt-4o-mini" in state
+        assert "backends" in state["tinyllama"]
+        assert "total_vnodes" in state["tinyllama"]
+        assert "distribution" in state["tinyllama"]
+        assert state["tinyllama"]["total_vnodes"] > 0
+
+    def test_model_rings_built_for_each_model(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        monkeypatch.setenv("T2_KEY", "key2")
+        config = self._make_config()
+        reg = Registry(config)
+        # Should have a ring for each model in the config
+        for model in reg.model_to_backends:
+            assert model in reg.model_rings
