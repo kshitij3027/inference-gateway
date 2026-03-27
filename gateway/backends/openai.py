@@ -1,5 +1,8 @@
+import json
 import os
 import time
+import uuid
+from collections.abc import AsyncGenerator
 
 import httpx
 import structlog
@@ -118,3 +121,60 @@ async def chat_completion(
     )
 
     return result
+
+
+async def stream_chat_completion(
+    client: httpx.AsyncClient,
+    backend: BackendConfig,
+    request: ChatCompletionRequest,
+) -> AsyncGenerator[str, None]:
+    """Stream chat completion from OpenAI-compatible backend. Near-passthrough with ID replacement."""
+    body, headers = translate_request(request, backend)
+    body["stream"] = True  # Override to enable streaming
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    try:
+        async with client.stream(
+            "POST",
+            f"{backend.base_url}/v1/chat/completions",
+            json=body,
+            headers=headers,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
+
+                data_str = line[6:]  # Strip "data: " prefix
+                if data_str == "[DONE]":
+                    break
+
+                try:
+                    data = json.loads(data_str)
+                    # Replace backend ID with gateway-generated ID
+                    data["id"] = chunk_id
+                    data["created"] = created
+                    yield f"data: {json.dumps(data)}\n\n"
+                except json.JSONDecodeError:
+                    continue
+
+    except httpx.HTTPStatusError as e:
+        logger.error("openai_stream_error", status_code=e.response.status_code)
+        error_data = {
+            "error": {
+                "message": f"Backend error: {e.response.status_code}",
+                "type": "stream_error",
+            }
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
+    except Exception as e:
+        logger.error("openai_stream_error", error=str(e))
+        error_data = {"error": {"message": str(e), "type": "stream_error"}}
+        yield f"data: {json.dumps(error_data)}\n\n"
+
+    yield "data: [DONE]\n\n"
