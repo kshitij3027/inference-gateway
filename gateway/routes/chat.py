@@ -42,12 +42,15 @@ async def chat_completions(
 
     # Find backend for model
     registry = request.app.state.registry
-    backend = registry.find_backend_for_model(chat_request.model)
+    routing_key = f"{tenant.id}:{chat_request.model}"
+    backend = registry.find_backend_for_model(chat_request.model, routing_key=routing_key)
     if backend is None:
         raise HTTPException(
             status_code=404,
             detail=f"No backend available for model: {chat_request.model}",
         )
+
+    request.state.backend_name = backend.name
 
     # Streaming path
     if chat_request.stream:

@@ -31,6 +31,13 @@ async def reload_config(request: Request):
     }
 
 
+@router.get("/ring")
+async def ring_state(request: Request):
+    """Return consistent hash ring state per model."""
+    registry = request.app.state.registry
+    return registry.ring_state()
+
+
 @router.get("/backends")
 async def list_backends(request: Request):
     """List all registered backends."""

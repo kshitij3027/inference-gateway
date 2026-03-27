@@ -75,6 +75,9 @@ async def request_id_middleware(request: Request, call_next):
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
 
     response.headers["X-Request-ID"] = request_id
+    backend_name = getattr(request.state, "backend_name", None)
+    if backend_name:
+        response.headers["X-Backend"] = backend_name
     logger.info(
         "request_completed",
         method=request.method,
