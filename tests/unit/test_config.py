@@ -348,3 +348,47 @@ class TestRegistry:
         # Should have a ring for each model in the config
         for model in reg.model_to_backends:
             assert model in reg.model_rings
+
+    def test_find_backend_with_exclude(self, monkeypatch):
+        """Excluded backends are skipped."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = GatewayConfig.model_validate({
+            "backends": [
+                {"name": "a", "provider": "ollama", "base_url": "http://a:11434", "models": ["tinyllama"]},
+                {"name": "b", "provider": "ollama", "base_url": "http://b:11434", "models": ["tinyllama"]},
+            ],
+            "tenants": [{"id": "t1", "api_key_env": "T1_KEY", "allowed_models": ["tinyllama"]}],
+        })
+        reg = Registry(config)
+        # With routing_key and exclude
+        result = reg.find_backend_for_model("tinyllama", routing_key="t1:tinyllama", exclude=frozenset({"a"}))
+        assert result is not None
+        assert result.name == "b"
+
+    def test_find_backend_exclude_all_returns_none(self, monkeypatch):
+        """Excluding all backends returns None."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = GatewayConfig.model_validate({
+            "backends": [
+                {"name": "a", "provider": "ollama", "base_url": "http://a:11434", "models": ["tinyllama"]},
+                {"name": "b", "provider": "ollama", "base_url": "http://b:11434", "models": ["tinyllama"]},
+            ],
+            "tenants": [{"id": "t1", "api_key_env": "T1_KEY", "allowed_models": ["tinyllama"]}],
+        })
+        reg = Registry(config)
+        result = reg.find_backend_for_model("tinyllama", routing_key="t1:tinyllama", exclude=frozenset({"a", "b"}))
+        assert result is None
+
+    def test_find_backend_fallback_with_exclude(self, monkeypatch):
+        """Fallback path (no routing_key) also respects exclude."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = GatewayConfig.model_validate({
+            "backends": [
+                {"name": "first", "provider": "ollama", "base_url": "http://first:11434", "models": ["tinyllama"]},
+                {"name": "second", "provider": "ollama", "base_url": "http://second:11434", "models": ["tinyllama"]},
+            ],
+            "tenants": [{"id": "t1", "api_key_env": "T1_KEY", "allowed_models": ["tinyllama"]}],
+        })
+        reg = Registry(config)
+        result = reg.find_backend_for_model("tinyllama", exclude=frozenset({"first"}))
+        assert result.name == "second"

@@ -116,23 +116,33 @@ class Registry:
             )
 
     def find_backend_for_model(
-        self, model: str, routing_key: str | None = None
+        self,
+        model: str,
+        routing_key: str | None = None,
+        exclude: frozenset[str] = frozenset(),
     ) -> BackendConfig | None:
         """Find a backend for the given model.
 
         If routing_key is provided, uses the consistent hash ring for
         deterministic backend selection. Falls back to first match otherwise.
+
+        Args:
+            model: The model name to look up.
+            routing_key: Optional key for consistent hash routing.
+            exclude: Set of backend names to skip (for failover).
         """
         if routing_key is not None:
             ring = self.model_rings.get(model)
             if ring is not None:
-                node_name = ring.get_node(routing_key)
+                node_name = ring.get_node(routing_key, exclude=exclude)
                 if node_name is not None:
                     return self.backends.get(node_name)
                 return None
 
-        # Fallback: first match (backward compat)
-        backends = self.model_to_backends.get(model, [])
+        # Fallback: first match (backward compat), respecting exclude
+        backends = [
+            b for b in self.model_to_backends.get(model, []) if b.name not in exclude
+        ]
         return backends[0] if backends else None
 
     def ring_state(self) -> dict:
