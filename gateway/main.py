@@ -6,11 +6,13 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
+import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, Request, Response
 
 from gateway.circuit_breaker import CircuitBreakerRegistry
 from gateway.config import ConfigError, Registry, load_config
+from gateway.rate_limiter import RateLimiter
 from gateway.observability.logging import setup_logging
 from gateway.routes.admin import router as admin_router
 from gateway.routes.chat import router as chat_router
@@ -38,6 +40,18 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
+    # Redis + rate limiter (best-effort — gateway works without Redis)
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    try:
+        app.state.redis = aioredis.from_url(redis_url, decode_responses=True)
+        await app.state.redis.ping()
+        app.state.rate_limiter = RateLimiter(app.state.redis)
+        logger.info("redis_connected", url=redis_url)
+    except Exception as e:
+        logger.warning("redis_unavailable", error=str(e))
+        app.state.redis = None
+        app.state.rate_limiter = None
+
     # SIGHUP handler for hot-reload
     def handle_sighup(signum, frame):
         try:
@@ -61,6 +75,8 @@ async def lifespan(app: FastAPI):
         tenants=len(config.tenants),
     )
     yield
+    if getattr(app.state, "redis", None):
+        await app.state.redis.aclose()
     await app.state.http_client.aclose()
     logger.info("gateway_stopped")
 
@@ -76,6 +92,7 @@ async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(request_id=request_id)
+    request.state.request_id = request_id
 
     start = time.perf_counter()
     response: Response = await call_next(request)

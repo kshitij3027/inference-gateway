@@ -12,6 +12,7 @@ services:
       - TENANT_BETA_KEY=test-beta-key
       - OPENAI_API_KEY=test-openai-key
       - ANTHROPIC_API_KEY=test-anthropic-key
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./config:/app/config:ro
     depends_on:
