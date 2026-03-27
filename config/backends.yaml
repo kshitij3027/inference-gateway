@@ -106,6 +106,9 @@ tenants:
       - mock-gpt-markdown
       - mock-claude-markdown
     priority: 1
+    rate_limit_rps: 10
+    rate_limit_rpm: 60
+    token_budget_daily: 500
   - id: tenant-beta
     name: Beta Corp
     api_key_env: TENANT_BETA_KEY

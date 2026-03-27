@@ -102,6 +102,12 @@ async def request_id_middleware(request: Request, call_next):
     backend_name = getattr(request.state, "backend_name", None)
     if backend_name:
         response.headers["X-Backend"] = backend_name
+    rate_limit_remaining = getattr(request.state, "rate_limit_remaining", None)
+    if rate_limit_remaining:
+        if "rps" in rate_limit_remaining:
+            response.headers["X-Ratelimit-Remaining-Rps"] = str(rate_limit_remaining["rps"])
+        if "rpm" in rate_limit_remaining:
+            response.headers["X-Ratelimit-Remaining-Rpm"] = str(rate_limit_remaining["rpm"])
     logger.info(
         "request_completed",
         method=request.method,
