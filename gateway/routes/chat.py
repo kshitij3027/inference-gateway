@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import httpx
 import structlog
@@ -34,6 +35,7 @@ async def _wrap_stream_with_circuit_breaker(gen, circuit_breaker):
             else:
                 circuit_breaker.record_success()
 
+
 TRANSLATORS = {
     "ollama": ollama.chat_completion,
     "openai": openai_backend.chat_completion,
@@ -53,6 +55,56 @@ async def chat_completions(
     request: Request,
     tenant: TenantConfig = Depends(get_current_tenant),
 ) -> ChatCompletionResponse:
+    # Rate limit check (after auth, before routing)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    rate_limiter = getattr(request.app.state, "rate_limiter", None)
+    if rate_limiter is not None:
+        try:
+            allowed, deny_info = await rate_limiter.check_rate_limit(
+                tenant.id, request_id, tenant.rate_limit_rps, tenant.rate_limit_rpm
+            )
+            if not allowed:
+                logger.warning("rate_limit_exceeded", tenant_id=tenant.id, **deny_info)
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "rate_limit_exceeded",
+                        "type": deny_info["limit_type"],
+                        "limit": deny_info["limit"],
+                        "current": deny_info["current"],
+                        "retry_after": deny_info["retry_after"],
+                    },
+                    headers={"Retry-After": str(int(deny_info["retry_after"]))},
+                )
+
+            # Token budget pre-check
+            budget_ok, budget_info = await rate_limiter.check_token_budget(
+                tenant.id, tenant.token_budget_daily
+            )
+            if not budget_ok:
+                logger.warning("token_budget_exceeded", tenant_id=tenant.id, **budget_info)
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "token_budget_exceeded",
+                        "type": "token_budget_daily",
+                        "limit": budget_info["limit"],
+                        "current": budget_info["current"],
+                        "retry_after": budget_info["retry_after"],
+                    },
+                    headers={"Retry-After": str(int(budget_info["retry_after"]))},
+                )
+
+            # Store remaining counts for response headers
+            request.state.rate_limit_remaining = await rate_limiter.get_remaining(
+                tenant.id, tenant.rate_limit_rps, tenant.rate_limit_rpm
+            )
+        except HTTPException:
+            raise  # Re-raise 429s
+        except Exception as e:
+            logger.warning("rate_limit_check_failed", error=str(e))
+            # Graceful degradation: allow request if Redis fails
+
     # Check model access
     if "*" not in tenant.allowed_models and chat_request.model not in tenant.allowed_models:
         raise HTTPException(
@@ -161,6 +213,13 @@ async def chat_completions(
                 completion_tokens=result.usage.completion_tokens,
                 duration_ms=duration_ms,
             )
+
+            # Record token usage for daily budget
+            if tenant.token_budget_daily and rate_limiter:
+                try:
+                    await rate_limiter.record_tokens(tenant.id, result.usage.total_tokens)
+                except Exception as e:
+                    logger.warning("token_recording_failed", error=str(e))
 
             return result
 
