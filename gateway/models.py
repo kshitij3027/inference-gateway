@@ -118,3 +118,25 @@ class AnthropicResponse(BaseModel):
     model: str
     stop_reason: str | None = None
     usage: AnthropicUsage
+
+
+# --- Streaming chunk models (OpenAI SSE format) ---
+
+
+class ChunkDelta(BaseModel):
+    role: str | None = None
+    content: str | None = None
+
+
+class ChunkChoice(BaseModel):
+    index: int = 0
+    delta: ChunkDelta
+    finish_reason: str | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChunkChoice]
