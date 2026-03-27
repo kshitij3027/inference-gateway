@@ -17,6 +17,8 @@ services:
     depends_on:
       ollama:
         condition: service_started
+      ollama-2:
+        condition: service_started
       redis:
         condition: service_healthy
       mock-openai-1:
@@ -30,6 +32,15 @@ services:
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     volumes:
       - ollama_data:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+
+  ollama-2:
+    image: ollama/ollama
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    volumes:
+      - ollama_data_2:/root/.ollama
       - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
@@ -86,3 +97,4 @@ services:
 
 volumes:
   ollama_data:
+  ollama_data_2:

@@ -1,7 +1,16 @@
 backends:
-  - name: ollama-local
+  - name: ollama-1
     provider: ollama
     base_url: http://ollama:11434
+    models:
+      - tinyllama
+    weight: 1
+    max_concurrent: 5
+    timeout_ms: 120000
+
+  - name: ollama-2
+    provider: ollama
+    base_url: http://ollama-2:11434
     models:
       - tinyllama
     weight: 1
@@ -18,9 +27,69 @@ backends:
     max_concurrent: 10
     timeout_ms: 30000
 
+  - name: mock-openai-2
+    provider: openai
+    base_url: http://mock-openai-2:3000
+    api_key_env: OPENAI_API_KEY
+    models:
+      - mock-gpt-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-openai-3
+    provider: openai
+    base_url: http://mock-openai-3:3000
+    api_key_env: OPENAI_API_KEY
+    models:
+      - mock-gpt-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-openai-4
+    provider: openai
+    base_url: http://mock-openai-4:3000
+    api_key_env: OPENAI_API_KEY
+    models:
+      - mock-gpt-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-openai-5
+    provider: openai
+    base_url: http://mock-openai-5:3000
+    api_key_env: OPENAI_API_KEY
+    models:
+      - mock-gpt-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
   - name: mock-anthropic-1
     provider: anthropic
     base_url: http://mock-anthropic-1:3000/anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    models:
+      - mock-claude-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-anthropic-2
+    provider: anthropic
+    base_url: http://mock-anthropic-2:3000/anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    models:
+      - mock-claude-markdown
+    weight: 1
+    max_concurrent: 10
+    timeout_ms: 30000
+
+  - name: mock-anthropic-3
+    provider: anthropic
+    base_url: http://mock-anthropic-3:3000/anthropic
     api_key_env: ANTHROPIC_API_KEY
     models:
       - mock-claude-markdown
