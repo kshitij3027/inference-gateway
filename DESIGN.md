@@ -489,3 +489,180 @@ Phase 1 built translation for a single backend: Ollama. Clients that needed to u
 
 **Q: "What happens when Anthropic adds a new field to their API response?"**
 **A:** `AnthropicResponse` uses `ConfigDict(extra="allow")`, so unknown fields are accepted without validation errors. The translator extracts only the fields it uses (`content`, `stop_reason`, `usage`). New fields are silently ignored. If the new field is something the gateway should surface (e.g., a new token count category), the `AnthropicResponse` model is updated to include it, and `translate_response()` maps it to the appropriate OpenAI-compatible field. The `extra="allow"` policy means the gateway does not break when the upstream API evolves — it degrades gracefully by ignoring what it does not understand.
+
+## Streaming Normalization
+
+### Why this exists
+
+LLM inference is slow — seconds to tens of seconds per response. Without streaming, clients wait for the entire response before seeing any output, which creates a poor user experience and prevents use cases like real-time chat UIs, progressive rendering, and typewriter effects. Streaming sends tokens as they are generated, but each provider uses a different streaming protocol: Ollama emits newline-delimited JSON (NDJSON), OpenAI emits Server-Sent Events (SSE) with `data:` prefixes, and Anthropic emits event-typed SSE with a state machine of `message_start`, `content_block_delta`, `message_delta`, and `message_stop` events. Without a normalization layer, clients would need three different stream parsers. The gateway absorbs this complexity by translating all three protocols into OpenAI-compatible SSE format, so clients write one parser regardless of which backend handles the request.
+
+### How it works
+
+1. Client sends `POST /v1/chat/completions` with `"stream": true` in the `ChatCompletionRequest` body.
+2. The route handler in `gateway/routes/chat.py` detects the `stream` flag before dispatch. It looks up the provider in the `STREAM_TRANSLATORS` dict (separate from the non-streaming `TRANSLATORS` dict) to get the provider-specific `stream_chat_completion` async generator function.
+3. The selected `stream_chat_completion` generator opens an httpx streaming connection to the backend via `client.stream("POST", ...)`, which holds the TCP connection open during the response.
+4. The generator yields a role announcement chunk first: `{"choices": [{"delta": {"role": "assistant"}}]}` — this matches OpenAI's behavior where the first chunk announces the assistant role before content begins.
+5. Per provider, the generator parses the backend's native streaming format:
+   - **Ollama**: Iterates NDJSON lines via `response.aiter_lines()`. Each line is `json.loads`-parsed. `message.content` is extracted, empty content lines are skipped, and `done: true` triggers the final chunk with `finish_reason: "stop"`.
+   - **OpenAI**: Near-passthrough SSE. Lines not starting with `"data: "` are skipped. `"data: [DONE]"` terminates the stream. JSON chunks are parsed, and the backend's `id` and `created` fields are replaced with gateway-generated values.
+   - **Anthropic**: Inline state machine dispatching on the `type` field of each parsed SSE data line. `content_block_delta` with `delta.type == "text_delta"` extracts the text. `message_delta` extracts `stop_reason` and maps it via `STOP_REASON_MAP` (`end_turn` -> `stop`, `max_tokens` -> `length`). `message_stop` breaks the loop. Non-text delta types (e.g., `input_json_delta` for tool use) are silently skipped.
+6. Each extracted content token is wrapped in a `ChatCompletionChunk` Pydantic model with a gateway-generated `chatcmpl-{uuid}` ID (shared across all chunks in the stream), the current Unix timestamp, and the model name.
+7. Chunks are serialized as SSE-formatted strings: `data: {json}\n\n`.
+8. After the stream loop ends (normal completion or error), the generator yields `data: [DONE]\n\n`.
+9. FastAPI wraps the async generator in a `StreamingResponse` with `media_type="text/event-stream"`, which sends chunks to the client as they are yielded.
+
+### Implementation
+
+**Streaming chunk models** (`gateway/models.py`):
+- `ChunkDelta` — `role: str | None = None`, `content: str | None = None`. Represents the delta payload in a streaming chunk. Role is set only in the first chunk; content is set in subsequent chunks.
+- `ChunkChoice` — `index: int = 0`, `delta: ChunkDelta`, `finish_reason: str | None = None`. Parallels `Choice` from the non-streaming path but uses `delta` instead of `message`.
+- `ChatCompletionChunk` — `id: str`, `object: Literal["chat.completion.chunk"]`, `created: int`, `model: str`, `choices: list[ChunkChoice]`. The streaming equivalent of `ChatCompletionResponse`. Unlike the non-streaming model, `id` and `created` are not auto-generated via `Field(default_factory=...)` — they are explicitly set by the generator so all chunks in a stream share the same values.
+
+**Ollama streaming translator** (`gateway/backends/ollama.py: stream_chat_completion()`):
+- Signature: `async def stream_chat_completion(client: httpx.AsyncClient, backend: BackendConfig, request: ChatCompletionRequest) -> AsyncGenerator[str, None]`.
+- Reuses `translate_request()` from the non-streaming path, then overrides `stream = True` on the resulting `OllamaRequest`.
+- Generates `chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"` and `created = int(time.time())` once, shared across all chunks.
+- Yields role announcement chunk, then enters the streaming loop via `async with client.stream("POST", f"{backend.base_url}/api/chat", ...)`.
+- Iterates `response.aiter_lines()`. Each line is parsed with `json.loads(line)`. Content is extracted from `data["message"]["content"]`. Empty content strings are skipped. When `data["done"]` is `True`, a final chunk with `finish_reason="stop"` is yielded and the loop breaks.
+- Error handling: `httpx.HTTPStatusError` and generic `Exception` are caught. Both yield an SSE error event (`data: {"error": {"message": "...", "type": "stream_error"}}\n\n`) before the `[DONE]` sentinel.
+- The `yield "data: [DONE]\n\n"` is outside the try/except block, ensuring it is always sent.
+
+**OpenAI streaming translator** (`gateway/backends/openai.py: stream_chat_completion()`):
+- Reuses `translate_request()` from the non-streaming path, then overrides `body["stream"] = True`.
+- Does not yield a separate role announcement chunk — the OpenAI backend already includes one in its SSE stream. The generator passes through backend chunks with ID replacement.
+- Iterates `response.aiter_lines()`. Empty lines and lines not starting with `"data: "` are skipped. `"data: [DONE]"` breaks the loop. JSON chunks are parsed, and `data["id"]` and `data["created"]` are replaced with gateway-generated values before re-serialization.
+- `json.JSONDecodeError` on a malformed line causes a `continue` (skip the line), not an error event.
+- Same error handling and `[DONE]` guarantee as Ollama.
+
+**Anthropic streaming translator** (`gateway/backends/anthropic.py: stream_chat_completion()`):
+- Reuses `translate_request()` from the non-streaming path, then sets `body["stream"] = True`.
+- Yields role announcement chunk before entering the streaming loop.
+- Initializes `finish_reason = "stop"` as default, updated if `message_delta` provides a `stop_reason`.
+- Iterates `response.aiter_lines()`. Lines that are empty or do not start with `"data: "` are skipped (this filters out `event:` lines from the SSE protocol). Each data line is JSON-parsed; `json.JSONDecodeError` lines are skipped.
+- Dispatches on `data["type"]`:
+  - `"content_block_delta"`: checks `delta.type == "text_delta"`, extracts `delta.text`, yields a content chunk.
+  - `"message_delta"`: extracts `delta.stop_reason`, maps it via `STOP_REASON_MAP` to update `finish_reason`.
+  - `"message_stop"`: breaks the loop.
+  - All other event types (e.g., `message_start`, `content_block_start`, `content_block_stop`) are implicitly ignored.
+- After the loop, yields a final chunk with the accumulated `finish_reason` and empty delta, then `[DONE]`.
+- Same error handling pattern as the other providers.
+
+**Route dispatch** (`gateway/routes/chat.py`):
+- `STREAM_TRANSLATORS` dict at module level: `{"ollama": ollama.stream_chat_completion, "openai": openai_backend.stream_chat_completion, "anthropic": anthropic_backend.stream_chat_completion}`.
+- The streaming branch in `chat_completions()` checks `chat_request.stream`, looks up the provider in `STREAM_TRANSLATORS`, logs `chat_request_received` with `streaming=True`, and returns `StreamingResponse(stream_translator(client=..., backend=..., request=...), media_type="text/event-stream")`.
+- The `response_model=ChatCompletionResponse` decorator on the route does not interfere with streaming — FastAPI passes `StreamingResponse` through without validation when it is returned directly.
+
+### Key design decisions
+
+1. **Separate `STREAM_TRANSLATORS` dict parallel to `TRANSLATORS`.** Streaming and non-streaming have fundamentally different return types: `AsyncGenerator[str, None]` vs `ChatCompletionResponse`. Trying to unify them in a single dispatch dict would require runtime type checking or union return types that make the code harder to reason about. Two dicts with identical keys but different value types keeps the dispatch clear and type-safe.
+
+2. **Hand-formatted SSE via `StreamingResponse` instead of `EventSourceResponse`.** Libraries like `sse-starlette` provide `EventSourceResponse` that handles SSE framing. However, OpenAI's SSE format has specific conventions (e.g., `data: [DONE]\n\n` as a sentinel, no `event:` or `id:` fields on content chunks) that an abstraction might not match exactly. Using `StreamingResponse` with `media_type="text/event-stream"` and hand-formatted `f"data: {json}\n\n"` strings gives precise control over the wire format, ensuring clients that parse OpenAI SSE see exactly what they expect.
+
+3. **Gateway-generated chunk IDs shared across the stream.** Each stream generates a single `chatcmpl-{uuid}` ID used for all chunks. This is consistent with OpenAI's behavior and the non-streaming path's ID generation. It enables clients to group chunks by ID and ensures the ID format is uniform regardless of the backend. The `created` timestamp is also generated once per stream.
+
+4. **Inline Anthropic state machine without buffering.** The Anthropic translator processes each SSE event as it arrives and yields the translated chunk immediately. There is no buffering of events to reconstruct a complete message before yielding. This preserves low time-to-first-token (TTFT) — the client sees the first content chunk as soon as the first `content_block_delta` arrives from Anthropic, without waiting for `message_stop`.
+
+5. **`httpx client.stream()` with `aiter_lines()` for lazy iteration.** The streaming context manager holds the backend TCP connection open and yields lines one at a time. This keeps memory consumption constant regardless of response length — the gateway never holds the entire response in memory. The context manager's `__aexit__` ensures the backend connection is closed even if the generator is abandoned mid-stream.
+
+6. **Role announcement chunk before the streaming loop.** Ollama and Anthropic translators yield an explicit `{"delta": {"role": "assistant"}}` chunk before entering the backend streaming loop. This matches OpenAI's behavior where the first SSE chunk announces the role. The OpenAI translator does not emit a separate role chunk because the backend already includes one in its stream.
+
+7. **Error SSE events for mid-stream failures.** Once `StreamingResponse` is returned, HTTP 200 is already committed — the gateway cannot change the status code. If the backend fails mid-stream, the generator yields a JSON error payload as a `data:` line (`{"error": {"message": "...", "type": "stream_error"}}`) before sending `[DONE]`. This gives clients a structured way to detect errors in the stream, even though the HTTP status is 200.
+
+8. **`response_model=ChatCompletionResponse` stays on the route decorator.** This is not removed for streaming because FastAPI only applies response model validation when the handler returns a dict or Pydantic model. When `StreamingResponse` is returned directly, FastAPI passes it through without validation. Keeping the decorator documents the non-streaming contract and enables OpenAPI schema generation for the non-streaming response format.
+
+### Alternatives considered
+
+1. **FastAPI `EventSourceResponse` (sse-starlette) vs raw `StreamingResponse`.** `EventSourceResponse` would handle SSE framing automatically, but it adds a dependency and its default behavior (adding `id:` fields, handling reconnection via `Last-Event-ID`) does not match OpenAI's SSE format. The OpenAI format uses bare `data:` lines with no `event:` or `id:` fields on content chunks. Raw `StreamingResponse` gives exact control over the wire format with no dependency.
+
+2. **Buffering Anthropic events to reconstruct full messages vs inline translation.** Buffering all events until `message_stop` and then yielding a single response would simplify the translator but eliminate the streaming benefit entirely — the client would wait for the full response just like the non-streaming path. Inline translation preserves the low-latency token-by-token delivery that makes streaming valuable.
+
+3. **Single unified return type (union of `ChatCompletionResponse | AsyncGenerator`) vs separate translator dicts.** A single `TRANSLATORS` dict returning a union type would avoid the parallel dict pattern, but it pushes type discrimination into the route handler: `if isinstance(result, AsyncGenerator): return StreamingResponse(...)`. This is fragile and loses the clarity of separate dispatch paths. Two dicts with clear type contracts are simpler.
+
+4. **`httpx-sse` library for SSE parsing vs manual line parsing.** The `httpx-sse` library provides a typed SSE event parser. However, the gateway only needs to handle three well-known formats (Ollama NDJSON, OpenAI SSE, Anthropic SSE), and the parsing logic for each is under 20 lines. Adding a library dependency for minimal parsing gains does not justify the added dependency surface.
+
+### Failure modes and edge cases
+
+- **Backend disconnect mid-stream.** If the backend closes the TCP connection while the generator is iterating `aiter_lines()`, httpx raises an exception. The generator's `except Exception` block catches it, yields an error SSE event with the exception message, and then yields `[DONE]`. The client receives a partial stream followed by an error event.
+- **Malformed JSON chunk from backend.** For OpenAI and Anthropic translators: `json.JSONDecodeError` is caught and the line is skipped via `continue`. The stream continues with the next line. For Ollama: `json.loads(line)` raises `JSONDecodeError` which is caught by the generic `except Exception` block, yielding an error event and terminating the stream. This difference reflects the reliability assumptions: OpenAI and Anthropic SSE may include non-JSON lines (event types, comments), while Ollama NDJSON should be strictly JSON.
+- **Connection refused before stream starts.** If the backend is unreachable, `client.stream()` raises an `httpx.ConnectError` inside the `async with` block. This is caught by the `except Exception` handler, which yields an error SSE event and then `[DONE]`. Because `StreamingResponse` is returned before the generator runs, HTTP 200 is already committed — the client sees a 200 response with an error event in the body.
+- **Client disconnect mid-stream.** When the client closes the connection, Starlette raises `ClientDisconnect` when attempting to write the next chunk. The `StreamingResponse` handler catches this and stops iterating the generator. The async generator is garbage-collected, and the `async with client.stream(...)` context manager's `__aexit__` closes the backend TCP connection. No manual cleanup is needed.
+- **Ollama returns `done: true` with empty content.** The empty content check (`if content:`) skips the content chunk. The `if done:` check then yields a final chunk with `finish_reason="stop"` and breaks. This is the correct behavior — the final NDJSON line from Ollama often has empty content alongside the done flag.
+- **Anthropic `message_delta` with unknown `stop_reason`.** `STOP_REASON_MAP.get(stop_reason, "stop")` defaults to `"stop"` for any unrecognized stop reason. The stream does not fail on an unknown reason — it degrades gracefully to the most common finish reason.
+- **Concurrent streaming requests.** Each streaming request gets its own async generator instance, its own httpx streaming context manager, and its own chunk ID. There is no shared mutable state between streams. httpx's connection pool manages the backend connections.
+
+### Observability
+
+- **Pre-stream logging:** `chat_request_received` is logged with `streaming=True`, model, tenant_id, backend name, provider, and message_count before the `StreamingResponse` is returned.
+- **No post-stream logging:** `chat_request_completed` is not logged for streaming requests. The route handler returns `StreamingResponse` immediately — the generator runs asynchronously as Starlette writes chunks to the client. There is no hook to log after the stream finishes. Phase 16 will add TTFT (time to first token) and ITL (inter-token latency) metrics via a callback mechanism on the generator.
+- **Per-provider error logs:** `ollama_stream_error`, `openai_stream_error`, and `anthropic_stream_error` are logged when exceptions occur during streaming. These include the error message or HTTP status code.
+- **Request ID propagation:** The `request_id_middleware` in `gateway/main.py` sets the request ID before the streaming generator runs, so error logs within the generator carry the correct request ID via structlog contextvars.
+
+### Testing
+
+**Unit tests — streaming chunk models** (`tests/unit/test_models.py`, 8 streaming-specific tests):
+- `ChunkDelta` serialization with role only, content only, and both fields. `ChunkChoice` with and without `finish_reason`. `ChatCompletionChunk` round-trip with `object: "chat.completion.chunk"`.
+
+**Unit tests — Ollama streaming** (`tests/unit/test_ollama_streaming.py`, 5 tests):
+- Happy path: role announcement chunk, two content chunks ("Hello", " world"), final chunk with `finish_reason="stop"`, `[DONE]` terminator.
+- Shared IDs: all non-`[DONE]` chunks share the same `chatcmpl-` prefixed ID.
+- Empty content skip: NDJSON lines with `content: ""` do not produce content chunks.
+- Done terminator: stream always ends with `data: [DONE]\n\n`.
+- SSE format: every yielded string starts with `data: ` and ends with `\n\n`.
+
+**Unit tests — OpenAI streaming** (`tests/unit/test_openai_streaming.py`, 5 tests):
+- Happy path: role chunk passthrough, content chunks ("Hello", " world"), final chunk with `finish_reason="stop"`, `[DONE]` terminator.
+- ID replacement: backend's `chatcmpl-backend` ID is replaced with a gateway-generated `chatcmpl-` ID.
+- Empty line skip: blank lines between SSE events do not produce output chunks.
+- Done terminator: stream always ends with `data: [DONE]\n\n`.
+- SSE format: every yielded string starts with `data: ` and ends with `\n\n`.
+
+**Unit tests — Anthropic streaming** (`tests/unit/test_anthropic_streaming.py`, 6 tests):
+- Happy path: role chunk, content chunks from `text_delta` events, final chunk with `finish_reason="stop"` (mapped from `end_turn`), `[DONE]` terminator.
+- Stop reason mapping: `max_tokens` maps to `finish_reason="length"`.
+- Non-text delta skip: `input_json_delta` events do not produce content chunks.
+- Shared IDs: all chunks share the same gateway-generated `chatcmpl-` ID.
+- Event line skip: `event:` lines from Anthropic SSE are filtered out, only `data:` lines are processed.
+- Done terminator: stream always ends with `data: [DONE]\n\n`.
+
+**Integration tests — streaming dispatch** (`tests/integration/test_streaming.py`, 4 tests):
+- SSE content type: streaming response has `text/event-stream` in `Content-Type` header.
+- Chunk format: response body contains `data:` lines with `chat.completion.chunk` objects and `data: [DONE]`.
+- Done termination: last non-empty line in the response body is `data: [DONE]`.
+- Non-streaming regression: requests with `stream: false` still return JSON `chat.completion` objects, not SSE.
+
+**Test infrastructure:**
+- All unit tests use a custom `_make_mock_stream_client()` helper that creates a mock httpx client with an `AsyncMock` context manager. The mock's `aiter_lines()` returns an async iterator over a list of pre-defined lines, enabling deterministic testing of each provider's parsing logic without network I/O.
+- Integration tests use `patch.dict` on `STREAM_TRANSLATORS` to inject a mock async generator, testing the route dispatch and `StreamingResponse` wrapping without requiring a real backend.
+
+**E2E (Docker):**
+- `make up` starts the full stack. All three providers (Ollama, OpenAI mock, Anthropic mock) stream correctly via `curl` with `"stream": true`. Responses arrive as chunked `text/event-stream` data ending with `data: [DONE]`.
+
+### Production gaps
+
+- **No TTFT or ITL metrics.** Time-to-first-token and inter-token latency are critical streaming performance indicators. Currently there is no instrumentation to measure when the first chunk is yielded or the spacing between chunks. Phase 16 adds these metrics.
+- **No cache integration with streams.** The semantic caching layer (Phase 8) cannot cache streaming responses. A tee buffer pattern (duplicate the stream into a cache writer and the client writer) is prepared but not connected.
+- **No usage or token tracking for streaming requests.** Non-streaming requests log `prompt_tokens` and `completion_tokens` from the backend response. Streaming requests have no equivalent — token counts are not available until after the stream completes, and there is no post-stream callback to collect them.
+- **No `chat_request_completed` log for streaming.** Duration, token counts, and final status are not logged because the route handler returns `StreamingResponse` before the generator runs. The completion log only fires for non-streaming requests.
+- **No request timeout on streaming connections.** The httpx client has a 120-second timeout for non-streaming requests, but streaming connections can remain open indefinitely. A slow backend that sends one token per minute would hold the connection open without limit.
+- **No max response size limit for streaming.** A backend that streams an unbounded response (e.g., a model in a loop) would be forwarded to the client without limit. There is no byte or token cap on streaming responses.
+- **No backpressure handling.** If the client reads slowly, Starlette buffers the generator's output. There is no mechanism to signal the backend to slow down if the client cannot keep up.
+
+### Interview talking points
+
+- **Why normalize to OpenAI SSE format.** Clients write one SSE parser regardless of whether the backend is Ollama, OpenAI, or Anthropic. The gateway absorbs three different streaming protocols (NDJSON, SSE passthrough, event-typed SSE state machine) and presents a uniform interface. Adding a fourth provider requires one new translator, not changes to every client.
+- **Anthropic inline state machine for low TTFT.** The Anthropic translator dispatches on each event's `type` field as it arrives, yielding translated chunks immediately. No buffering means the first token reaches the client as soon as Anthropic sends its first `content_block_delta`. Buffering until `message_stop` would defeat the purpose of streaming.
+- **httpx streaming context manager for constant memory.** `client.stream()` with `aiter_lines()` processes one line at a time. The gateway never holds the entire response in memory, regardless of response length. The context manager's `__aexit__` guarantees the backend connection is closed even if the generator is interrupted (client disconnect, error, garbage collection).
+
+### Likely interview questions
+
+**Q: "How do you handle a client disconnecting mid-stream?"**
+**A:** When the client closes the TCP connection, Starlette's `StreamingResponse` detects the closed socket on its next write attempt and raises `ClientDisconnect`. This stops the iteration of the async generator. Python's garbage collector then finalizes the generator, which triggers the `async with client.stream(...)` context manager's `__aexit__`, closing the backend HTTP connection. No manual cleanup code is needed — the combination of Python's generator finalization and httpx's context manager protocol handles it automatically. The backend stops receiving reads on its connection and can clean up on its side.
+
+**Q: "Why can't you log token counts for streaming requests?"**
+**A:** The route handler returns the `StreamingResponse` object immediately — at that point, the async generator has not started running yet. The generator executes asynchronously as Starlette writes chunks to the client. When the stream finishes, execution is inside Starlette's response writer, not in the route handler. There is no return value and no hook to run post-stream logic. Phase 16 addresses this by wrapping the generator in a metrics-collecting wrapper that tracks TTFT, ITL, and total chunks, then fires a callback when the generator is exhausted.
+
+**Q: "How do you ensure `[DONE]` is always sent?"**
+**A:** In all three translators, the `yield "data: [DONE]\n\n"` statement is placed outside the `try/except` block, after both the normal stream loop and the error handlers. Whether the stream completes successfully, the backend returns an error, or an unexpected exception occurs, the generator always reaches the `[DONE]` yield. The only scenario where `[DONE]` is not sent is if the client disconnects first — but in that case, no one is listening for it anyway.
+
+**Q: "What is the tradeoff of returning HTTP 200 before the stream starts?"**
+**A:** `StreamingResponse` commits HTTP 200 and the `text/event-stream` headers as soon as the route handler returns — before the generator yields its first chunk. If the backend is unreachable or returns an error, the client has already received a 200 status code. The gateway cannot retroactively change it to 502. Instead, it yields a JSON error payload as a `data:` line in the SSE stream. This means clients must parse the stream body for errors, not just check the HTTP status. This is the same tradeoff OpenAI's own API makes — it is inherent to HTTP streaming, not a gateway-specific limitation.
