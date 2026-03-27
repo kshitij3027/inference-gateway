@@ -973,3 +973,219 @@ Circuit breakers solve this by tracking per-backend failure rates in a rolling w
 
 **Q: "What happens if a circuit breaker is stuck OPEN due to a transient issue that resolved?"**
 **A:** The circuit breaker cannot get permanently stuck. After the current cooldown period expires (at most 300 seconds / 5 minutes), `allow_request()` transitions to HALF_OPEN and allows one probe. If the issue has resolved, the probe succeeds, the breaker closes, and traffic resumes. The maximum time a backend can be excluded after a transient issue is the current cooldown period -- in the worst case, 300 seconds. There is no mechanism for permanent exclusion; the exponential backoff always caps and the probe always fires eventually.
+
+## Distributed Rate Limiter
+
+### Why this exists
+
+Without rate limiting, a single tenant can consume all backend capacity. LLM inference is expensive -- both in compute cost (GPU-seconds per request) and in money (per-token pricing from OpenAI, Anthropic). A tenant that sends a burst of long-context requests can saturate every backend, causing latency spikes or outright denial of service for other tenants. Three independent rate limiting dimensions protect different things:
+
+1. **RPS (requests per second)** protects the gateway itself. A burst of concurrent requests can exhaust connection pools, memory, and file descriptors in the gateway process before the backends even see them.
+2. **RPM (requests per minute)** protects budget predictability. Even if individual requests are small, a high sustained rate accumulates cost. RPM gives operators a coarse-grained knob for per-tenant throughput.
+3. **Token budget (daily)** protects cost directly. A single request with a 100k-token context costs orders of magnitude more than a short chat message. Token budgets cap the total spend per tenant per day regardless of how many requests they send.
+
+All three dimensions must be enforced atomically and consistently across multiple gateway instances. A tenant sending 10 concurrent requests must not be able to bypass a 5 RPS limit by hitting different instances. This requires a shared state store (Redis) and atomic check-and-increment logic.
+
+### How it works
+
+1. **Request arrives, authentication succeeds.** The `get_current_tenant` dependency resolves the `TenantConfig`, which carries `rate_limit_rps`, `rate_limit_rpm`, and `token_budget_daily` fields. These are defined in `config/backends.yaml` under the `tenants` section (e.g., `tenant-alpha` has `rate_limit_rps: 10`, `rate_limit_rpm: 60`, `token_budget_daily: 500`). Tenants without these fields (e.g., `tenant-beta`) have no rate limits.
+
+2. **Rate limiter check begins.** The route handler in `gateway/routes/chat.py: chat_completions()` retrieves `rate_limiter` from `request.app.state` (lines 60-61). If `rate_limiter is None` (Redis was unavailable at startup), the entire rate limiting block is skipped and the request proceeds. Otherwise, `rate_limiter.check_rate_limit()` is called with `tenant_id`, `request_id`, `rps_limit`, and `rpm_limit`.
+
+3. **RPS sliding window check (1-second window).** `RateLimiter.check_rate_limit()` in `gateway/rate_limiter.py` calls `_check_window()` with `key=ratelimit:{tenant_id}:rps`, `window_size=1.0`, `limit=rps_limit`, and `expire_seconds=2`. This executes the Lua script `_SLIDING_WINDOW_SCRIPT` atomically on Redis:
+   - `ZREMRANGEBYSCORE key -inf window_start` -- removes all sorted set members with scores older than `now - 1.0`, cleaning entries outside the 1-second window.
+   - `ZCARD key` -- counts remaining members in the window.
+   - If `count >= limit`: returns `{0, count}` (denied). The Lua script short-circuits before adding the new entry.
+   - If `count < limit`: `ZADD key now member` adds the current request, `EXPIRE key 2` sets a 2-second TTL for auto-cleanup, and returns `{1, count}` (allowed).
+
+4. **Short-circuit on RPS denial.** If the RPS check returns denied, `check_rate_limit()` returns `(False, {"limit_type": "rps", "limit": rps_limit, "current": count, "retry_after": 1.0})` immediately. The RPM check is never executed.
+
+5. **RPM sliding window check (60-second window).** If RPS passes, the same Lua script runs again with `key=ratelimit:{tenant_id}:rpm`, `window_size=60.0`, `limit=rpm_limit`, and `expire_seconds=120`. The logic is identical to the RPS check but with a longer window.
+
+6. **Token budget pre-check.** After both RPS and RPM pass, `check_token_budget()` reads the daily token counter with `GET ratelimit:{tenant_id}:tokens:{today}` (a plain Redis string, not a sorted set). If the current total equals or exceeds `token_budget_daily`, the request is denied. The `retry_after` value is calculated as seconds until midnight UTC.
+
+7. **Denial response.** On any denial, the route handler raises `HTTPException(status_code=429)` with a structured JSON body containing `error`, `type` (which dimension triggered the denial), `limit`, `current`, and `retry_after`. The `Retry-After` HTTP header is set to the integer seconds value.
+
+8. **Remaining counts for response headers.** On allow, `get_remaining()` is called to compute how many requests remain in each window. This calls `ZREMRANGEBYSCORE` + `ZCARD` for each dimension (non-atomically -- these are informational, not authoritative). The results are stored on `request.state.rate_limit_remaining`.
+
+9. **Response headers injected by middleware.** The `request_id_middleware` in `gateway/main.py` (lines 105-110) reads `rate_limit_remaining` from `request.state` after the response is generated. If present, it sets `X-Ratelimit-Remaining-Rps` and `X-Ratelimit-Remaining-Rpm` headers on the response.
+
+10. **Token recording after response.** After a successful non-streaming response, the route handler in `gateway/routes/chat.py` (lines 218-222) calls `rate_limiter.record_tokens(tenant_id, result.usage.total_tokens)`. This executes `INCRBY ratelimit:{tenant_id}:tokens:{today} total_tokens` and `EXPIRE key 90000` (25 hours). The token count is cumulative for the day.
+
+### Implementation
+
+**Lua script** (`gateway/rate_limiter.py: _SLIDING_WINDOW_SCRIPT`):
+- Accepts 1 key and 5 arguments: `window_start`, `now`, `member`, `limit`, `expire_s`.
+- Executes three Redis commands atomically: `ZREMRANGEBYSCORE` (cleanup), `ZCARD` (count), and conditionally `ZADD` + `EXPIRE` (insert).
+- Returns a 2-element array: `{allowed (0 or 1), count}`.
+- The `member` value is `{request_id}:rps` or `{request_id}:rpm`, ensuring uniqueness across concurrent requests to the same tenant.
+
+**RateLimiter class** (`gateway/rate_limiter.py: RateLimiter`):
+- `__init__(self, redis_client)` -- stores the Redis client. The Lua script is not registered at construction time.
+- `_ensure_script()` -- lazily calls `redis.register_script(_SLIDING_WINDOW_SCRIPT)` on first use. This returns a callable that handles `EVALSHA`/`EVAL` fallback transparently.
+- `check_rate_limit(tenant_id, request_id, rps_limit, rpm_limit) -> (bool, dict | None)` -- checks RPS then RPM via `_check_window()`. Returns `(True, None)` if both pass, `(False, deny_info)` on first failure. If either limit is `None`, that dimension is skipped entirely (no Redis call).
+- `_check_window(key, now, window_size, member, limit, expire_seconds) -> (bool, int)` -- computes `window_start = now - window_size`, invokes the Lua script with the key and arguments, parses the 2-element result.
+- `check_token_budget(tenant_id, budget) -> (bool, dict | None)` -- `GET` on the daily key, integer comparison against budget. If `budget is None`, returns `(True, None)` without touching Redis.
+- `record_tokens(tenant_id, tokens) -> int` -- `INCRBY` on the daily key, `EXPIRE` with 90000 seconds (25 hours). Returns the new total.
+- `get_remaining(tenant_id, rps_limit, rpm_limit) -> dict` -- `ZREMRANGEBYSCORE` + `ZCARD` for each active dimension, returns `{"rps": remaining, "rpm": remaining}`.
+
+**Redis key schema:**
+- `ratelimit:{tenant_id}:rps` -- sorted set, scores are Unix timestamps, members are `{request_id}:rps`. TTL: 2 seconds.
+- `ratelimit:{tenant_id}:rpm` -- sorted set, scores are Unix timestamps, members are `{request_id}:rpm`. TTL: 120 seconds.
+- `ratelimit:{tenant_id}:tokens:{YYYY-MM-DD}` -- plain string (integer counter). TTL: 90000 seconds (25 hours).
+
+**Route integration** (`gateway/routes/chat.py: chat_completions()`, lines 58-106):
+- Retrieves `rate_limiter` from `request.app.state`. If `None`, skips all rate limiting.
+- Calls `check_rate_limit()`, then `check_token_budget()`. On denial, raises `HTTPException(429)` with structured detail and `Retry-After` header.
+- Calls `get_remaining()` and stores on `request.state.rate_limit_remaining`.
+- Wraps the entire block in `try/except`: `HTTPException` is re-raised (429s propagate), all other exceptions are caught and logged as `rate_limit_check_failed` (graceful degradation -- request proceeds).
+- After successful response (line 218-222): calls `record_tokens()` if `tenant.token_budget_daily` is set and `rate_limiter` is not `None`.
+
+**Middleware integration** (`gateway/main.py: request_id_middleware()`, lines 105-110):
+- After `call_next(request)`, reads `request.state.rate_limit_remaining`. If present, sets `X-Ratelimit-Remaining-Rps` and `X-Ratelimit-Remaining-Rpm` response headers.
+
+**Lifespan initialization** (`gateway/main.py: lifespan()`, lines 43-53):
+- Connects to Redis via `aioredis.from_url(redis_url, decode_responses=True)`.
+- Calls `ping()` to verify connectivity.
+- On success: creates `RateLimiter(redis)` and stores as `app.state.rate_limiter`.
+- On failure: logs `redis_unavailable`, sets `app.state.redis = None` and `app.state.rate_limiter = None`. The gateway starts and operates without rate limiting.
+
+**Tenant configuration** (`config/backends.yaml`):
+- `tenant-alpha`: `rate_limit_rps: 10`, `rate_limit_rpm: 60`, `token_budget_daily: 500`.
+- `tenant-beta`: no rate limit fields -- all three limits default to `None`, meaning unlimited.
+
+### Key design decisions
+
+1. **Sliding window via sorted sets -- true sliding window, no boundary effects.** A sorted set with Unix timestamps as scores and request IDs as members creates a true sliding window. At any point in time, `ZREMRANGEBYSCORE` removes entries older than the window, and `ZCARD` counts entries within the window. There are no fixed bucket boundaries, so there is no "burst at the window edge" problem where a client can send 2x the limit by timing requests to straddle a boundary.
+
+2. **Atomic Lua script -- prevents TOCTOU race between concurrent requests.** Without atomicity, two concurrent requests could both read `count=9` (under a limit of 10), both decide to proceed, and both add an entry -- resulting in 11 entries in a window with a limit of 10. The Lua script executes `ZREMRANGEBYSCORE`, `ZCARD`, and conditional `ZADD` as a single atomic operation on Redis. No other command can interleave between the count check and the insert.
+
+3. **Token budget uses `INCRBY`, not sorted sets (different semantics).** Token budget is a cumulative daily counter, not a sliding window. There is no "window" to slide -- the budget resets at midnight (via key expiry), not on a rolling basis. `INCRBY` is the correct primitive: simple, atomic, and O(1). Using a sorted set for tokens would waste memory (storing every request's token count as a member) for no benefit.
+
+4. **Graceful degradation -- Redis down means rate limiting disabled, requests pass through.** The gateway's primary function is proxying LLM requests. Rate limiting is a secondary protection mechanism. If Redis is unavailable, the gateway should still serve requests rather than rejecting them all. This is implemented at two levels: (a) at startup, `rate_limiter = None` if Redis fails to connect, and the route handler skips rate limiting when `rate_limiter is None`; (b) at request time, any exception from the rate limiter is caught and logged as `rate_limit_check_failed`, and the request proceeds.
+
+5. **Pre-check approximate -- token budget can overshoot because tokens are unknown before inference.** The token budget pre-check reads the current daily total and compares it to the budget. But this check happens before the LLM backend processes the request -- the gateway does not know how many tokens the response will contain. Two concurrent requests that both pass the pre-check with `current=490` and `budget=500` will both proceed, and if each generates 50 tokens, the actual total will be 590. This overshoot is acceptable because (a) the alternative (reserving tokens before inference) requires knowing the response size in advance, which is impossible, and (b) the overshoot is bounded by the maximum tokens a single request can generate.
+
+6. **Lazy script registration -- `register_script()` called on first use, not at import time.** The `_ensure_script()` method registers the Lua script on the first call to `check_rate_limit()`. This avoids importing `rate_limiter.py` causing a Redis call (which would fail in tests without a Redis connection). Lazy registration also means the script is only registered if rate limiting is actually used.
+
+7. **25-hour TTL on daily token keys -- auto-expire even with timezone edge cases.** The daily token key is `ratelimit:{tenant_id}:tokens:{YYYY-MM-DD}`. The date is `date.today().isoformat()`, which uses the gateway process's local timezone. The 25-hour TTL (90000 seconds) ensures the key expires even if the process timezone is ahead of UTC -- a key created at 23:59 local time will expire 25 hours later, well after midnight in any timezone. Without the TTL, stale keys would accumulate indefinitely in Redis.
+
+8. **Request ID as sorted set member -- guarantees uniqueness across concurrent requests.** The member value for each sorted set entry is `{request_id}:rps` or `{request_id}:rpm`. Since `request_id` is a UUID generated per request (either from the `X-Request-ID` header or `uuid.uuid4()`), every member is unique. If a fixed member were used (e.g., just the tenant ID), `ZADD` would update the existing member's score rather than adding a new entry, and `ZCARD` would always return 1.
+
+### Alternatives considered
+
+1. **Fixed-window counters (INCR + TTL) -- rejected due to boundary burst problem.** A fixed-window counter increments an integer key and sets a TTL equal to the window size. At t=0, the key is created with TTL=1s. At t=0.9, the counter reaches the limit. At t=1.0, the key expires and a new window starts. A client can send `limit` requests at t=0.9 (end of window 1) and another `limit` requests at t=1.0 (start of window 2), achieving 2x the limit in a 1-second span. Sliding windows eliminate this because the window is always anchored to "now minus window_size."
+
+2. **Token bucket algorithm -- rejected because LLM backends cannot handle bursts.** Token bucket allows accumulated "tokens" (not LLM tokens -- algorithm tokens) to be spent in a burst. A bucket with rate=10/s and capacity=50 allows a burst of 50 requests followed by a sustained 10/s. LLM backends (especially Ollama running on limited GPU) cannot handle 50 concurrent requests -- they queue internally and response times degrade severely. Sliding window rate limiting enforces a strict maximum within any window, preventing bursts that the backend cannot absorb.
+
+3. **In-memory rate limiting -- rejected because it does not work across multiple gateway instances.** Storing rate limit counters in the gateway process works for a single instance but fails when multiple instances sit behind a load balancer. A tenant could send `limit` requests to each of N instances, achieving N times the limit. Redis provides a shared state store that all instances can read and write atomically.
+
+4. **Redis INCR with TTL (non-sorted-set sliding window) -- rejected because it is not a true sliding window.** A simple `INCR` with `EXPIRE` creates a fixed window anchored to the first request in the window. It has the same boundary problem as fixed-window counters. The sorted set approach tracks individual request timestamps, enabling true sliding window semantics where the window always covers "the last N seconds from now."
+
+### Failure modes and edge cases
+
+- **Redis unavailable at startup.** The `lifespan()` function in `gateway/main.py` catches the exception from `redis.ping()`, logs `redis_unavailable`, and sets `app.state.rate_limiter = None`. The gateway starts and serves requests without rate limiting. This is a deliberate design choice -- the gateway degrades to "unlimited" rather than refusing to start.
+
+- **Redis fails mid-request.** The `try/except` block in `chat_completions()` (lines 102-106) catches any non-HTTPException from the rate limiter and logs `rate_limit_check_failed`. The request proceeds as if rate limiting were disabled. This handles transient Redis failures (network blip, Redis restart) without causing a cascade of 500 errors from the gateway.
+
+- **Token budget overshoot on concurrent requests.** Two concurrent requests from the same tenant both call `check_token_budget()` and both read `current=490` with `budget=500`. Both pass the pre-check. Both complete inference and call `record_tokens()` -- one increments to 540, the other to 590. The budget is exceeded by 90 tokens. This is acceptable because (a) the overshoot is bounded by the number of concurrent requests times the maximum tokens per response, and (b) the next request will see `current=590 >= budget=500` and be denied. The window of overshoot is the duration of a single inference request.
+
+- **Clock skew across gateway instances.** The Lua script uses `ARGV[2]` (the `now` timestamp passed by the gateway) for `ZADD` scores, not Redis server time. If two gateway instances have different clocks, their sorted set entries will have slightly different scores. This is mitigated because `ZREMRANGEBYSCORE` uses `window_start = now - window_size` from the same instance's clock -- the cleanup is consistent with the insertion for each instance. In practice, NTP keeps instances within milliseconds of each other, and a few milliseconds of skew in a 1-second or 60-second window is negligible.
+
+- **Sorted set grows unbounded.** Every request adds a member to the sorted set. Without cleanup, a high-traffic tenant could accumulate millions of entries. Two mechanisms prevent this: (a) `ZREMRANGEBYSCORE` at the start of every Lua script execution removes entries outside the window, and (b) `EXPIRE` on every `ZADD` sets a TTL on the key (2 seconds for RPS, 120 seconds for RPM). If no requests arrive after the TTL, Redis deletes the entire key. The sorted set is self-cleaning.
+
+- **Midnight rollover for token budget.** The daily token key includes the date (`YYYY-MM-DD`). At midnight (in the gateway's local timezone), `date.today().isoformat()` returns a new date string, and subsequent requests write to a new key. The previous day's key has a 25-hour TTL and will be auto-deleted. There is no explicit reset operation -- the rollover is implicit in the key naming scheme.
+
+- **`retry_after` calculation for token budget.** `check_token_budget()` computes seconds until midnight UTC using `datetime.now(timezone.utc)`. If the gateway process uses a non-UTC timezone, `date.today()` for the key name uses local time while `retry_after` uses UTC. This mismatch means the `retry_after` value may be slightly off (the key rolls over at local midnight, but `retry_after` counts down to UTC midnight). The `max(1.0, retry_after)` guard prevents negative or zero values.
+
+### Observability
+
+**Structured log events:**
+- `rate_limit_exceeded` -- logged when RPS or RPM limit is hit. Includes `tenant_id`, `limit_type` (rps or rpm), `limit`, `current`, and `retry_after`. Enables operators to identify which tenants are hitting limits and which dimension is the bottleneck.
+- `token_budget_exceeded` -- logged when daily token budget is exhausted. Includes `tenant_id`, `limit_type` (token_budget_daily), `limit`, `current`, and `retry_after`.
+- `rate_limit_check_failed` -- logged when the rate limiter throws an unexpected exception (Redis failure). Includes the error string. Indicates Redis connectivity problems.
+- `token_recording_failed` -- logged when `record_tokens()` fails after a successful response. Includes the error string. The response was already sent to the client; token recording is best-effort.
+
+**Response headers:**
+- `X-Ratelimit-Remaining-Rps` -- remaining requests in the current 1-second window. Set by `request_id_middleware` in `gateway/main.py`.
+- `X-Ratelimit-Remaining-Rpm` -- remaining requests in the current 60-second window. Set alongside the RPS header.
+- `Retry-After` -- integer seconds until the client should retry. Set on 429 responses only.
+
+**429 response body:**
+- Structured JSON: `{"error": "rate_limit_exceeded" | "token_budget_exceeded", "type": "rps" | "rpm" | "token_budget_daily", "limit": <int>, "current": <int>, "retry_after": <float>}`. Clients can programmatically determine which limit was hit and how long to wait.
+
+### Testing
+
+**Unit tests** (`tests/unit/test_rate_limiter.py`, 15 tests with mocked Redis):
+
+- `TestCheckRateLimit` (6 tests):
+  - `test_allows_under_rps_limit` -- Lua script returns `[1, 3]` (allowed, count=3). Asserts `allowed is True` and `info is None`.
+  - `test_denies_at_rps_limit` -- Lua script returns `[0, 10]` (denied, count=10). Asserts `allowed is False`, `info["limit_type"] == "rps"`, `info["retry_after"] == 1.0`.
+  - `test_rps_passes_rpm_denies` -- First Lua call returns `[1, 5]` (RPS allowed), second returns `[0, 60]` (RPM denied). Uses `side_effect` on the mock script to vary return values by call count. Asserts `info["limit_type"] == "rpm"`.
+  - `test_rps_checked_before_rpm` -- Lua script returns `[0, 10]` (RPS denied). Asserts the script was called only once (`script.call_count == 1`), proving RPM was not checked.
+  - `test_no_limits_always_allows` -- Both `rps_limit` and `rpm_limit` are `None`. Asserts `allowed is True` and `script.call_count == 0` (no Redis interaction).
+  - `test_both_limits_pass` -- Lua script returns `[1, 5]` for both calls. Asserts `allowed is True` and `script.call_count == 2` (both dimensions checked).
+
+- `TestTokenBudget` (4 tests):
+  - `test_under_budget_allows` -- `redis.get` returns `"5000"`, budget is 100000. Asserts `allowed is True`.
+  - `test_exceeded_budget_denies` -- `redis.get` returns `"100001"`, budget is 100000. Asserts `allowed is False`, `info["limit_type"] == "token_budget_daily"`.
+  - `test_none_budget_always_allows` -- Budget is `None`. Asserts `allowed is True` and `redis.get` was not called.
+  - `test_no_existing_tokens_allows` -- `redis.get` returns `None` (key does not exist). Asserts `allowed is True`.
+
+- `TestRecordTokens` (1 test):
+  - `test_increments_counter` -- Calls `record_tokens("t1", 500)`. Asserts `redis.incrby` and `redis.expire` were each called once, and the returned total matches the mock return value (8500).
+
+- `TestGetRemaining` (4 tests):
+  - `test_rps_remaining` -- `zcard` returns 3, limit is 10. Asserts `remaining["rps"] == 7`.
+  - `test_rpm_remaining` -- `zcard` returns 50, limit is 60. Asserts `remaining["rpm"] == 10`.
+  - `test_no_limits_empty_dict` -- Both limits `None`. Asserts `remaining == {}`.
+  - `test_at_limit_returns_zero` -- `zcard` returns 10, limit is 10. Asserts `remaining["rps"] == 0`.
+
+**Integration tests** (`tests/integration/test_rate_limiter.py`, 7 tests with `_MockRateLimiter`):
+
+- `TestRateLimitEnforcement` (3 tests):
+  - `test_429_when_rate_limit_exceeded` -- `_MockRateLimiter(deny_after=3)` allows first 3 requests, denies the rest. Sends 5 sequential requests. Asserts `results.count(200) == 3` and `results.count(429) == 2`.
+  - `test_429_includes_retry_after_header` -- `_MockRateLimiter(deny_after=0)` denies all. Asserts `"retry-after" in resp.headers`.
+  - `test_429_json_body_structure` -- Denies all. Asserts the 429 body contains `error`, `type`, `limit`, and `retry_after` fields.
+
+- `TestRateLimitHeaders` (2 tests):
+  - `test_remaining_headers_on_success` -- Asserts `x-ratelimit-remaining-rps` and `x-ratelimit-remaining-rpm` headers are present on 200 responses.
+  - `test_remaining_decreases_with_requests` -- Sends 3 sequential requests, collects `x-ratelimit-remaining-rps` values. Asserts `remaining_values[0] > remaining_values[2]`.
+
+- `TestGracefulDegradation` (1 test):
+  - `test_no_rate_limiter_passes_through` -- Patches `rate_limiter` to `None`. Asserts the request succeeds with 200 and no rate limit headers are present.
+
+- `TestTokenBudget` (1 test):
+  - `test_token_recording_after_response` -- Asserts `mock_rl._tokens_recorded == 8` after a successful response (matching `_mock_response().usage.total_tokens`).
+
+**E2E (Docker):**
+- 15 concurrent requests against `tenant-alpha` (which has `rate_limit_rps: 10`). Approximately 10 requests pass with 200 and approximately 5 are rejected with 429. The exact split depends on Redis timing and request arrival order. The 429 responses include `Retry-After: 1` and structured JSON bodies.
+
+### Production gaps
+
+- **No streaming token recording.** `record_tokens()` is called after non-streaming responses only (line 218-222 in `chat.py`). Streaming responses do not have a `usage` object in the final response -- the total token count is unknown until the stream completes. Recording tokens for streaming would require accumulating chunk-level token counts or using the `stream_options: {"include_usage": true}` extension, which not all backends support.
+- **No admin endpoint for rate limit stats.** There is no `GET /admin/rate-limits` endpoint to view current usage per tenant (current RPS, RPM, token total). Operators must query Redis directly (`ZCARD ratelimit:tenant-alpha:rps`, `GET ratelimit:tenant-alpha:tokens:2026-03-26`) to inspect rate limit state.
+- **No Prometheus metrics.** Rate limit denials, token usage, and Redis errors are logged but not exported as Prometheus counters or histograms. Phase 10 would add `rate_limit_denied_total{tenant, limit_type}`, `tokens_used_total{tenant}`, and `rate_limit_check_errors_total` metrics.
+- **No per-backend rate limits.** Rate limits are per-tenant only. There is no mechanism to limit how many requests a single backend receives per second (independent of tenant). If a backend has a provider-imposed rate limit (e.g., OpenAI's 60 RPM per API key), the gateway does not enforce or respect it. Per-backend rate limits would require a separate set of Redis keys keyed by backend name.
+- **No burst allowance.** The sliding window enforces a strict maximum. There is no "burst capacity" that allows temporary spikes above the limit. A token bucket or leaky bucket hybrid would allow controlled bursts, but as noted in alternatives, LLM backends generally cannot handle bursts.
+- **No rate limit reset or override endpoint.** Operators cannot reset a tenant's token budget counter mid-day or temporarily increase a tenant's RPS limit without editing `backends.yaml` and reloading config.
+
+### Interview talking points
+
+- **Why sliding window over fixed window or token bucket.** Fixed windows have the boundary burst problem (2x limit at the boundary). Token bucket allows bursts that LLM backends cannot absorb. Sliding window via sorted sets gives a true per-second or per-minute limit with no boundary effects and no burst spikes. The tradeoff is memory (one sorted set member per request in the window vs a single integer counter), but with typical RPS limits of 10-100, the sorted set holds at most 100 members -- negligible.
+- **Why Redis Lua for atomicity instead of Redis transactions.** Redis `MULTI/EXEC` transactions cannot read a value and make a conditional decision based on it in the same transaction -- there is no "read, branch, write" flow. Lua scripts execute atomically on the Redis server with full access to the Lua language for conditionals and loops. The `_SLIDING_WINDOW_SCRIPT` reads the count, checks against the limit, and conditionally writes -- all without any interleaving from other clients. This is the standard pattern for rate limiting with Redis.
+- **Graceful degradation as a first-class design choice.** The gateway's value is proxying LLM requests. If the rate limiter fails, the correct response is to allow the request (fail open), not to reject it (fail closed). Every interaction with the rate limiter is wrapped in a try/except that logs and continues. This is a deliberate tradeoff: during a Redis outage, tenants are temporarily unlimited, but the gateway continues serving its primary function. The alternative (fail closed) would mean a Redis outage causes a complete gateway outage for all tenants.
+
+### Likely interview questions
+
+**Q: "How does the sliding window prevent the boundary burst problem?"**
+**A:** Fixed-window counters reset at a fixed boundary (e.g., every second on the second). A client can send `limit` requests at t=0.99 (end of window 1) and `limit` requests at t=1.01 (start of window 2), achieving 2x the limit in a 0.02-second span. The sliding window has no fixed boundaries. At t=1.01, `ZREMRANGEBYSCORE` removes entries older than t=0.01. The entries from t=0.99 are still in the window (they are only 0.02 seconds old). So the count correctly reflects recent activity regardless of when the requests arrive relative to any clock boundary.
+
+**Q: "What happens if Redis goes down while the gateway is running?"**
+**A:** Any exception from the rate limiter is caught in the `try/except` block in the route handler. The exception is logged as `rate_limit_check_failed`, and the request proceeds as if rate limiting were disabled. This is fail-open behavior. The gateway continues proxying LLM requests without rate limiting until Redis recovers. On the next request after Redis recovers, `check_rate_limit()` will succeed normally -- there is no reconnection logic needed because `redis.asyncio` handles reconnection transparently.
+
+**Q: "Why not use Redis server time instead of client-provided timestamps?"**
+**A:** The Lua script uses `ARGV[2]` (the gateway's `time.time()`) for `ZADD` scores and `ARGV[1]` (the gateway's `now - window_size`) for `ZREMRANGEBYSCORE`. Using Redis `TIME` command inside the Lua script would be possible but adds a Redis call per script execution. More importantly, the gateway timestamps are consistent with each other -- `window_start` and `now` come from the same `time.time()` call, so the window is exactly `window_size` seconds. If Redis server time drifted from gateway time, the cleanup and insertion would use different time bases, potentially leaving stale entries or removing valid ones. In practice, NTP keeps all servers within milliseconds, making this a theoretical concern.
+
+**Q: "How would you handle rate limiting for streaming requests?"**
+**A:** RPS and RPM rate limiting works identically for streaming and non-streaming -- the check happens before the request is dispatched to the backend. The gap is in token budget recording: streaming responses do not have a `usage` object in the final SSE event (most providers do not include it). To record tokens for streaming, the gateway would need to either (a) count tokens by parsing the streamed content chunks (approximate, requires a tokenizer), (b) use the `stream_options.include_usage` extension (provider-dependent), or (c) estimate based on the prompt size and a heuristic for response length. Currently, streaming requests consume RPS/RPM budget but not token budget.
