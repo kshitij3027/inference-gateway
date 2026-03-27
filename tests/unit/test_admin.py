@@ -3,6 +3,7 @@ import yaml
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from gateway.circuit_breaker import CircuitBreakerRegistry
 from gateway.config import GatewayConfig, Registry
 from gateway.routes.admin import router as admin_router
 
@@ -13,6 +14,9 @@ def _make_test_app(registry: Registry, config_path: str = "") -> FastAPI:
     app.include_router(admin_router)
     app.state.registry = registry
     app.state.config_path = config_path
+    app.state.circuit_breakers = CircuitBreakerRegistry(
+        list(registry.backends.keys())
+    )
     return app
 
 

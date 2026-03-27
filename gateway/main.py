@@ -9,6 +9,7 @@ import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
 
+from gateway.circuit_breaker import CircuitBreakerRegistry
 from gateway.config import ConfigError, Registry, load_config
 from gateway.observability.logging import setup_logging
 from gateway.routes.admin import router as admin_router
@@ -32,6 +33,9 @@ async def lifespan(app: FastAPI):
 
     app.state.config_path = CONFIG_PATH
     app.state.registry = Registry(config)
+    app.state.circuit_breakers = CircuitBreakerRegistry(
+        list(app.state.registry.backends.keys())
+    )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
     # SIGHUP handler for hot-reload
@@ -39,6 +43,9 @@ async def lifespan(app: FastAPI):
         try:
             new_config = load_config(CONFIG_PATH)
             app.state.registry = Registry(new_config)
+            app.state.circuit_breakers.sync_backends(
+                list(app.state.registry.backends.keys())
+            )
             logger.info("config_reloaded_via_sighup")
         except ConfigError as e:
             logger.error("sighup_reload_failed", error=str(e))

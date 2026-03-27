@@ -19,6 +19,9 @@ async def reload_config(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
     request.app.state.registry = new_registry
+    request.app.state.circuit_breakers.sync_backends(
+        list(new_registry.backends.keys())
+    )
     logger.info(
         "config_reloaded",
         backends=len(config.backends),
