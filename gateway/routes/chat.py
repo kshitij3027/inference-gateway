@@ -2,6 +2,7 @@ import time
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from gateway.auth import get_current_tenant
 from gateway.backends import anthropic as anthropic_backend
@@ -17,6 +18,12 @@ TRANSLATORS = {
     "ollama": ollama.chat_completion,
     "openai": openai_backend.chat_completion,
     "anthropic": anthropic_backend.chat_completion,
+}
+
+STREAM_TRANSLATORS = {
+    "ollama": ollama.stream_chat_completion,
+    "openai": openai_backend.stream_chat_completion,
+    "anthropic": anthropic_backend.stream_chat_completion,
 }
 
 
@@ -42,7 +49,35 @@ async def chat_completions(
             detail=f"No backend available for model: {chat_request.model}",
         )
 
-    # Dispatch to provider-specific translator
+    # Streaming path
+    if chat_request.stream:
+        stream_translator = STREAM_TRANSLATORS.get(backend.provider)
+        if stream_translator is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported provider for streaming: {backend.provider}",
+            )
+
+        logger.info(
+            "chat_request_received",
+            model=chat_request.model,
+            tenant_id=tenant.id,
+            backend=backend.name,
+            provider=backend.provider,
+            streaming=True,
+            message_count=len(chat_request.messages),
+        )
+
+        return StreamingResponse(
+            stream_translator(
+                client=request.app.state.http_client,
+                backend=backend,
+                request=chat_request,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming path
     translator = TRANSLATORS.get(backend.provider)
     if translator is None:
         raise HTTPException(
