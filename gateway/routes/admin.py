@@ -58,3 +58,30 @@ async def list_backends(request: Request):
         }
         for b in registry.backends.values()
     ]
+
+
+@router.get("/cache/stats")
+async def cache_stats(request: Request):
+    """Return semantic cache statistics."""
+    semantic_cache = getattr(request.app.state, "semantic_cache", None)
+    if semantic_cache is None:
+        return {"enabled": False, "message": "Semantic cache not available"}
+    try:
+        stats = await semantic_cache.get_stats()
+        return {"enabled": True, **stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache stats error: {e}")
+
+
+@router.delete("/cache")
+async def flush_cache(request: Request):
+    """Flush all cached responses."""
+    semantic_cache = getattr(request.app.state, "semantic_cache", None)
+    if semantic_cache is None:
+        raise HTTPException(status_code=503, detail="Semantic cache not available")
+    try:
+        count = await semantic_cache.flush()
+        logger.info("cache_flushed", entries_deleted=count)
+        return {"status": "flushed", "entries_deleted": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache flush error: {e}")

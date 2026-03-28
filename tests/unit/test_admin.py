@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import pytest
 import yaml
 from fastapi import FastAPI
@@ -99,3 +101,52 @@ class TestReloadConfig:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post("/admin/reload")
         assert resp.status_code == 400
+
+
+class TestCacheStats:
+    async def test_returns_stats(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_cache = AsyncMock()
+        mock_cache.get_stats = AsyncMock(return_value={
+            "hits": 10, "misses": 90, "hit_rate": 0.1, "entries": 5,
+        })
+        app.state.semantic_cache = mock_cache
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/cache/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["hits"] == 10
+        assert data["entries"] == 5
+
+    async def test_returns_disabled_when_no_cache(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.semantic_cache = None
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/cache/stats")
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+
+
+class TestCacheFlush:
+    async def test_flush_returns_count(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_cache = AsyncMock()
+        mock_cache.flush = AsyncMock(return_value=42)
+        app.state.semantic_cache = mock_cache
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.delete("/admin/cache")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "flushed"
+        assert resp.json()["entries_deleted"] == 42
+
+    async def test_flush_returns_503_when_no_cache(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.semantic_cache = None
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.delete("/admin/cache")
+        assert resp.status_code == 503
