@@ -206,3 +206,74 @@ class TestCacheIntegration:
                 assert "data: [DONE]" in text
                 # The tee should have called store
                 mock_cache.store.assert_called_once()
+
+
+class TestStampedeGuardIntegration:
+    async def test_stampede_lock_acquired_and_released(self, test_env, mock_translator):
+        """On cache miss, stampede lock should be acquired and released."""
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.record_miss = AsyncMock()
+            mock_cache.store = AsyncMock()
+            mock_cache.acquire_stampede_lock = AsyncMock(return_value=(True, "cache:lock:abc"))
+            mock_cache.release_stampede_lock = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "hello"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            mock_cache.acquire_stampede_lock.assert_called_once()
+            mock_cache.release_stampede_lock.assert_called_once_with("cache:lock:abc")
+
+    async def test_stampede_wait_returns_cached_result(self, test_env, mock_translator):
+        """When lock is not acquired, waiter should get result from wait_for_cached_result."""
+        cached = _make_response(content="stampede cached")
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.record_miss = AsyncMock()
+            mock_cache.record_hit = AsyncMock()
+            mock_cache.acquire_stampede_lock = AsyncMock(return_value=(False, "cache:lock:abc"))
+            mock_cache.wait_for_cached_result = AsyncMock(return_value=(cached, 0.99))
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "hello"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            assert resp.headers.get("X-Cache") == "HIT"
+            body = resp.json()
+            assert body["choices"][0]["message"]["content"] == "stampede cached"
+
+    async def test_stampede_wait_timeout_falls_through(self, test_env, mock_translator):
+        """When stampede wait times out, request should fall through to backend."""
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.record_miss = AsyncMock()
+            mock_cache.store = AsyncMock()
+            mock_cache.acquire_stampede_lock = AsyncMock(return_value=(False, "cache:lock:abc"))
+            mock_cache.wait_for_cached_result = AsyncMock(return_value=(None, None))
+            mock_cache.release_stampede_lock = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "hello"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            # Should have fallen through to backend
+            assert resp.headers.get("X-Cache") == "MISS"

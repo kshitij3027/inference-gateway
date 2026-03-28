@@ -213,6 +213,36 @@ async def chat_completions(
             logger.warning("cache_lookup_failed", error=str(e))
             request.state.cache_status = "MISS"
 
+    # Stampede guard (non-streaming only)
+    lock_acquired = False
+    lock_key = ""
+    if semantic_cache is not None and not chat_request.stream:
+        try:
+            lock_acquired, lock_key = await semantic_cache.acquire_stampede_lock(
+                chat_request.model, chat_request.messages
+            )
+            if not lock_acquired:
+                # Another request is computing this — wait for it
+                waited_response, waited_similarity = await semantic_cache.wait_for_cached_result(
+                    chat_request.model, chat_request.messages,
+                    tenant.id, cache_isolation, timeout=30.0,
+                )
+                if waited_response is not None:
+                    await semantic_cache.record_hit()
+                    request.state.cache_status = "HIT"
+                    request.state.cache_similarity = waited_similarity
+                    logger.info(
+                        "stampede_guard_hit",
+                        model=chat_request.model,
+                        tenant_id=tenant.id,
+                        similarity=waited_similarity,
+                    )
+                    return waited_response
+                # Timeout — fall through to backend call
+                logger.info("stampede_guard_timeout", model=chat_request.model)
+        except Exception as e:
+            logger.warning("stampede_guard_failed", error=str(e))
+
     # Find backend for model
     registry = request.app.state.registry
     routing_key = f"{tenant.id}:{chat_request.model}"
@@ -337,6 +367,13 @@ async def chat_completions(
                     )
                 except Exception as e:
                     logger.warning("cache_store_failed", error=str(e))
+
+            # Release stampede lock after cache store
+            if lock_acquired and lock_key:
+                try:
+                    await semantic_cache.release_stampede_lock(lock_key)
+                except Exception:
+                    pass
 
             return result
 
