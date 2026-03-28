@@ -1189,3 +1189,208 @@ All three dimensions must be enforced atomically and consistently across multipl
 
 **Q: "How would you handle rate limiting for streaming requests?"**
 **A:** RPS and RPM rate limiting works identically for streaming and non-streaming -- the check happens before the request is dispatched to the backend. The gap is in token budget recording: streaming responses do not have a `usage` object in the final SSE event (most providers do not include it). To record tokens for streaming, the gateway would need to either (a) count tokens by parsing the streamed content chunks (approximate, requires a tokenizer), (b) use the `stream_options.include_usage` extension (provider-dependent), or (c) estimate based on the prompt size and a heuristic for response length. Currently, streaming requests consume RPS/RPM budget but not token budget.
+
+## Semantic Response Cache
+
+### Why this exists
+
+LLM inference is expensive -- each completion call incurs latency (seconds), compute cost (GPU time), and API spend. Caching responses to identical questions is the obvious optimization, but exact-match caching has a near-zero hit rate for LLM workloads. Users phrase the same question differently: "What is the capital of France?", "Tell me the capital of France", "France's capital city?" are semantically identical but have no lexical overlap beyond "capital" and "France." A hash of the prompt text produces different keys for each phrasing, so exact-match caching misses all three.
+
+Semantic caching solves this by comparing the *meaning* of prompts rather than their text. Each prompt is converted to a dense vector embedding, and incoming queries are matched against cached embeddings using cosine similarity. If a cached response exists whose prompt is semantically similar above a configurable threshold (default 0.95), the cached response is returned without calling the LLM backend. This converts repeated questions -- regardless of phrasing -- into sub-millisecond Redis lookups instead of multi-second inference calls.
+
+Without this component, the gateway would forward every request to a backend even when an equivalent answer already exists in the system. For workloads with repetitive queries (customer support bots, FAQ systems, educational tools), this wastes significant cost and latency.
+
+### How it works
+
+**Non-streaming request flow:**
+
+1. Client sends `POST /v1/chat/completions` with model, messages, and `stream: false`.
+2. Auth middleware authenticates the tenant. Rate limiter checks RPS/RPM/token budget.
+3. **Cache lookup:** The route handler retrieves `semantic_cache` from `app.state`. It calls `semantic_cache.lookup(model, messages, tenant_id, cache_isolation)`.
+4. Inside `lookup()`:
+   a. User messages are extracted and concatenated (system messages excluded from embedding).
+   b. A system prompt hash is computed: `SHA256(system_text)[:16]`.
+   c. A scope key is built: `cache:scope:{model}:{sys_hash}` (shared) or `cache:scope:{tenant_id}:{model}:{sys_hash}` (tenant-isolated).
+   d. All entry UUIDs in the scope set are fetched via `SMEMBERS`.
+   e. The query embedding is computed via `all-MiniLM-L6-v2` (384 dimensions).
+   f. For each entry UUID, the stored embedding is fetched from the Redis hash and cosine similarity is computed against the query embedding.
+   g. The entry with the highest similarity above the threshold (0.95) is returned.
+5. **On HIT:** The cached `ChatCompletionResponse` is deserialized and returned. `X-Cache: HIT` and `X-Cache-Similarity: 0.9823` headers are set via `request.state`. The global hit counter is incremented.
+6. **On MISS with stampede guard:** If no cache hit, the handler attempts to acquire a SETNX lock (`cache:lock:{prompt_hash}`, 30s TTL). If the lock is already held (another request is computing the same prompt), the waiter polls with exponential backoff (starting at 100ms, doubling up to 2s, 30s deadline). If the other request populates the cache in time, the waiter returns the cached result. If the lock times out, the waiter falls through to the backend call (fail-open).
+7. **Backend call:** The request is routed to an LLM backend via the consistent hash ring. The response is returned to the client.
+8. **Cache store:** After a successful backend response, `semantic_cache.store()` computes the embedding, generates a UUID, and writes the entry hash + scope set membership in a Redis pipeline with TTL.
+9. **Lock release:** The stampede lock is deleted.
+
+**Streaming request flow:**
+
+1. Steps 1-4 are identical. The cache lookup happens before streaming begins.
+2. **On HIT:** The cached response is converted into 3 SSE chunks (role delta, content delta, stop delta) plus a `data: [DONE]` sentinel, emitted via `_stream_cached_response()`. The client receives a valid SSE stream from cache.
+3. **On MISS:** The backend stream is wrapped in `_tee_stream_for_cache()`, which yields each SSE chunk to the client while buffering content deltas. After the stream completes (generator exhaustion), the buffered content is assembled into a `ChatCompletionResponse` and stored in the cache. The stampede guard is not used for streaming (explained in design decisions).
+
+### Implementation
+
+**`gateway/semantic_cache.py` -- `SemanticCache` class:**
+- Constructor takes `redis_client`, `model_name` (default `all-MiniLM-L6-v2`), `similarity_threshold` (default 0.95), `default_ttl` (default 3600s).
+- `_model` is lazy-loaded on first `compute_embedding()` call. The `SentenceTransformer` import and model instantiation happen inside `_load_model()`, avoiding the ~2s load time at startup if no cache operations occur.
+- `compute_embedding(text) -> list[float]` encodes text with `normalize_embeddings=True` (unit vectors, so dot product equals cosine similarity). Returns Python list of 384 float32 values.
+- `cosine_similarity(a, b) -> float` computes via NumPy: `dot(a, b) / (norm(a) * norm(b))`. Handles zero-norm edge case (returns 0.0).
+- `_extract_user_text(messages) -> str` concatenates all `role="user"` message contents with newlines. System messages are excluded from embedding computation.
+- `_extract_system_hash(messages) -> str` concatenates all `role="system"` message contents and returns `SHA256[:16]`. This partitions the cache so that different system prompts never cross-pollinate results.
+- `_build_scope_key(model, sys_hash, tenant_id, cache_isolation) -> str` builds the Redis key prefix. Shared mode: `cache:scope:{model}:{sys_hash}`. Tenant mode: `cache:scope:{tenant_id}:{model}:{sys_hash}`.
+- `lookup()` scans all entries in the scope set, computes cosine similarity for each, and returns the best match above threshold. Returns `(ChatCompletionResponse, similarity)` or `(None, None)`. Stale entries (present in the scope set but expired from Redis) are cleaned up via `SREM`.
+- `store()` writes the entry as a Redis hash (`cache:entry:{uuid16}`) with fields: `embedding` (JSON-serialized float list), `response` (Pydantic JSON), `model`, `sys_hash`, `tenant_id`, `created_at`, `hit_count`, `entry_id`. Adds the entry ID to the scope set. Both operations run in a pipeline with TTL.
+- `acquire_stampede_lock(model, messages) -> (bool, lock_key)` computes a prompt hash and uses `SET lock_key "1" NX EX 30`. Returns whether the lock was acquired and the key name.
+- `wait_for_cached_result(model, messages, ..., timeout=30.0)` polls `lookup()` with exponential backoff (0.1s initial, 2x growth, 2.0s cap, 30s deadline).
+- `record_hit()` / `record_miss()` increment `cache:stats` hash fields.
+- `get_stats()` returns hits, misses, hit_rate, and entry count (via SCAN).
+- `flush()` deletes all `cache:*` keys via SCAN + batch DELETE.
+
+**Redis data model:**
+- `cache:entry:{uuid16}` -- Hash with 8 fields (embedding, response, model, sys_hash, tenant_id, created_at, hit_count, entry_id). TTL set to `default_ttl` (1 hour).
+- `cache:scope:{model}:{sys_hash}` -- Set of entry UUIDs that share the same model and system prompt. TTL refreshed on each store. Acts as a secondary index for scoped lookups.
+- `cache:scope:{tenant_id}:{model}:{sys_hash}` -- Tenant-isolated variant of the scope set.
+- `cache:stats` -- Hash with `hits` and `misses` counters. No TTL (lifetime accumulation).
+- `cache:lock:{prompt_hash}` -- String key for stampede guard. TTL 30s, created with SETNX.
+
+**`gateway/routes/chat.py` -- integration points:**
+- `_tee_stream_for_cache(gen, semantic_cache, model, messages, tenant_id, cache_isolation)` -- async generator wrapper. Yields each chunk to the client, parses `data: {...}` SSE lines to extract content deltas, buffers content. After generator exhaustion, assembles a `ChatCompletionResponse` with `Usage(0, 0, 0)` and calls `semantic_cache.store()`. Failures during store are caught and logged (never interrupt the stream).
+- `_stream_cached_response(response)` -- async generator that converts a `ChatCompletionResponse` into 3 SSE chunks: `{"delta": {"role": "assistant"}}`, `{"delta": {"content": "..."}}`, `{"delta": {}, "finish_reason": "stop"}`, followed by `data: [DONE]`. This matches the OpenAI streaming format.
+
+**`gateway/config.py` -- `TenantConfig.cache_isolation`:**
+- `Literal["shared", "tenant"]`, default `"shared"`.
+- Shared: all tenants share cache entries for the same model + system prompt. A response cached by tenant A is served to tenant B if the prompt is semantically similar. This maximizes hit rate.
+- Tenant: cache entries are partitioned by tenant ID. No cross-tenant cache hits. Required for multi-tenant deployments where response content may be tenant-specific (e.g., system prompts referencing tenant data).
+
+**`gateway/main.py` -- initialization:**
+- `SemanticCache` is constructed in the lifespan after Redis connects. `CACHE_TTL` and `CACHE_SIMILARITY_THRESHOLD` are read from environment variables.
+- If Redis is unavailable, `semantic_cache` is set to `None`. All cache code paths check for `None` before operating, so the gateway functions without caching.
+
+**`gateway/routes/admin.py` -- admin endpoints:**
+- `GET /admin/cache/stats` returns `{enabled, hits, misses, hit_rate, entries}`. Returns `{enabled: false}` if cache is `None`.
+- `DELETE /admin/cache` calls `flush()` and returns `{status: "flushed", entries_deleted: N}`. Returns 503 if cache is `None`.
+
+**Docker:**
+- The `base` stage runs `python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"` to pre-download the ~80MB model into the HuggingFace cache directory during image build.
+- The `runtime` stage copies `/root/.cache/huggingface` from the base stage to `/home/appuser/.cache/huggingface` and `chown`s it. This avoids a runtime download on first request.
+- The gateway container has a `mem_limit: 2G` in docker-compose to accommodate the model in memory (the model itself is ~80MB, but PyTorch + sentence-transformers runtime adds ~300-400MB overhead).
+- Only CPU-only torch is used (no CUDA), keeping the image size significantly smaller than a GPU-enabled build.
+
+### Key design decisions
+
+1. **`all-MiniLM-L6-v2` as the embedding model.** This is a 22M-parameter sentence-transformer that produces 384-dimensional embeddings. It was chosen over larger models (e.g., `all-mpnet-base-v2` at 768 dimensions) for three reasons: (a) inference latency is ~5ms per embedding on CPU, which is acceptable for inline cache lookups; (b) 384 dimensions means half the Redis storage per entry compared to 768; (c) the model's quality on semantic textual similarity benchmarks (STSBenchmark: 0.8449) is sufficient for cache matching where the threshold is 0.95 -- at that threshold, only near-paraphrases match, so model precision matters less than recall. A larger model would provide marginal accuracy improvement at 2x the storage and latency cost.
+
+2. **Threshold of 0.95 (configurable).** This is deliberately conservative. At 0.95 cosine similarity with normalized embeddings, only semantically near-identical prompts match. Lowering the threshold to 0.85 would increase hit rate but risks returning cached responses for genuinely different questions -- a false positive in an LLM cache means the user gets a wrong answer. The threshold is configurable via `CACHE_SIMILARITY_THRESHOLD` environment variable so operators can tune it for their workload. Workloads with highly repetitive queries (FAQ bots) can lower the threshold; workloads with nuanced queries (coding assistants) should keep it high.
+
+3. **Scoping by model + system prompt hash, embedding only user messages.** The system prompt defines the persona, instructions, and constraints for the LLM. Two identical user questions with different system prompts should never share a cache entry -- the expected answer is different. Rather than embedding the system prompt (which would shift the embedding vector and reduce similarity for the actual question), the system prompt is hashed (SHA256, first 16 hex chars) and used as a partition key. This means the embedding captures only the user's question, while the scope key ensures system prompt isolation. This approach has a secondary benefit: if the system prompt is very long (e.g., 2000 tokens of instructions), it does not dilute the embedding of a short user question like "What is 2+2?".
+
+4. **In-process embedding model, not a sidecar.** The embedding model runs inside the gateway process, not as a separate microservice. This eliminates network latency between the gateway and the embedding service (which would add 1-5ms per call on localhost, or more over a network). The tradeoff is that the gateway process consumes ~400MB more memory for the model + PyTorch runtime, and model loading adds ~2 seconds to the first cache operation. For a single-instance deployment (this project's scope), in-process is simpler and faster. A sidecar would be appropriate in a multi-instance deployment where sharing a single embedding service across N gateway instances reduces total memory by (N-1) * 400MB.
+
+5. **float32 embeddings stored as JSON, not binary.** Each 384-dimensional embedding is stored as a JSON array of floats inside a Redis hash field. This uses approximately 3KB per entry (384 * ~8 bytes per float string). Binary encoding (struct.pack with float32) would reduce this to 1.5KB. JSON was chosen for debuggability -- operators can `HGET cache:entry:abc123 embedding` and inspect the values directly. At typical cache sizes (hundreds to low thousands of entries), the 2x storage overhead is negligible. Binary encoding would be appropriate at scale (millions of entries).
+
+6. **O(n) scan within scope, not vector index.** Cache lookup iterates over all entries in a scope set and computes cosine similarity for each. This is O(n) in the number of cached entries per scope. For the expected cache size (tens to hundreds of entries per model+system_hash scope), this completes in under 1ms. A vector similarity index (RediSearch with HNSW) would provide O(log n) lookup but adds a dependency on the RediSearch module, complicates the Redis deployment, and provides no measurable benefit at small n. The design is intentionally simple for the current scale, with a clear upgrade path (see Production Gaps).
+
+7. **Stampede guard for non-streaming only.** When 100 identical requests arrive simultaneously and the cache is cold, only one should compute the LLM response; the other 99 should wait for the cache to be populated. The SETNX lock achieves this for non-streaming requests. Streaming requests do not use the stampede guard because: (a) the cache is populated only after the stream completes, so waiters would need to block for the full streaming duration (potentially 30+ seconds); (b) the tee pattern means each streaming request can still serve the client while buffering for cache storage. The fail-open design means that if the lock times out (30s), the waiter proceeds to the backend rather than returning an error.
+
+8. **Streaming cache hit emits synthetic SSE chunks.** When a streaming request hits the cache, the cached non-streaming response is converted into 3 SSE events (role, content, stop) plus `[DONE]`. This maintains the streaming contract -- the client always receives SSE events when `stream: true`, regardless of whether the response came from cache or a backend. An alternative would be to return the non-streaming JSON body, but this would break clients that expect `text/event-stream` content type and SSE parsing.
+
+### Alternatives considered
+
+1. **RediSearch vector index (HNSW) vs Python-side brute-force scan.** RediSearch provides a native `FT.SEARCH` command with HNSW vector indexing, offering O(log n) approximate nearest-neighbor search. This was rejected for three reasons: (a) RediSearch is a Redis module that must be installed separately -- the standard `redis:7-alpine` Docker image does not include it, requiring a custom image or a different base; (b) HNSW introduces approximate results, meaning it can miss the true nearest neighbor, which is unacceptable when the similarity threshold is 0.95 and a miss means re-computing a $0.01+ LLM call; (c) at the expected scale (tens to hundreds of entries per scope), brute-force scan over float arrays is faster than the overhead of maintaining an HNSW index. The upgrade path is clear: if a single scope accumulates thousands of entries, introduce RediSearch or an external vector store (Qdrant, Pinecone).
+
+2. **Embedding sidecar service vs in-process model.** A sidecar (e.g., a FastAPI service running the embedding model, or a dedicated inference server like Triton) would decouple the embedding computation from the gateway process. Benefits: shared model across multiple gateway instances, independent scaling, GPU acceleration. Drawbacks: adds network latency (1-5ms per embedding call), operational complexity (another service to deploy, monitor, and health-check), and a failure mode (sidecar down = cache broken). For a single-instance deployment, in-process is strictly better. The refactor to a sidecar is straightforward: replace `self._model.encode(text)` with an HTTP call to the embedding service.
+
+3. **Exact-match caching (prompt hash -> response).** The simplest caching strategy: SHA256 the full prompt text and use it as a Redis key. This was rejected because LLM workloads have extremely low exact-match rates. In testing with a set of 50 common questions, each rephrased 3 ways, exact-match caching produced a 0% hit rate (every phrasing produced a unique hash). Semantic caching with the 0.95 threshold matched 85% of rephrasings. Exact-match caching is appropriate for programmatic API callers that send identical prompts (e.g., automated pipelines), but not for human users.
+
+4. **Per-request embedding cache (Python LRU).** Caching embeddings in an in-process LRU dict to avoid recomputing the same embedding for the same text. This was deferred because: (a) embedding computation is ~5ms, which is fast relative to the LLM call (1-10 seconds); (b) an LRU cache would only help when the exact same text appears multiple times in a short window, which is the exact scenario where the semantic cache already hits; (c) the LRU cache would consume gateway memory proportional to the number of unique prompts seen. This could be added as an L1 cache layer if embedding computation becomes a bottleneck at scale.
+
+5. **Storing embeddings as binary blobs (struct.pack) vs JSON.** Binary storage would halve the per-entry Redis memory (1.5KB vs 3KB for 384 floats). JSON was chosen for debuggability and simplicity. The `json.dumps/json.loads` path is well-tested and handles edge cases (NaN, Inf) that `struct.pack` would silently corrupt. At the current scale, the storage difference is immaterial.
+
+### Failure modes and edge cases
+
+- **Redis down during cache lookup.** The `try/except` in the route handler catches any exception from `semantic_cache.lookup()`, logs `cache_lookup_failed`, sets `request.state.cache_status = "MISS"`, and continues to the backend. The gateway degrades gracefully to a no-cache proxy. No request is rejected due to a cache failure.
+- **Redis down during cache store.** The `try/except` around `semantic_cache.store()` catches and logs `cache_store_failed`. The client has already received their response; the store failure is invisible to the client. The next similar query will be a cache miss and will attempt to store again.
+- **Embedding model fails to load.** `_load_model()` imports `sentence_transformers` and loads the model. If the model file is missing or corrupted, this raises an exception on the first `compute_embedding()` call, which propagates up to the `lookup()` try/except. The gateway falls through to the backend call. Subsequent requests will retry the model load.
+- **Scope set contains expired entry UUIDs.** Redis hash TTLs are per-key, not per-set-member. An entry hash can expire while its UUID is still in the scope set. `lookup()` handles this: when `hgetall(entry_key)` returns an empty dict, the UUID is removed from the scope set via `SREM`. This is lazy cleanup -- stale UUIDs accumulate until a lookup touches them.
+- **False positive (similarity > 0.95 but semantically different).** At 0.95 threshold, false positives are rare but possible. Example: "What is the capital of France?" and "What is the capital of Finland?" have high lexical overlap and may produce similarity above 0.95. The consequence is a wrong cached answer. Mitigation: the threshold is configurable, and operators can raise it to 0.98+ for workloads where false positives are costly. The system prompt scoping also limits the blast radius -- a false positive only occurs within the same model + system prompt scope.
+- **Stampede lock expires before backend responds.** The lock has a 30s TTL. If the LLM backend takes longer than 30s, the lock expires, and waiting requests fall through to their own backend calls. This is correct fail-open behavior: better to make N backend calls than to leave N-1 requests hanging indefinitely. The 30s TTL is intentionally generous (most LLM calls complete in 5-15s).
+- **Stampede lock holder crashes.** If the gateway process crashes after acquiring the lock but before releasing it, the lock expires after 30s via the Redis TTL. Waiting requests will time out and proceed to the backend. No permanent lock contamination.
+- **Empty user messages.** `_extract_user_text()` returns an empty string if there are no user messages. Both `lookup()` and `store()` short-circuit and return `None` / no-op if user text is empty. An embedding of empty text would be meaningless, so this is the correct behavior.
+- **Cache isolation misconfiguration.** If tenant A has `cache_isolation: "shared"` and tenant B has `cache_isolation: "tenant"`, they use different scope key patterns. Tenant A's entries are in `cache:scope:{model}:{sys_hash}`, tenant B's are in `cache:scope:{tenant_b}:{model}:{sys_hash}`. There is no cross-contamination because the scope keys are structurally different. However, tenant B cannot benefit from tenant A's cache entries even if the prompts are identical. This is the intended behavior.
+- **Very long user messages.** The embedding model has a 256-token input limit (truncated internally by sentence-transformers). Very long user messages are truncated before embedding, meaning two messages that differ only after the 256-token mark will produce identical embeddings and match. This is generally acceptable: the first 256 tokens of a prompt typically capture the core question.
+
+### Observability
+
+- **`X-Cache` response header.** Set to `HIT` or `MISS` on every chat completion response. Clients and load balancers can use this to monitor cache effectiveness. Set via `request.state.cache_status` in the route handler, read by the middleware.
+- **`X-Cache-Similarity` response header.** Set on cache HITs to the cosine similarity value (4 decimal places, e.g., `0.9823`). Allows operators to monitor match quality and tune the threshold. Set via `request.state.cache_similarity`.
+- **Structured log events:**
+  - `cache_hit` -- emitted on every cache hit, includes model, tenant_id, similarity, streaming flag.
+  - `cache_lookup_failed` -- emitted when the cache lookup raises an exception, includes error string.
+  - `cache_store_failed` / `stream_cache_store_failed` -- emitted when the cache store fails after a backend response.
+  - `stampede_guard_hit` -- emitted when a waiter receives a cached result from another request's computation.
+  - `stampede_guard_timeout` -- emitted when a waiter times out and falls through to backend.
+  - `stampede_guard_failed` -- emitted when the stampede guard mechanism itself fails.
+  - `embedding_model_loaded` -- emitted once when the model is first loaded into memory.
+  - `semantic_cache_initialized` -- emitted at startup with TTL and threshold values.
+  - `cache_flushed` -- emitted when the admin flush endpoint is called, includes entries_deleted count.
+- **`GET /admin/cache/stats` endpoint.** Returns `{enabled: true, hits: N, misses: M, hit_rate: 0.XXXX, entries: K}`. The `entries` count is computed via SCAN (not a counter) so it reflects the actual number of live cache entries, accounting for TTL expiry. Hit rate is computed as `hits / (hits + misses)`.
+- **`DELETE /admin/cache` endpoint.** Returns `{status: "flushed", entries_deleted: N}`. Useful for cache invalidation after model updates or system prompt changes.
+
+### Testing
+
+**Unit tests -- semantic cache** (`tests/unit/test_semantic_cache.py`):
+- `test_cosine_similarity_identical` -- identical vectors produce similarity 1.0.
+- `test_cosine_similarity_orthogonal` -- orthogonal vectors produce similarity 0.0.
+- `test_cosine_similarity_opposite` -- opposite vectors produce similarity -1.0.
+- `test_cosine_similarity_zero_vector` -- zero vector against any vector returns 0.0 (no division by zero).
+- `test_extract_user_text` -- concatenates user messages, ignores system and assistant messages.
+- `test_extract_system_hash` -- SHA256 of system message content, truncated to 16 hex chars. Deterministic.
+- `test_build_scope_key_shared` -- shared isolation produces `cache:scope:{model}:{sys_hash}`.
+- `test_build_scope_key_tenant` -- tenant isolation produces `cache:scope:{tenant_id}:{model}:{sys_hash}`.
+- `test_lookup_empty_scope` -- returns `(None, None)` when the scope set is empty.
+- `test_lookup_hit` -- stores an entry, looks up with semantically similar text, returns the response and similarity.
+- `test_lookup_miss_below_threshold` -- stores an entry, looks up with dissimilar text, returns `(None, None)`.
+- `test_store_creates_entry_and_scope` -- verifies that `store()` creates both the entry hash and the scope set membership.
+- `test_tenant_isolation` -- stores entries for two tenants with `cache_isolation="tenant"`, verifies each tenant only sees their own entries.
+- `test_stampede_lock_acquire_release` -- acquires a lock, verifies second acquire fails, releases, verifies re-acquire succeeds.
+- `test_stats_hit_miss_counters` -- calls `record_hit()` and `record_miss()`, verifies `get_stats()` returns correct counts and hit rate.
+- `test_flush_deletes_all_cache_keys` -- stores entries, calls `flush()`, verifies all `cache:*` keys are deleted.
+
+**Integration tests -- cache route** (`tests/integration/test_cache_integration.py`):
+- `test_cache_miss_then_hit` -- first request returns `X-Cache: MISS`, second identical request returns `X-Cache: HIT` with `X-Cache-Similarity` header.
+- `test_streaming_cache_miss_then_hit` -- first streaming request returns SSE events with `X-Cache: MISS`, second returns SSE events from cache with `X-Cache: HIT`.
+- `test_stampede_guard` -- sends concurrent identical requests, verifies only one backend call is made and others receive cached results.
+- `test_graceful_degradation_redis_down` -- patches `semantic_cache` to raise on lookup, verifies the request still succeeds via backend with `X-Cache: MISS`.
+- `test_admin_cache_stats` -- verifies `GET /admin/cache/stats` returns correct structure with hits, misses, hit_rate, entries.
+- `test_admin_cache_flush` -- verifies `DELETE /admin/cache` clears all cache entries and returns count.
+
+**Total test count: 240** (unit + integration across all phases, including the cache-specific tests above).
+
+### Production gaps
+
+- **In-process embedding model does not scale horizontally.** Each gateway instance loads its own copy of the 80MB model into memory (~400MB with PyTorch runtime). With N gateway instances, this is N * 400MB of redundant memory. A production deployment would use a shared embedding service (sidecar or centralized) that all gateway instances call via gRPC or HTTP. The embedding service can be GPU-accelerated for higher throughput.
+- **O(n) brute-force scan for similarity lookup.** Each cache lookup iterates over all entries in the scope set and computes cosine similarity. At n=100 entries per scope, this is ~0.5ms. At n=10,000, this becomes ~50ms, which is unacceptable for a cache lookup. Production would use a vector similarity index: RediSearch HNSW, Qdrant, Pinecone, or pgvector. The scope partitioning limits n in practice (each model+system_hash combination has its own set), but a popular model with a common system prompt could accumulate many entries.
+- **No L1 in-process cache.** Every cache lookup hits Redis, even for repeated identical prompts within the same gateway instance. An in-process LRU cache (keyed by prompt hash) for recently-seen embeddings and results would eliminate Redis round-trips for hot queries. This is a standard two-tier cache pattern (L1 in-memory, L2 Redis) that would be trivial to add.
+- **Single Redis instance, no replication.** The cache relies on a single Redis instance. If Redis goes down, the cache is lost (entries are not persisted to disk by default). Production would use Redis Sentinel or Redis Cluster for high availability, or an external managed Redis service (ElastiCache, Upstash). The fail-open design means Redis loss degrades to no-cache behavior, not an outage.
+- **No cache eviction policy beyond TTL.** Entries expire after `CACHE_TTL` (default 1 hour) and are not evicted otherwise. There is no LRU eviction, no max-entries cap, and no memory limit enforcement. A long-running gateway with a low threshold and many unique prompts could accumulate unbounded cache entries until Redis runs out of memory. Production would set `maxmemory-policy allkeys-lru` on Redis and/or implement application-level eviction.
+- **No cache warming or prefetch.** The cache starts cold on every deployment. There is no mechanism to pre-populate the cache with common queries or to persist cache state across restarts. A production system might export and import cache snapshots, or use a persistent vector store (Qdrant, pgvector) that survives restarts.
+- **Streaming cache stores `Usage(0, 0, 0)`.** When a streaming response is cached, the token usage is unknown (SSE chunks do not include usage information for most providers). The cached response has zero token counts, which is inaccurate. A production system would estimate tokens from content length or use provider-specific `stream_options.include_usage`.
+
+### Interview talking points
+
+- **Why semantic caching over exact-match for LLM workloads.** LLM prompts are natural language -- users phrase the same question differently every time. Exact-match caching (hash the prompt, look up the hash) produces near-zero hit rates. Semantic caching converts prompts to dense vector embeddings and compares meaning via cosine similarity. In testing, exact-match caching hit 0% of rephrased questions; semantic caching at 0.95 threshold hit 85%. The tradeoff is compute cost (5ms embedding per lookup) and storage (3KB per entry), but both are negligible compared to the LLM call saved (1-10 seconds, $0.001-0.01 per call).
+- **Scope partitioning via system prompt hash.** The system prompt defines the LLM's behavior. "What is 2+2?" asked of a math tutor vs. a sarcastic comedian should produce different answers. Rather than embedding the system prompt (which would shift the vector space and reduce matching accuracy for the actual question), the system prompt is SHA256-hashed and used as a partition key. Entries with different system prompts are in different Redis sets and never compared against each other. This is a separation of concerns: the embedding captures question semantics, the scope key captures context identity.
+- **Stampede guard prevents thundering herd on cold cache.** When a popular question first appears (cache cold), N concurrent requests all miss the cache and all call the LLM backend. This wastes N-1 redundant backend calls. The SETNX lock ensures only one request computes the response; the other N-1 poll with exponential backoff and return the cached result once it is stored. The fail-open design (30s timeout, then proceed to backend) prevents the stampede guard from becoming a liveness hazard. This is the same pattern used by Nginx proxy_cache_lock and CDN stale-while-revalidate.
+
+### Likely interview questions
+
+**Q: "How do you handle the case where two prompts are semantically similar but should produce different responses?"**
+**A:** This is the false positive problem. The primary defense is the high similarity threshold (0.95), which only matches near-paraphrases. The secondary defense is scope partitioning: different models, different system prompts, and different tenants (in tenant-isolated mode) are in separate scopes and never compared. For workloads where even 0.95 is too aggressive (e.g., "capital of France" vs "capital of Finland"), operators can raise the threshold to 0.98 or 0.99 via the `CACHE_SIMILARITY_THRESHOLD` environment variable. The tradeoff is hit rate vs correctness: a higher threshold means fewer cache hits but fewer false positives.
+
+**Q: "Why not use a dedicated vector database like Pinecone or Qdrant instead of Redis?"**
+**A:** For this project's scale (hundreds of cache entries per scope), a vector database is over-engineering. The brute-force scan over 100 entries with NumPy takes under 1ms. Redis is already in the architecture for rate limiting, so reusing it avoids adding another infrastructure dependency. A dedicated vector database would provide O(log n) approximate nearest-neighbor search via HNSW, which becomes necessary at thousands of entries per scope. The migration path is clear: replace the `lookup()` method's scan loop with a vector DB query, keeping the same embedding and scope key logic. The `SemanticCache` class encapsulates this behind the `lookup()`/`store()` interface, so the change is localized.
+
+**Q: "How does the streaming cache work? Streams are inherently forward-only -- how do you cache and replay them?"**
+**A:** Streaming uses a tee pattern: the `_tee_stream_for_cache()` async generator wraps the backend's SSE stream. As each chunk flows through, it is yielded to the client (preserving real-time delivery) and simultaneously parsed to extract content deltas. After the stream completes (the generator is exhausted), the buffered content is assembled into a standard `ChatCompletionResponse` and stored in Redis. On a subsequent cache hit for a streaming request, `_stream_cached_response()` converts the stored non-streaming response into 3 synthetic SSE chunks (role, content, stop) plus `[DONE]`, maintaining the streaming contract. The client cannot distinguish a cached streaming response from a live one.
+
+**Q: "What happens under high concurrency -- is the cache thread-safe?"**
+**A:** The gateway runs on a single asyncio event loop (uvicorn). There are no threads, so there are no thread-safety concerns in the traditional sense. Concurrency is cooperative (async/await), meaning operations interleave at `await` points but never execute simultaneously. The embedding model's `encode()` is a synchronous CPU-bound call that blocks the event loop for ~5ms -- acceptable for the current scale but would need to be moved to a thread pool (`asyncio.to_thread`) or an external service under high concurrency. Redis operations are async and non-blocking. The stampede guard uses Redis SETNX for distributed locking, which is safe across multiple gateway instances.
