@@ -6,11 +6,9 @@ Clients send standard `/v1/chat/completions` requests. The gateway translates pr
 
 ## Demo
 
-https://github.com/user-attachments/assets/grafana-dashboards-demo.mov
+<video src="docs/grafana-dashboards-demo.mov" controls width="100%"></video>
 
-> Screen recording of the 3 Grafana dashboards with live traffic: Gateway Overview (RPS, error rate, cache hit ratio, active backends), Per-Backend Drilldown (latency percentiles, circuit breaker state), Per-Tenant Usage (token consumption, rate limit hits).
->
-> The demo file is at [`docs/grafana-dashboards-demo.mov`](docs/grafana-dashboards-demo.mov).
+> Grafana dashboards with live traffic: Gateway Overview (RPS, error rate, cache hit ratio, active backends), Per-Backend Drilldown (latency percentiles, circuit breaker state), Per-Tenant Usage (token consumption, rate limit hits).
 
 ## Architecture
 
