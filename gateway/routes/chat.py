@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 
@@ -11,7 +12,13 @@ from gateway.backends import anthropic as anthropic_backend
 from gateway.backends import ollama
 from gateway.backends import openai as openai_backend
 from gateway.config import TenantConfig
-from gateway.models import ChatCompletionRequest, ChatCompletionResponse
+from gateway.models import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessageResponse,
+    Choice,
+    Usage,
+)
 
 router = APIRouter()
 logger = structlog.get_logger()
@@ -34,6 +41,64 @@ async def _wrap_stream_with_circuit_breaker(gen, circuit_breaker):
                 circuit_breaker.record_failure()
             else:
                 circuit_breaker.record_success()
+
+
+async def _tee_stream_for_cache(gen, semantic_cache, model, messages, tenant_id, cache_isolation):
+    """Wrap a streaming generator to buffer chunks and cache the assembled response."""
+    buffered_content = []
+
+    async for chunk in gen:
+        yield chunk
+        # Parse SSE chunk to extract content
+        if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+            try:
+                data = json.loads(chunk[6:])
+                choices = data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        buffered_content.append(content)
+            except (json.JSONDecodeError, IndexError, KeyError):
+                pass
+
+    # After stream completes, store the assembled response in cache
+    if buffered_content and semantic_cache is not None:
+        full_content = "".join(buffered_content)
+        assembled = ChatCompletionResponse(
+            model=model,
+            choices=[Choice(message=ChatMessageResponse(content=full_content))],
+            usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+        try:
+            await semantic_cache.store(
+                model=model,
+                messages=messages,
+                response=assembled,
+                tenant_id=tenant_id,
+                cache_isolation=cache_isolation,
+            )
+        except Exception as e:
+            logger.warning("stream_cache_store_failed", error=str(e))
+
+
+async def _stream_cached_response(response):
+    """Convert a cached ChatCompletionResponse into SSE chunks for streaming."""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model = response.model
+    content = response.choices[0].message.content
+
+    # Role chunk
+    yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+
+    # Content chunk
+    yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
+
+    # Stop chunk
+    yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+
+    yield "data: [DONE]\n\n"
 
 
 TRANSLATORS = {
@@ -133,7 +198,13 @@ async def chat_completions(
                     model=chat_request.model,
                     tenant_id=tenant.id,
                     similarity=cache_similarity,
+                    streaming=chat_request.stream,
                 )
+                if chat_request.stream:
+                    return StreamingResponse(
+                        _stream_cached_response(cached_response),
+                        media_type="text/event-stream",
+                    )
                 return cached_response
             else:
                 await semantic_cache.record_miss()
@@ -185,10 +256,13 @@ async def chat_completions(
             request=chat_request,
         )
 
-        return StreamingResponse(
-            _wrap_stream_with_circuit_breaker(raw_gen, cb),
-            media_type="text/event-stream",
-        )
+        wrapped_gen = _wrap_stream_with_circuit_breaker(raw_gen, cb)
+        if semantic_cache is not None:
+            wrapped_gen = _tee_stream_for_cache(
+                wrapped_gen, semantic_cache, chat_request.model,
+                chat_request.messages, tenant.id, cache_isolation,
+            )
+        return StreamingResponse(wrapped_gen, media_type="text/event-stream")
 
     # Non-streaming path with failover retry loop
     cb_registry = request.app.state.circuit_breakers

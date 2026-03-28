@@ -139,3 +139,70 @@ class TestCacheIntegration:
                 )
             assert resp.status_code == 200
             assert resp.headers.get("X-Cache") == "MISS"
+
+    async def test_streaming_cache_hit_returns_sse(self, test_env, mock_translator):
+        """Streaming cache hit should return SSE-formatted chunks."""
+        cached = _make_response(content="cached streamed response")
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9900))
+            mock_cache.record_hit = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "tinyllama",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            assert resp.headers.get("content-type") == "text/event-stream; charset=utf-8"
+            assert resp.headers.get("X-Cache") == "HIT"
+            # Verify SSE format
+            text = resp.text
+            assert "data: " in text
+            assert "data: [DONE]" in text
+            assert "cached streamed response" in text
+
+    async def test_streaming_cache_miss_wraps_with_tee(self, test_env):
+        """Streaming cache miss should wrap generator with tee for caching."""
+        async def fake_stream(client, backend, request):
+            yield 'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"tinyllama","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            yield 'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"tinyllama","choices":[{"index":0,"delta":{"content":"hello world"},"finish_reason":null}]}\n\n'
+            yield 'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"tinyllama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield "data: [DONE]\n\n"
+
+        with patch.dict(
+            "gateway.routes.chat.STREAM_TRANSLATORS",
+            {"ollama": fake_stream, "openai": fake_stream, "anthropic": fake_stream},
+        ):
+            async with app.router.lifespan_context(app):
+                mock_cache = AsyncMock()
+                mock_cache.lookup = AsyncMock(return_value=(None, None))
+                mock_cache.record_miss = AsyncMock()
+                mock_cache.store = AsyncMock()
+                app.state.semantic_cache = mock_cache
+
+                transport = ASGITransport(app=app)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "tinyllama",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": True,
+                        },
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+                assert resp.status_code == 200
+                assert resp.headers.get("X-Cache") == "MISS"
+                text = resp.text
+                assert "hello world" in text
+                assert "data: [DONE]" in text
+                # The tee should have called store
+                mock_cache.store.assert_called_once()
