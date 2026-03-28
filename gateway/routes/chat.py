@@ -20,6 +20,13 @@ from gateway.models import (
     Choice,
     Usage,
 )
+from gateway.observability.metrics import (
+    ACTIVE_REQUESTS,
+    CACHE_OPERATIONS,
+    QUEUE_DEPTH,
+    RATE_LIMIT_REJECTIONS,
+    TOKENS_CONSUMED,
+)
 
 router = APIRouter()
 logger = structlog.get_logger()
@@ -108,6 +115,8 @@ async def _wrap_stream_with_slot_release(gen, queue_manager, backend_name, model
         async for chunk in gen:
             yield chunk
     finally:
+        from gateway.observability.metrics import ACTIVE_REQUESTS
+        ACTIVE_REQUESTS.labels(backend=backend_name).dec()
         await queue_manager.release_slot(backend_name, model)
 
 
@@ -144,6 +153,9 @@ async def chat_completions(
             )
             if not allowed:
                 logger.warning("rate_limit_exceeded", tenant_id=tenant.id, **deny_info)
+                RATE_LIMIT_REJECTIONS.labels(
+                    tenant=tenant.id, limit_type=deny_info["limit_type"]
+                ).inc()
                 raise HTTPException(
                     status_code=429,
                     detail={
@@ -162,6 +174,9 @@ async def chat_completions(
             )
             if not budget_ok:
                 logger.warning("token_budget_exceeded", tenant_id=tenant.id, **budget_info)
+                RATE_LIMIT_REJECTIONS.labels(
+                    tenant=tenant.id, limit_type="token_budget_daily"
+                ).inc()
                 raise HTTPException(
                     status_code=429,
                     detail={
@@ -205,6 +220,7 @@ async def chat_completions(
             )
             if cached_response is not None:
                 await semantic_cache.record_hit()
+                CACHE_OPERATIONS.labels(model=chat_request.model, status="hit").inc()
                 request.state.cache_status = "HIT"
                 request.state.cache_similarity = cache_similarity
                 logger.info(
@@ -222,6 +238,7 @@ async def chat_completions(
                 return cached_response
             else:
                 await semantic_cache.record_miss()
+                CACHE_OPERATIONS.labels(model=chat_request.model, status="miss").inc()
                 request.state.cache_status = "MISS"
         except Exception as e:
             logger.warning("cache_lookup_failed", error=str(e))
@@ -286,6 +303,7 @@ async def chat_completions(
                     await queue_manager.enqueue(
                         chat_request.model, request_id, tenant.priority
                     )
+                    QUEUE_DEPTH.labels(model=chat_request.model).inc()
                 except QueueFullError:
                     raise HTTPException(
                         status_code=503,
@@ -294,11 +312,13 @@ async def chat_completions(
                     )
                 try:
                     queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
                     request.state.queue_wait_ms = queue_wait_ms
                 except QueueTimeoutError:
                     await queue_manager.remove_from_queue(
                         chat_request.model, request_id
                     )
+                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
                     raise HTTPException(
                         status_code=504, detail="Queue timeout"
                     )
@@ -316,6 +336,7 @@ async def chat_completions(
                     backend.name, backend.max_concurrent
                 )
             slot_backend = backend.name
+            ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
 
         request.state.backend_name = backend.name
 
@@ -385,6 +406,7 @@ async def chat_completions(
                     await queue_manager.enqueue(
                         chat_request.model, request_id, tenant.priority
                     )
+                    QUEUE_DEPTH.labels(model=chat_request.model).inc()
                 except QueueFullError:
                     raise HTTPException(
                         status_code=503,
@@ -393,11 +415,13 @@ async def chat_completions(
                     )
                 try:
                     queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
                     request.state.queue_wait_ms = queue_wait_ms
                 except QueueTimeoutError:
                     await queue_manager.remove_from_queue(
                         chat_request.model, request_id
                     )
+                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
                     raise HTTPException(
                         status_code=504, detail="Queue timeout"
                     )
@@ -416,6 +440,7 @@ async def chat_completions(
                     backend.name, backend.max_concurrent
                 )
             slot_backend = backend.name
+            ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
 
         translator = TRANSLATORS.get(backend.provider)
         if translator is None:
@@ -458,6 +483,12 @@ async def chat_completions(
                 completion_tokens=result.usage.completion_tokens,
                 duration_ms=duration_ms,
             )
+            TOKENS_CONSUMED.labels(
+                tenant=tenant.id, model=chat_request.model, type="prompt"
+            ).inc(result.usage.prompt_tokens)
+            TOKENS_CONSUMED.labels(
+                tenant=tenant.id, model=chat_request.model, type="completion"
+            ).inc(result.usage.completion_tokens)
 
             # Record token usage for daily budget
             if tenant.token_budget_daily and rate_limiter:
@@ -523,6 +554,7 @@ async def chat_completions(
         finally:
             # Always release the slot for this attempt
             if queue_manager is not None and slot_backend:
+                ACTIVE_REQUESTS.labels(backend=slot_backend).dec()
                 await queue_manager.release_slot(slot_backend, chat_request.model)
 
     # All attempts exhausted or no backend available

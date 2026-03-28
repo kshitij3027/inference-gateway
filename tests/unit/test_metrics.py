@@ -147,3 +147,53 @@ class TestMetricIncrements:
                 ) as ac:
                     metrics_resp = await ac.get("/metrics/")
                 assert "gateway_request_duration_seconds" in metrics_resp.text
+
+    async def test_cache_hit_counter_increments(self, test_env):
+        """Cache hit should increment gateway_cache_operations_total."""
+        cached = _make_response(content="cached")
+        async with gateway_app.router.lifespan_context(gateway_app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.98))
+            mock_cache.record_hit = AsyncMock()
+            gateway_app.state.semantic_cache = mock_cache
+            gateway_app.state.queue_manager = None
+
+            transport = ASGITransport(app=gateway_app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "hi"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            async with AsyncClient(
+                transport=ASGITransport(app=gateway_app), base_url="http://test"
+            ) as ac:
+                metrics_resp = await ac.get("/metrics/")
+            assert 'gateway_cache_operations_total{model="tinyllama",status="hit"}' in metrics_resp.text
+
+    async def test_request_id_propagation(self, test_env):
+        """X-Request-ID should be echoed back in response."""
+        response = _make_response()
+
+        async def fake_chat(client, backend, request):
+            return response
+
+        with patch.dict(
+            "gateway.routes.chat.TRANSLATORS",
+            {"ollama": fake_chat, "openai": fake_chat, "anthropic": fake_chat},
+        ):
+            async with gateway_app.router.lifespan_context(gateway_app):
+                gateway_app.state.semantic_cache = None
+                gateway_app.state.queue_manager = None
+
+                transport = ASGITransport(app=gateway_app)
+                async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "hi"}]},
+                        headers={
+                            "Authorization": "Bearer test-alpha-key",
+                            "X-Request-ID": "test-req-123",
+                        },
+                    )
+                assert resp.headers.get("X-Request-ID") == "test-req-123"

@@ -115,6 +115,14 @@ class CircuitBreaker:
             new_state=new_state.value,
             current_cooldown=self._current_cooldown,
         )
+        try:
+            from gateway.observability.metrics import CIRCUIT_BREAKER_STATE
+            state_map = {"CLOSED": 0, "OPEN": 1, "HALF_OPEN": 2}
+            CIRCUIT_BREAKER_STATE.labels(backend=self.backend_name).set(
+                state_map.get(new_state.value, 0)
+            )
+        except ImportError:
+            pass
 
     def snapshot(self) -> dict:
         """Return current state for admin endpoint."""
