@@ -1569,3 +1569,160 @@ For streaming requests, slot release cannot happen in a `finally` block around t
 
 **Q: "Why per-model queues instead of per-backend queues?"**
 **A:** A model can be served by multiple backends (e.g., two vLLM instances both hosting `llama-70b`). If queues are per-backend and backend A is full while backend B has capacity, a request queued on backend A waits unnecessarily. Per-model queues decouple "what I need" (a model) from "where I get it" (a backend). When a slot opens on any backend serving that model, the next waiter is popped and re-runs backend selection, which routes it to whichever backend has capacity. This also interacts correctly with the circuit breaker: if backend A's circuit opens while a request is queued, the request is re-routed to backend B on dequeue rather than being sent to a known-bad destination.
+
+## Observability Stack
+
+### Why this exists
+
+A gateway that proxies LLM requests across multiple backends, tenants, and models is operationally opaque without instrumentation. When latency spikes, the operator needs to know whether the bottleneck is a slow backend, a cache miss storm, a rate limiter rejecting legitimate traffic, or a circuit breaker stuck open. Without metrics, every incident investigation starts with grepping logs and guessing. Without dashboards, capacity planning is impossible -- you cannot tell whether you are approaching backend saturation, which tenants dominate token consumption, or whether the cache is actually reducing backend load.
+
+Structured logging (structlog, already present from Phase 1) solves the debugging case: individual request traces with correlation IDs. But logs are the wrong tool for aggregate questions -- "what is the P99 latency over the last hour?" requires scanning millions of log lines. Prometheus metrics solve the aggregate case: pre-computed counters and histograms that can be queried, graphed, and alerted on in constant time regardless of traffic volume. Grafana turns those metrics into operator-facing dashboards that answer the most common operational questions without writing PromQL by hand.
+
+The observability stack closes the loop: structlog for per-request debugging, Prometheus for aggregate system health, Grafana for visual operator interface.
+
+### How it works
+
+1. **Metric emission**: Each subsystem increments or observes Prometheus metric objects at the point where the event occurs. The HTTP middleware records request count and latency after `call_next` returns. The chat route handler records cache hits/misses, rate limit rejections, token consumption, and queue depth changes. The circuit breaker records state transitions. All metric objects are module-level globals in `gateway/observability/metrics.py`, imported directly by the subsystems that use them.
+
+2. **Metric exposition**: `prometheus_client.make_asgi_app()` is mounted as a sub-application at `/metrics` in `gateway/main.py`. When Prometheus scrapes this endpoint, the ASGI app calls `generate_latest()` internally, serializes all registered metric families into the Prometheus text exposition format, and returns it with the correct `Content-Type` header (`text/plain; version=0.0.4; charset=utf-8`). No manual serialization code is needed.
+
+3. **Metric collection**: The Prometheus container scrapes `gateway:8080/metrics/` every 5 seconds (job-level override of the 15-second global interval). Metrics are stored in Prometheus's local time-series database (TSDB) and queryable via PromQL.
+
+4. **Visualization**: Grafana is provisioned declaratively. A YAML datasource definition points Grafana at the Prometheus container with a fixed UID (`prometheus`). A dashboard provider auto-loads JSON dashboard definitions from the provisioning directory on startup. Three dashboards provide progressively deeper views: Gateway Overview for system-wide health, Per-Backend Drilldown for individual backend investigation, and Per-Tenant Usage for tenant-level accounting.
+
+5. **Label propagation**: The HTTP middleware sets `request.state.tenant_id` and `request.state.model_name` in the chat handler so that the middleware can attach these labels to request-level metrics (count, latency) after the handler returns. Backend name is resolved during routing and attached to active request and circuit breaker metrics.
+
+### Implementation
+
+**Metrics module** (`gateway/observability/metrics.py`): Eight Prometheus metric families defined as module-level globals using the standard `prometheus_client` library:
+
+| Metric | Type | Labels | Purpose |
+|--------|------|--------|---------|
+| `gateway_request_total` | Counter | tenant, model, backend, status_code, method | Total request volume segmented by outcome |
+| `gateway_request_duration_seconds` | Histogram | tenant, model, backend | Latency distribution with buckets from 0.05s to 60s |
+| `gateway_cache_operations_total` | Counter | model, status (hit/miss) | Cache effectiveness per model |
+| `gateway_rate_limit_rejections_total` | Counter | tenant, limit_type (rps/rpm/token_budget_daily) | Rate limiter activity by rejection reason |
+| `gateway_circuit_breaker_state` | Gauge | backend | Current CB state: 0=CLOSED, 1=OPEN, 2=HALF_OPEN |
+| `gateway_queue_depth` | Gauge | model | Current number of requests waiting in per-model queues |
+| `gateway_tokens_consumed_total` | Counter | tenant, model, type (prompt/completion) | Token accounting for cost attribution |
+| `gateway_active_requests` | Gauge | backend | In-flight concurrent requests per backend |
+
+**Metric exposition** (`gateway/main.py`): The Prometheus ASGI app is mounted at `/metrics` via `app.mount("/metrics", make_asgi_app())`. Circuit breaker gauges are initialized to 0 (CLOSED) for all configured backends during the application lifespan startup, ensuring Grafana panels show a value from the first scrape rather than displaying "No data" until the first state transition.
+
+**Subsystem instrumentation** (`gateway/routes/chat.py`): Cache operations are recorded immediately after `record_hit()` or `record_miss()` returns. Rate limit rejections are recorded just before raising the 429 `HTTPException`, ensuring the metric is only incremented for actual rejections. Token consumption is recorded for both `prompt` and `completion` types using the counts extracted from the backend response. Queue depth is incremented on enqueue and decremented on dequeue or timeout, keeping the gauge accurate even under error conditions. Active requests are incremented on slot acquisition and decremented on slot release, both wrapped in `finally` blocks to prevent gauge drift.
+
+**Circuit breaker instrumentation** (`gateway/circuit_breaker.py`): The `_transition()` method sets `CIRCUIT_BREAKER_STATE.labels(backend).set(state_int)` using a lazy import with `try/except ImportError`. This keeps the circuit breaker module independently importable and testable without requiring `prometheus_client` as a hard dependency -- unit tests for circuit breaker logic do not need to install or mock the metrics library.
+
+**Prometheus configuration** (`prometheus/prometheus.yml`): A single scrape job targeting `gateway:8080` with a 5-second scrape interval. The trailing slash on `/metrics/` is required because FastAPI's mounted sub-app redirects `/metrics` to `/metrics/`, and Prometheus does not follow redirects by default.
+
+**Grafana provisioning** (`grafana/provisioning/`):
+- `datasources/datasource.yml`: Defines the Prometheus datasource with `uid: prometheus`, `url: http://prometheus:9090`, and `isDefault: true`.
+- `dashboards/dashboard.yml`: Configures the file-based dashboard provider to load JSON files from the provisioning directory.
+- Three JSON dashboard files, each with a stable `uid` for cross-linking and API access:
+  - **Gateway Overview** (`uid: gateway-overview`): 6 panels -- RPS by status code (stacked time series), Error Rate % (stat with threshold coloring), Active Backends count (stat), Cache Hit Ratio % (gauge), Queue Depth by model (time series), Latency P50/P95/P99 (time series with three queries).
+  - **Per-Backend Drilldown** (`uid: per-backend-drilldown`): Template variable `$backend` populated from `gateway_request_total` label values. 5 panels -- Latency Percentiles (P50/P95/P99 using `histogram_quantile`), Error Rate %, Active Concurrent Requests, Circuit Breaker State (with value mappings: 0=CLOSED green, 1=OPEN red, 2=HALF_OPEN yellow), Request Volume.
+  - **Per-Tenant Usage** (`uid: per-tenant-usage`): Template variable `$tenant` populated from `gateway_request_total` label values. 5 panels -- Request Volume by Model, Tokens Consumed by type (prompt vs completion stacked), Rate Limit Hits by limit_type, Top Models table (sorted by request count), Latency P95 by Model.
+
+**Docker Compose** (`docker-compose.yaml`): Prometheus service (`prom/prometheus`, port 9090) with the config file bind-mounted. Grafana service (`grafana/grafana`, port 3000) with provisioning directories bind-mounted and anonymous access enabled via environment variables (`GF_AUTH_ANONYMOUS_ENABLED=true`, `GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer`).
+
+### Key design decisions
+
+**Prometheus + Grafana over commercial APM**: Prometheus is the de facto standard for cloud-native metrics. It is free, open-source, has native Kubernetes integration, and supports the pull-based model that works naturally with container orchestration (no agent installation, no push credentials). Grafana provides dashboarding with PromQL support. The combination avoids vendor lock-in and per-host licensing costs that commercial APM tools (Datadog, New Relic) impose. For a gateway that may run at high request volume, per-host or per-event pricing can become significant.
+
+**`make_asgi_app()` over manual `generate_latest()` endpoint**: The ASGI app handles content negotiation, encoding, and the Prometheus-specific content type header correctly. A manual endpoint using `generate_latest()` requires the developer to set the content type to `text/plain; version=0.0.4; charset=utf-8` explicitly -- getting this wrong causes Prometheus to reject the scrape. The ASGI app also handles gzip encoding negotiation. There is no reason to reimplement what the library already provides.
+
+**Module-level globals over dependency injection for metrics**: Prometheus metrics in Python are inherently global -- they register themselves in a global `CollectorRegistry` on construction. Wrapping them in a class and injecting them via FastAPI's `Depends()` adds indirection without changing the underlying behavior. Module-level globals match the library's design intent, are importable from any module with a single `from gateway.observability.metrics import REQUEST_COUNT`, and avoid the boilerplate of threading a metrics object through every function signature. This is the pattern used by the `prometheus_client` documentation and by production systems at scale.
+
+**Histogram bucket selection (0.05s to 60s)**: The bucket boundaries `[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]` cover the full range of gateway response times. Cache hits return in 50-100ms. Simple completions with short prompts return in 1-5 seconds. Complex completions with long contexts can take 30-60 seconds. The default Prometheus histogram buckets (`[0.005, 0.01, 0.025, ...]`) are designed for internal microservice calls and would put 99% of LLM requests in the `+Inf` bucket, making percentile calculations useless. Custom buckets ensure that `histogram_quantile(0.95, ...)` produces meaningful values across the actual latency distribution.
+
+**Lazy import for circuit breaker instrumentation**: The circuit breaker module uses `try: from gateway.observability.metrics import CIRCUIT_BREAKER_STATE` inside `_transition()` rather than a top-level import. This means the circuit breaker can be unit-tested in isolation without `prometheus_client` installed, and it can be reused in contexts (CLI tools, standalone scripts) where metrics are not relevant. The `try/except ImportError` pattern has near-zero runtime cost after the first successful import (Python caches the module), and the metrics module is always available in the gateway process.
+
+**Dashboard provisioning as code over manual UI configuration**: JSON dashboard definitions in the provisioning directory are version-controlled, reproducible, and automatically loaded on container startup. Manual dashboard creation through the Grafana UI produces configuration that lives only in Grafana's SQLite database, is lost when the container is recreated, and cannot be code-reviewed or diff'd. Provisioned dashboards are read-only in the UI (marked with a provisioned badge), which prevents accidental modification.
+
+**Anonymous Grafana access for E2E verification**: Setting `GF_AUTH_ANONYMOUS_ENABLED=true` with `GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer` allows automated E2E tests to verify dashboard provisioning by hitting the Grafana API without managing authentication tokens. This is appropriate for local development and CI. In production, anonymous access would be disabled and replaced with OAuth or LDAP integration.
+
+**Bounded metric cardinality**: The label dimensions `tenant x model x backend x status_code x method` are all drawn from configuration, not user input. Tenants come from the tenant config file (bounded set). Models come from the backend registry (bounded set). Backends are defined in config (bounded set). Status codes are HTTP codes (small fixed set). Methods are HTTP methods (small fixed set). No label is derived from request body content, query parameters, or user-supplied strings. This prevents cardinality explosion -- a common Prometheus anti-pattern where unbounded labels cause memory exhaustion in both the application and Prometheus TSDB.
+
+### Alternatives considered
+
+**Statsd (push-based) over Prometheus (pull-based)**: Statsd sends metrics over UDP to an aggregation daemon, which forwards them to a backend (Graphite, Datadog). This works well in environments where services cannot expose HTTP endpoints (e.g., Lambda functions, short-lived batch jobs). The gateway is a long-running HTTP server, so pull-based scraping is natural. Push-based systems also require running an additional aggregation daemon and introduce UDP packet loss as a failure mode. Rejected in favor of Prometheus's simpler operational model for this use case.
+
+**OpenTelemetry Metrics over prometheus_client**: OpenTelemetry provides a vendor-neutral metrics API that can export to Prometheus, OTLP, and other backends. The additional abstraction is valuable for organizations standardizing on OTel across polyglot services. For a single-language gateway with Prometheus as the only metrics backend, the `prometheus_client` library is simpler (no collector/exporter pipeline to configure), produces native Prometheus exposition format without translation, and avoids the OTel SDK's startup complexity. Migration to OTel later would involve changing metric object constructors and adding an exporter, not rewriting instrumentation callsites -- the metric names and labels would remain identical.
+
+**Per-request metric objects (dependency injection) over module-level globals**: Creating metric objects per-request or injecting them via FastAPI dependencies would allow per-test isolation and avoid global state. However, Prometheus metrics are inherently global (the `CollectorRegistry` is a process-level singleton). Wrapping globals in a class does not change the semantics -- it only adds indirection. Test isolation is achieved by resetting the registry in test fixtures, not by avoiding globals.
+
+**InfluxDB over Prometheus**: InfluxDB is a push-based time-series database with its own query language (Flux/InfluxQL). It handles high-cardinality data better than Prometheus and supports longer retention natively. However, it requires push-based instrumentation (different library), has a more complex operational footprint (clustering, retention policies, continuous queries), and Grafana's PromQL integration is more mature than its Flux integration. For a gateway with bounded cardinality, Prometheus's limitations are not a factor.
+
+### Failure modes and edge cases
+
+**Prometheus scrape failure**: If Prometheus cannot reach `gateway:8080/metrics/`, metrics stop updating but the gateway continues serving traffic unaffected. Grafana dashboards show stale data (the last successfully scraped values). No data is lost from the gateway's perspective -- metric objects continue accumulating in-process. When scraping resumes, the next scrape picks up the current counter/gauge values. Histograms may show a gap in the time series but counters are monotonic, so rate calculations recover after two successful scrapes.
+
+**Metric label mismatch**: If a request fails before the chat handler sets `request.state.tenant_id` or `request.state.model_name` (e.g., a 404 on an unknown route), the middleware falls back to default label values (`unknown` tenant, `unknown` model). This prevents `KeyError` on label access and ensures every request is counted, even if it cannot be attributed to a specific tenant or model.
+
+**High cardinality from misconfiguration**: If someone adds a label derived from user input (e.g., the full prompt text), the number of unique time series explodes, consuming memory in both the gateway process and Prometheus. The current design prevents this by drawing all labels from configuration-defined sets, but there is no runtime guard against a developer adding an unbounded label in a future change. Code review is the primary defense.
+
+**Counter reset on gateway restart**: Prometheus counters are monotonically increasing within a process lifetime. When the gateway restarts, counters reset to zero. Prometheus handles this via its `rate()` and `increase()` functions, which detect counter resets and compute correct rates across restarts. However, short-lived gateway instances (frequent restarts) produce noisy rate calculations because each reset creates a discontinuity.
+
+**Gauge drift from unbalanced inc/dec**: `QUEUE_DEPTH` and `ACTIVE_REQUESTS` use `.inc()` and `.dec()` calls that must be perfectly balanced. If an exception path skips a `.dec()`, the gauge drifts permanently upward. Both decrements are placed in `finally` blocks to prevent this, but a code change that adds a new exit path without a corresponding decrement would cause drift. The symptom is a gauge that monotonically increases and never returns to zero, visible on the Grafana dashboard as a steadily climbing line.
+
+**Grafana provisioning failure**: If a dashboard JSON file has a syntax error, Grafana logs the error and skips that dashboard but starts successfully with the remaining dashboards. The broken dashboard simply does not appear in the UI. This is a startup-time failure -- once dashboards are loaded, they are served from Grafana's internal database and are not re-read from disk unless the container restarts.
+
+### Observability
+
+This section is itself the observability implementation, so the observability of the observability stack is inherently meta:
+
+- **Prometheus self-metrics**: Prometheus exposes its own metrics at `localhost:9090/metrics`, including `prometheus_tsdb_head_series` (number of active time series -- useful for detecting cardinality issues), `prometheus_target_scrape_pool_sync_total` (scrape failures), and `up` (whether each scrape target is reachable).
+- **Grafana health**: Grafana exposes `/api/health` which returns `{"database": "ok"}` when healthy. The provisioning log (`/var/log/grafana/grafana.log` inside the container) records which dashboards and datasources were loaded on startup.
+- **Gateway /metrics endpoint**: The endpoint itself is observable -- its response time and size are indicators of metric collection health. A sudden increase in response size suggests cardinality growth.
+- **Structured logs**: All metric emission points log at DEBUG level with structlog, so enabling DEBUG logging shows every metric increment alongside the request context. This is useful for verifying that instrumentation is firing correctly during development.
+
+### Testing
+
+**286 total tests (273 existing + 13 new observability tests).**
+
+**Unit tests -- metrics endpoint**: Verify that `GET /metrics` returns HTTP 200 with `text/plain` content type containing Prometheus exposition format. Verify that all 8 metric families (`gateway_request_total`, `gateway_request_duration_seconds`, `gateway_cache_operations_total`, `gateway_rate_limit_rejections_total`, `gateway_circuit_breaker_state`, `gateway_queue_depth`, `gateway_tokens_consumed_total`, `gateway_active_requests`) appear in the response body. Verify that sending a request through the gateway increments the request counter and observes the latency histogram. Verify that cache hit/miss events increment the cache counter with the correct `status` label. Verify that `X-Request-ID` propagation continues to work with metrics middleware in the chain.
+
+**Config validation tests**: Verify that `prometheus/prometheus.yml` is valid YAML with a `scrape_configs` entry containing a `gateway` job targeting port 8080. Verify that `grafana/provisioning/datasources/datasource.yml` defines a Prometheus datasource with `uid: prometheus`. Verify that all 3 dashboard JSON files parse as valid JSON, each containing `uid`, `title`, and a non-empty `panels` array.
+
+**What is not tested**: Prometheus-to-Grafana data flow (would require a running Prometheus instance with scraped data and Grafana rendering panels -- this is an integration test better suited for a staging environment). PromQL query correctness (the queries in dashboard JSON are not executed in tests; they are validated by manual inspection and Grafana's query editor). Alert rule evaluation (no alerting rules exist yet).
+
+### Production gaps
+
+**No alerting**: There is no Alertmanager configuration. In production, alerts would be defined for: error rate exceeding threshold (e.g., 5xx rate > 5% for 5 minutes), P99 latency exceeding SLO (e.g., > 30s for 10 minutes), circuit breaker open for extended period (> 5 minutes), cache hit ratio dropping below baseline (e.g., < 50% for 15 minutes), queue depth growing unbounded. These alerts would route to PagerDuty, Slack, or email via Alertmanager's routing tree.
+
+**No persistent TSDB storage**: Prometheus stores data on the container's ephemeral filesystem. A container restart loses all historical metrics. Production deployments would use persistent volumes for Prometheus data, or remote write to a long-term storage backend (Thanos, Cortex, Grafana Mimir) for retention beyond the default 15-day window.
+
+**No multi-process metric aggregation**: The gateway runs as a single uvicorn process. If scaled to multiple workers (e.g., `uvicorn --workers 4`), each worker maintains its own `CollectorRegistry` in its own process memory. Prometheus scraping the `/metrics` endpoint hits one worker at random, seeing only that worker's counters. The `prometheus_client` library provides `multiprocess.MultiProcessCollector` with a shared directory for cross-process aggregation, but this is not configured. Production multi-worker deployments would need this, or each worker would expose metrics on a separate port.
+
+**No metric retention policy**: There is no configuration for how long Prometheus retains data. The default is 15 days with a maximum block duration of 2 hours. For a production system, retention would be explicitly configured based on storage capacity and query needs (e.g., `--storage.tsdb.retention.time=90d` for 90-day retention).
+
+**No metric federation**: In a multi-instance deployment (multiple gateway replicas behind a load balancer), each instance exposes its own `/metrics`. A single Prometheus instance would scrape all replicas. For large deployments, Prometheus federation or a multi-tenant Prometheus setup (Thanos, Cortex) would be needed to aggregate metrics across instances.
+
+**No Grafana persistence or authentication**: Grafana uses an ephemeral SQLite database and anonymous access. Production would use a persistent PostgreSQL backend for Grafana's database, OAuth2/LDAP for authentication, and RBAC for dashboard access control. Dashboard provisioning as code would remain, but user-created dashboards and annotations would persist across restarts.
+
+**No distributed tracing integration**: The metrics stack does not integrate with distributed tracing (Jaeger, Zipkin, Tempo). The `request_id` from structlog provides request-level correlation, but there are no trace spans for sub-operations (cache lookup, backend call, queue wait). Adding OpenTelemetry tracing would provide flame-graph visualization of request lifecycles.
+
+### Interview talking points
+
+- Chose pull-based Prometheus over push-based alternatives (Statsd, OTLP) because the gateway is a long-running HTTP server where pull is natural, avoids running an aggregation daemon, and eliminates UDP packet loss as a failure mode.
+- Metric cardinality is bounded by design: all label values come from configuration (tenants, models, backends), never from user input. This prevents the classic Prometheus anti-pattern of unbounded labels causing memory exhaustion.
+- Histogram bucket selection was deliberate: default Prometheus buckets (5ms-10s) are designed for microservice calls and would put 99% of LLM responses in the `+Inf` bucket, making percentile calculations meaningless. Custom buckets (50ms-60s) span the actual latency distribution from cache hits to slow completions.
+- Dashboard provisioning as code ensures reproducibility, version control, and code review for operational tooling -- the same principles applied to application code are applied to dashboards. No manual clicking in the Grafana UI.
+- Lazy import pattern for circuit breaker metrics keeps the CB module independently testable and reusable without coupling it to the observability stack. The `try/except ImportError` has near-zero runtime cost after first import.
+
+### Likely interview questions
+
+**Q: "Why not use OpenTelemetry for metrics instead of the Prometheus client directly?"**
+**A:** OpenTelemetry provides a vendor-neutral abstraction that exports to multiple backends, which is valuable in polyglot organizations standardizing on a single observability API. For this gateway -- a single Python service with Prometheus as the only metrics backend -- the `prometheus_client` library is simpler. It produces native exposition format without an exporter pipeline, has no OTel SDK startup overhead, and avoids configuring the OTel collector/exporter chain. The metric names, labels, and instrumentation callsites would be identical under OTel; only the object constructors and export path change. Migration to OTel later is a mechanical refactor, not an architectural change.
+
+**Q: "How do you handle metric cardinality in a multi-tenant system?"**
+**A:** Every label dimension is drawn from a bounded, configuration-defined set. Tenants are defined in the tenant config file. Models are registered in the backend registry. Backends are enumerated in config. Status codes and HTTP methods are small fixed sets. The cross-product of these sets produces a predictable number of time series that can be calculated statically: `|tenants| x |models| x |backends| x |status_codes| x |methods|`. For a deployment with 10 tenants, 5 models, 3 backends, ~5 common status codes, and 2 methods, that is roughly 1,500 series for the highest-cardinality metric -- well within Prometheus's comfort zone of millions of series. The key discipline is never adding a label derived from request body content, user-supplied strings, or other unbounded inputs.
+
+**Q: "What happens to your metrics when the gateway process restarts?"**
+**A:** Prometheus counters are monotonically increasing within a process. On restart, they reset to zero. Prometheus's `rate()` and `increase()` functions detect counter resets and handle them correctly -- the first scrape after restart shows a counter value lower than the previous scrape, which Prometheus interprets as a reset rather than a decrease. Gauges (`ACTIVE_REQUESTS`, `QUEUE_DEPTH`, `CIRCUIT_BREAKER_STATE`) immediately reflect the new process's state, which starts at zero for request gauges and is initialized explicitly to CLOSED (0) for circuit breaker gauges during startup. Histograms reset like counters, so `histogram_quantile` calculations may be slightly inaccurate for the first few scrape intervals after restart. For very short-lived processes (frequent restarts), the Pushgateway is an alternative that persists the last pushed values, but it is not needed for a long-running gateway process.
+
+**Q: "Why module-level globals for metrics instead of dependency injection?"**
+**A:** Prometheus metrics in Python are inherently global. They register themselves in a process-level `CollectorRegistry` singleton on construction. Wrapping them in a class and injecting via FastAPI `Depends()` would add indirection without changing the underlying semantics -- the registry is still global, the metric objects are still singletons. Module-level globals match the library's design intent, are importable with a single line from any module, and avoid threading a metrics parameter through every function signature in the call chain. Test isolation is achieved by resetting the global registry in test fixtures, not by avoiding globals. This is the same pattern used in the `prometheus_client` documentation and in production Prometheus deployments.
+
+**Q: "How would you add alerting to this setup?"**
+**A:** Deploy Alertmanager alongside Prometheus and add alerting rules to `prometheus/alert_rules.yml`. Rules would include: error rate (`rate(gateway_request_total{status_code=~"5.."}[5m]) / rate(gateway_request_total[5m]) > 0.05`), latency SLO breach (`histogram_quantile(0.99, rate(gateway_request_duration_seconds_bucket[5m])) > 30`), circuit breaker stuck open (`gateway_circuit_breaker_state == 1` for > 5 minutes), and cache degradation (`rate(gateway_cache_operations_total{status="hit"}[15m]) / rate(gateway_cache_operations_total[15m]) < 0.5`). Alertmanager would route alerts based on severity: critical alerts (error rate, CB stuck open) to PagerDuty, warning alerts (latency, cache ratio) to Slack. The key design principle is alerting on symptoms (error rate, latency) rather than causes (CPU usage, memory) -- symptoms tell you users are affected, causes require interpretation.
