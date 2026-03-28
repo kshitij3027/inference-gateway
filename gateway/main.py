@@ -40,6 +40,12 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
+    # Initialize circuit breaker gauges to CLOSED (0) for all backends
+    from gateway.observability.metrics import CIRCUIT_BREAKER_STATE
+
+    for backend_name in app.state.registry.backends:
+        CIRCUIT_BREAKER_STATE.labels(backend=backend_name).set(0)
+
     # Redis + rate limiter (best-effort — gateway works without Redis)
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     try:
