@@ -130,6 +130,10 @@ async def chat_completions(
     request: Request,
     tenant: TenantConfig = Depends(get_current_tenant),
 ) -> ChatCompletionResponse:
+    # Set tenant and model on request state for metrics middleware
+    request.state.tenant_id = tenant.id
+    request.state.model_name = chat_request.model
+
     # Rate limit check (after auth, before routing)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     rate_limiter = getattr(request.app.state, "rate_limiter", None)

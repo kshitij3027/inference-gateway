@@ -159,6 +159,24 @@ async def request_id_middleware(request: Request, call_next):
     queue_wait_ms = getattr(request.state, "queue_wait_ms", None)
     if queue_wait_ms is not None:
         response.headers["X-Queue-Wait-Ms"] = str(queue_wait_ms)
+
+    # Prometheus metrics
+    from gateway.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
+
+    tenant_id = getattr(request.state, "tenant_id", "")
+    model_name = getattr(request.state, "model_name", "")
+    backend = getattr(request.state, "backend_name", "") or ""
+    REQUEST_COUNT.labels(
+        tenant=tenant_id,
+        model=model_name,
+        backend=backend,
+        status_code=str(response.status_code),
+        method=request.method,
+    ).inc()
+    REQUEST_LATENCY.labels(
+        tenant=tenant_id, model=model_name, backend=backend
+    ).observe(duration_ms / 1000)
+
     logger.info(
         "request_completed",
         method=request.method,
