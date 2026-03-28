@@ -1394,3 +1394,178 @@ Without this component, the gateway would forward every request to a backend eve
 
 **Q: "What happens under high concurrency -- is the cache thread-safe?"**
 **A:** The gateway runs on a single asyncio event loop (uvicorn). There are no threads, so there are no thread-safety concerns in the traditional sense. Concurrency is cooperative (async/await), meaning operations interleave at `await` points but never execute simultaneously. The embedding model's `encode()` is a synchronous CPU-bound call that blocks the event loop for ~5ms -- acceptable for the current scale but would need to be moved to a thread pool (`asyncio.to_thread`) or an external service under high concurrency. Redis operations are async and non-blocking. The stampede guard uses Redis SETNX for distributed locking, which is safe across multiple gateway instances.
+
+## Priority Queue with Backpressure
+
+### Why this exists
+
+LLM inference calls take 2--30 seconds per request. When all backend slots are occupied, the gateway must decide what to do with incoming requests. Without a queue, the only option is an immediate 503 rejection, which forces clients to implement their own retry logic -- retry storms, exponential backoff guessing, wasted network round-trips, and no fairness guarantees between tenants. A priority queue absorbs short bursts of overload by holding requests in-process until a slot opens, converting a hard rejection into a brief wait. For the client, waiting 5 seconds in a queue and getting a response is strictly better than receiving a 503, retrying 3 times with backoff, and getting the same response 15 seconds later. The queue also enables priority differentiation: high-priority tenants (e.g., production traffic) can jump ahead of low-priority tenants (e.g., batch jobs) without requiring separate backend pools.
+
+Backpressure is the other half of the design. An unbounded queue is worse than no queue -- it accumulates latency debt until requests start timing out deep in the queue, wasting resources on work that will never be delivered. The queue enforces a hard depth limit (`max_queue_depth`, default 100) and a per-request timeout (`queue_timeout`, default 30s). When either is breached, the gateway rejects with a clear signal (503 with `Retry-After` or 504), telling the client that the system is genuinely overloaded rather than momentarily busy.
+
+### How it works
+
+The request flow through the priority queue is:
+
+1. **Backend selection** completes normally -- the router picks a target backend and model.
+2. **Slot check**: `PriorityQueueManager.acquire_slot(backend_name)` atomically increments the in-process concurrency counter for that backend. If the counter is below `max_concurrent`, the slot is granted immediately and the request proceeds to the backend call. No queue interaction occurs on this fast path.
+3. **Queue entry** (slow path): If the counter has already reached `max_concurrent`, the request is enqueued. A unique `request_id` is generated, the tenant's priority and current timestamp are combined into a score (`priority * 1_000_000_000_000 + time.time()`), and the request is added to the Redis sorted set `queue:{model}` via `ZADD`.
+4. **Wait**: The request awaits an `asyncio.Event` associated with its `request_id`. This is a zero-CPU wait -- the coroutine is suspended, the event loop serves other requests, and no polling occurs.
+5. **Signal**: When any request on the same backend completes and releases its slot, `release_slot(backend_name)` calls `_signal_next_waiter(backend_name)`. This pops the lowest-score entry from the Redis sorted set (`ZPOPMIN`), looks up its `asyncio.Event`, and sets it. The waiting coroutine wakes up.
+6. **Circuit breaker re-check**: After waking, the dequeued request does NOT blindly proceed to the original backend. It calls `get_open_backends()` and `find_backend_for_model()` again. If the original backend's circuit breaker has opened during the wait, the request is re-routed to any other available backend for the same model. This prevents a queue from draining into a known-bad backend.
+7. **Slot acquire on dequeue**: The dequeued request acquires a slot on whatever backend it is routed to (which may differ from the original).
+8. **Backend call**: The request proceeds to the LLM backend.
+9. **Slot release**: On completion (success or failure), the slot is released in a `finally` block, which triggers signaling the next waiter.
+
+For streaming requests, slot release cannot happen in a `finally` block around the backend call because the response is a generator -- the slot must remain held while chunks are being yielded to the client. A wrapper generator `_wrap_stream_with_slot_release()` handles this: it yields chunks from the inner stream, and when the inner stream is exhausted (or raises), it releases the slot in its own `finally` clause.
+
+### Implementation
+
+**Core module: `gateway/priority_queue.py`**
+
+- `PriorityQueueManager` -- the single class that owns concurrency tracking, queue operations, and wait signaling.
+  - `_concurrency: dict[str, int]` -- in-process counter per backend name. Incremented on acquire, decremented on release. Protected by `_lock: asyncio.Lock` to prevent interleaving at `await` points.
+  - `_waiters: dict[str, asyncio.Event]` -- maps `request_id` to its wake-up event. Populated on enqueue, consumed on signal.
+  - `_max_concurrent: dict[str, int]` -- per-backend concurrency limit, loaded from `BackendConfig.max_concurrent`.
+  - `acquire_slot(backend_name) -> bool` -- under lock, checks if `_concurrency[backend_name] < _max_concurrent[backend_name]`. If yes, increments and returns `True`. If no, returns `False`.
+  - `release_slot(backend_name)` -- under lock, decrements `_concurrency[backend_name]`, then calls `_signal_next_waiter(backend_name)`.
+  - `enqueue(model, request_id, priority) -> float` -- computes score as `priority * 1_000_000_000_000 + time.time()`, calls `ZADD queue:{model} score request_id`, registers an `asyncio.Event` in `_waiters[request_id]`, returns the score.
+  - `wait_for_slot(request_id, timeout) -> None` -- calls `asyncio.wait_for(event.wait(), timeout)`. On timeout, raises `QueueTimeoutError` and calls `remove_from_queue()` to clean up the Redis entry.
+  - `_signal_next_waiter(backend_name)` -- resolves which models are served by this backend, calls `ZPOPMIN queue:{model}` on each, and sets the event for the popped `request_id`. If the popped entry has no corresponding event in `_waiters` (stale entry -- request already timed out or was cancelled), it retries up to 3 times to skip stale entries and find a live waiter.
+  - `remove_from_queue(model, request_id)` -- calls `ZREM queue:{model} request_id` and deletes the event from `_waiters`.
+  - `get_queue_depth(model) -> int` -- calls `ZCARD queue:{model}`.
+- `QueueFullError` -- raised when `ZCARD queue:{model} >= max_queue_depth` before enqueue. The route handler converts this to a 503 with `Retry-After: 5`.
+- `QueueTimeoutError` -- raised when `asyncio.wait_for` exceeds the configured timeout. The route handler converts this to a 504.
+
+**Route integration: `gateway/routes/chat.py`**
+
+- The priority queue sits in the request pipeline AFTER backend selection and BEFORE the backend call. It is inside the retry loop so that each retry attempt independently acquires and releases a slot.
+- Non-streaming path: `acquire_slot()` is called at the top of the attempt. If it returns `False`, the request enqueues, waits, re-checks the circuit breaker, and acquires a slot on the (possibly different) backend. The slot is released in a `finally` block wrapping the backend call.
+- Streaming path: The `finally` block cannot release the slot because the response generator has not been consumed yet. Instead, the raw backend stream is wrapped in `_wrap_stream_with_slot_release(stream, queue_manager, backend_name)`, which yields chunks through and releases the slot when the generator exits.
+- `request.state.queue_wait_ms` is set to the elapsed queue wait time (or 0 if the fast path was taken), picked up by middleware to add the `X-Queue-Wait-Ms` response header.
+- A `slot_backend` variable tracks which backend currently holds the slot, ensuring that `release_slot` is always called on the correct backend name even after re-routing.
+
+**Lifespan and middleware: `gateway/main.py`**
+
+- `PriorityQueueManager` is instantiated during the FastAPI lifespan handler, after Redis is connected. If Redis is unavailable, the queue manager is not created, and the gateway operates without queuing (immediate 503 on overload).
+- Middleware reads `request.state.queue_wait_ms` (if present) and adds `X-Queue-Wait-Ms` to the response headers.
+- Environment variables: `QUEUE_MAX_DEPTH` (default 100), `QUEUE_TIMEOUT` (default 30).
+
+**Admin endpoint: `gateway/routes/admin.py`**
+
+- `GET /admin/queue` returns a JSON object with per-backend concurrency status (`active`/`max` slots) and per-model queue depth.
+
+**Configuration (pre-existing, now enforced)**
+
+- `BackendConfig.max_concurrent` (default 10) defines the concurrency limit per backend. Ollama is configured at 5 (resource-constrained), mock backends at 10.
+- `TenantConfig.priority` (default 1) defines the tenant's priority tier. Lower number = higher priority. Tenant "alpha" is priority 1, tenant "beta" is priority 2.
+
+### Key design decisions
+
+**In-process concurrency tracking instead of Redis.** The concurrency counter is a plain Python `dict[str, int]` protected by an `asyncio.Lock`, not a Redis counter. This is intentional: concurrency tracking must be consistent with the actual number of in-flight HTTP connections from this process. If the process crashes, all its in-flight connections die, and the counter resets to zero on restart -- exactly correct. A Redis counter would survive the crash with a stale value, requiring TTL-based expiration or heartbeats to self-correct. The tradeoff is that in a multi-instance deployment, each gateway instance tracks its own concurrency independently. This is acceptable because `max_concurrent` is a per-instance limit (each instance has its own connection pool to the backend), not a global limit. Global rate limiting is handled by the separate rate limiter component.
+
+**Redis sorted set for the queue.** The queue needs priority ordering with FIFO tiebreaking and atomic pop. Redis sorted sets provide exactly this: `ZADD` inserts with a score, `ZPOPMIN` atomically removes and returns the lowest-score member. No polling, no race conditions on pop, and Redis handles the sort. The alternative -- an in-process `asyncio.PriorityQueue` -- would be simpler but would not survive process restarts and would not allow the admin endpoint to query queue depth without coupling to the queue's internals.
+
+**Score formula: `priority * 1_000_000_000_000 + time.time()`.** The multiplier (1 trillion) ensures that priority tiers never overlap with timestamp values. `time.time()` returns a float with microsecond precision, typically around `1.7e9` (epoch seconds). Multiplying priority by `1e12` shifts it into a range that is always larger than any timestamp. Priority 1 produces scores starting at `1e12 + 1.7e9` (~1.0017 trillion), priority 2 produces scores starting at `2e12 + 1.7e9` (~2.0017 trillion). Within the same priority tier, lower timestamps sort first (FIFO). Across tiers, lower priority numbers sort first (higher priority). `ZPOPMIN` always returns the highest-priority, oldest request.
+
+**Per-model queue instead of per-backend queue.** Queues are keyed by model name (`queue:{model}`), not by backend name. This is because multiple backends can serve the same model (e.g., two vLLM instances both serving `llama-70b`), and the request does not care which backend serves it. When a slot opens on any backend, `_signal_next_waiter` pops from the model queue, and the dequeued request runs backend selection again to find an available backend. A per-backend queue would pin requests to a specific backend, preventing re-routing even when another backend for the same model has capacity.
+
+**asyncio.Event for signaling instead of polling.** Each queued request creates an `asyncio.Event` and awaits it. When a slot opens, the signaler sets the event, and the waiter wakes up in the same event loop tick. There is zero latency between "slot freed" and "next request wakes up" -- no 100ms polling interval, no wasted CPU cycles checking a flag. The `asyncio.Event` is the idiomatic asyncio primitive for this pattern: one coroutine waits, another coroutine signals, the event loop handles the scheduling.
+
+**Circuit breaker re-check after dequeue.** A request might wait in the queue for 10--20 seconds. During that time, the backend it was originally targeting might have its circuit breaker trip open. Proceeding to a known-bad backend would waste the queue wait and produce an error. Instead, after dequeue, the request re-runs `get_open_backends()` and `find_backend_for_model()`. If the original backend is now open-circuited, the request is routed to any other backend that serves the same model. This decoupling between "which model" (fixed at enqueue time) and "which backend" (resolved at dequeue time) is why per-model queues are the right granularity.
+
+### Alternatives considered
+
+**Immediate 503 rejection (no queue).** The simplest approach: if all slots are occupied, return 503 immediately. This pushes all backpressure to the client, which must implement retry logic with exponential backoff. The problem is that LLM inference is slow (2--30s), so slots turn over on a seconds timescale. A client that retries after 1s will likely succeed. But without coordination, N clients all retry at the same time (thundering herd), and without priority, a batch job's retry is indistinguishable from a production request's retry. The queue solves both problems. Rejected in favor of queuing for any workload with bursty traffic or mixed priority tenants.
+
+**In-process `asyncio.PriorityQueue`.** Simpler implementation, no Redis dependency for the queue itself. Rejected because: (a) queue state is lost on process restart, (b) the admin endpoint cannot inspect queue depth without reaching into the queue's internals, (c) in a multi-instance deployment, each instance's queue is isolated with no way to redistribute work if one instance is overloaded. Redis sorted sets provide persistence, atomic operations, and external visibility.
+
+**Redis Streams (`XADD`/`XREADGROUP`).** Redis Streams provide consumer groups, acknowledgment, and at-least-once delivery -- features designed for durable message processing. Rejected because the priority queue pattern does not need consumer groups (there is one consumer per gateway instance), does not need acknowledgment (the request is in-process, not handed off), and critically, Redis Streams do not support priority ordering. Entries are strictly ordered by ID (timestamp). Implementing priority over Streams would require multiple streams (one per priority tier) with manual arbitration, adding complexity without benefit.
+
+**Semaphore-based concurrency limiting (`asyncio.Semaphore`).** An `asyncio.Semaphore(max_concurrent)` per backend would handle the fast path (acquire immediately if under limit) and the slow path (await until released). Rejected because semaphores provide no priority ordering -- waiters are woken in FIFO order regardless of tenant priority. Adding priority to a semaphore requires a custom implementation that is essentially a priority queue. The explicit queue + event design provides priority, observability (queue depth is inspectable), and separation of concerns (concurrency tracking vs. queuing vs. signaling are distinct operations).
+
+**Global queue across all models.** A single queue for all requests, regardless of model. Rejected because a slot opening on backend A (which serves model X) should not wake up a request for model Y. Per-model queues ensure that a signal is only delivered to a request that can actually use the freed capacity.
+
+### Failure modes and edge cases
+
+**Queue full (503).** When `ZCARD queue:{model} >= max_queue_depth`, `enqueue()` raises `QueueFullError` before adding the entry. The route handler returns 503 with `Retry-After: 5`. This is the intended backpressure signal: the queue itself is overloaded, and the client should wait before retrying. The `Retry-After` header gives clients a concrete backoff duration rather than leaving them to guess.
+
+**Queue timeout (504).** When `asyncio.wait_for(event.wait(), timeout)` raises `asyncio.TimeoutError`, it is caught and re-raised as `QueueTimeoutError`. The route handler returns 504 (Gateway Timeout), removes the stale entry from the Redis sorted set via `remove_from_queue()`, and deletes the `asyncio.Event` from `_waiters`. The cleanup prevents the stale entry from being popped by `_signal_next_waiter` and waking a coroutine that has already returned an error.
+
+**Stale entries in `_signal_next_waiter`.** A race exists: a queued request times out and cleans up its entry from `_waiters`, but the Redis `ZREM` has not executed yet (or another instance added a stale entry). When `_signal_next_waiter` pops this entry via `ZPOPMIN`, it finds no matching event in `_waiters`. Without mitigation, the freed slot would be wasted (no waiter is signaled). The fix: `_signal_next_waiter` retries up to 3 times, popping the next entry from the sorted set on each retry. This ensures that a live waiter is found if one exists, at the cost of at most 3 extra `ZPOPMIN` calls (each is O(log N) in Redis, sub-millisecond).
+
+**Slot leak prevention.** A slot leak occurs when `acquire_slot` is called but `release_slot` is never called -- the counter increments but never decrements, and the backend appears permanently at capacity. Three mechanisms prevent this: (a) Non-streaming requests release slots in a `finally` block wrapping the backend call, ensuring release on both success and exception. (b) Streaming requests use `_wrap_stream_with_slot_release()`, a generator wrapper whose `finally` clause releases the slot when the generator is closed (by exhaustion, client disconnect, or exception). (c) A `slot_backend` variable in the route handler tracks which backend name the slot was acquired on, ensuring that `release_slot` is called on the correct backend even if re-routing occurred after dequeue.
+
+**Redis unavailable at startup.** If Redis is unreachable during the lifespan handler, `PriorityQueueManager` is not instantiated. The gateway operates without queuing -- all requests take the fast path, and if backends are at capacity, clients receive immediate 503 errors. This is graceful degradation: the gateway remains functional, just without queue-based smoothing.
+
+**Redis fails mid-operation.** If `ZADD` or `ZPOPMIN` raises a connection error, the exception propagates up to the route handler's error handling. For `ZADD` failures (enqueue), the request is not queued and falls through to a 503. For `ZPOPMIN` failures (signal), the slot is still released (the counter is decremented), but no waiter is woken. The next `release_slot` call will retry signaling. Worst case, a queued request waits until its timeout expires.
+
+**Backend circuit breaker opens while requests are queued.** Addressed by the re-check after dequeue (see "How it works" step 6). If no backend is available for the model after dequeue, the request receives a 503 from the standard "no available backend" error path. The queue wait time is not wasted in the sense that the system did attempt to serve the request; it is reported via `X-Queue-Wait-Ms` for observability.
+
+**Process crash with in-flight slots.** Because concurrency tracking is in-process, a process crash resets all counters to zero on restart. This is correct: the crashed process's HTTP connections are also dead, so the backend's actual concurrency from this process is zero. Redis queue entries from the crashed process remain (requests that were waiting). These entries are stale -- their `asyncio.Event` objects no longer exist. The `_signal_next_waiter` retry mechanism handles this by skipping entries with no matching waiter.
+
+### Observability
+
+**Response header: `X-Queue-Wait-Ms`.** Every response includes this header. A value of `0` means the request took the fast path (slot was immediately available). A non-zero value reports the milliseconds spent waiting in the queue. This is added by middleware reading `request.state.queue_wait_ms`, which is set by the route handler.
+
+**Admin endpoint: `GET /admin/queue`.** Returns a JSON object with two sections: per-backend concurrency status (current `active` slots and `max` slots) and per-model queue depth (number of waiting requests). This endpoint is polled by monitoring dashboards and is useful for capacity planning -- if queue depth is consistently non-zero, more backend capacity is needed.
+
+**Prometheus metrics** (via existing metrics middleware). The `X-Queue-Wait-Ms` value can be scraped as a histogram bucket for queue wait time distribution. Request duration already includes queue wait time, so an increase in P95 latency with stable backend latency indicates queuing overhead. The 503 and 504 status codes are already tracked as error rates, allowing alerts on sustained backpressure.
+
+**Structured logging.** Queue events are logged at INFO level: enqueue (with model, priority, queue depth), dequeue (with wait time), timeout, queue full rejection, and re-route after circuit breaker check. Each log entry includes the `request_id` for correlation with request logs.
+
+### Testing
+
+273 total tests after this phase.
+
+**Unit tests (`tests/unit/`):**
+- Concurrency tracking: acquire increments counter, release decrements, acquire fails at max_concurrent, release below zero is clamped.
+- Enqueue: score is computed correctly (`priority * 1e12 + timestamp`), entry appears in Redis sorted set, queue depth increments.
+- Score design: priority 1 always sorts before priority 2 regardless of timestamp. Within same priority, earlier timestamp sorts first.
+- Wait and timeout: `wait_for_slot` returns when event is set. `wait_for_slot` raises `QueueTimeoutError` after timeout expires.
+- Signal and stale entries: `_signal_next_waiter` sets the correct event. Stale entries (no matching waiter) are skipped, up to 3 retries.
+- Remove: `remove_from_queue` deletes from Redis sorted set and from `_waiters` dict.
+- Queue depth: `get_queue_depth` returns `ZCARD` value.
+
+**Integration tests (`tests/integration/`):**
+- Slots available: request proceeds immediately, `X-Queue-Wait-Ms: 0`.
+- Queue full (503): all slots occupied, queue at max depth, next request gets 503 with `Retry-After: 5`.
+- Timeout (504): all slots occupied, queue timeout set to 0.1s, request gets 504 after timeout.
+- Graceful degradation: Redis unavailable, queue manager not created, requests proceed without queuing.
+- `X-Queue-Wait-Ms` header: request that waited in queue has non-zero header value.
+- Slot release on failure: backend returns 500, slot is still released (counter decremented), next queued request is woken.
+- Circuit opens while queued: backend circuit breaker trips during queue wait, dequeued request is re-routed to alternate backend.
+
+### Production gaps
+
+**No cross-instance queue coordination.** Each gateway instance tracks its own concurrency independently. In a multi-instance deployment behind a load balancer, the total concurrency on a backend is the sum of all instances' concurrency. If each instance allows 10 concurrent requests and there are 5 instances, the backend sees up to 50 concurrent requests. The `max_concurrent` setting must be divided by the expected instance count, or a distributed semaphore (e.g., Redis-based with Redlock) should replace the in-process counter.
+
+**No queue persistence across restarts.** Redis stores the queue entries (sorted set), but the `asyncio.Event` objects are in-process. On restart, Redis has orphaned queue entries with no corresponding waiters. These entries are harmless (they will be skipped by `_signal_next_waiter`'s stale-entry retry) but waste a small amount of Redis memory until manually flushed or overwritten. A production system would add a startup sweep to `ZREM` entries older than `queue_timeout`.
+
+**No priority preemption.** A priority-1 request that arrives while the queue has only priority-2 requests will be enqueued behind them in the sorted set. `ZPOPMIN` will correctly return the priority-1 request next (its score is lower). However, it does not preempt a priority-2 request that has already been dequeued and is in-flight. True preemption would require cancelling in-flight requests, which is destructive and complex. The current design provides priority ordering at the queue level, not at the execution level.
+
+**Fixed timeout, no adaptive backpressure.** The queue timeout is a static configuration value (default 30s). A production system might adjust the timeout based on observed backend latency (e.g., if P99 backend latency is 10s, timeout should be at least 2x that). Adaptive backpressure could shed load earlier during sustained overload rather than waiting for the full timeout.
+
+**No dead-letter queue.** Requests that time out are simply rejected with 504. A production system might log timed-out requests to a dead-letter store for later analysis or retry by an offline batch process.
+
+### Interview talking points
+
+- **Queue vs. immediate rejection for slow backends.** LLM inference is uniquely slow (2--30s per request), making queuing far more effective than in typical web services. A 5-second queue wait that produces a successful response is better than a 503 followed by 3 client retries totaling 15 seconds. The queue absorbs bursty overload while backpressure (depth limit + timeout) prevents unbounded latency accumulation.
+- **Score design for priority + FIFO.** The formula `priority * 1e12 + timestamp` is a single-value encoding of a two-level sort key. The multiplier is chosen so that priority tiers never overlap with timestamp values (timestamps are ~1.7e9, well below 1e12). Redis `ZPOPMIN` returns the lowest score, which is always the highest-priority (lowest number), oldest (lowest timestamp) request. No secondary sort key, no custom comparator -- just a single float in a sorted set.
+- **In-process concurrency + Redis queue: separation of concerns.** Concurrency tracking (how many connections this process has open) is inherently per-process state -- it must reset on crash, it must be consistent with actual HTTP connections, and it must be zero-latency. The queue (who is waiting next) benefits from persistence, atomic pop, and external visibility, so it lives in Redis. Mixing the two (e.g., Redis for both) would add latency to the hot path and create stale-counter problems on crash.
+- **Zero-latency signaling with asyncio.Event.** No polling loops, no sleep intervals. When a slot is freed, the next waiter wakes up in the same event loop tick. This is the difference between asyncio cooperative scheduling (event-driven, zero waste) and polling-based designs (periodic checks, wasted cycles, added latency).
+- **Stale entry handling as a robustness pattern.** The `_signal_next_waiter` retry mechanism (up to 3 pops to skip stale entries) is a practical concession to distributed state: the in-process `_waiters` dict and the Redis sorted set can diverge (timeout cleanup races, process crashes). Rather than adding complex distributed locking to keep them perfectly synchronized, the system tolerates divergence and self-corrects by skipping stale entries.
+
+### Likely interview questions
+
+**Q: "Why not use an asyncio.Semaphore instead of building a custom queue?"**
+**A:** `asyncio.Semaphore` handles concurrency limiting but provides no priority ordering -- waiters are woken in FIFO order regardless of tenant priority. Adding priority to a semaphore effectively means building a custom priority queue on top of it, at which point the semaphore adds no value. The explicit design -- `dict` counter for concurrency, Redis sorted set for the queue, `asyncio.Event` for signaling -- separates concerns cleanly: each component does one thing and is independently testable and observable. A semaphore conflates concurrency limiting and wait ordering into a single opaque primitive.
+
+**Q: "How do you prevent slot leaks?"**
+**A:** Three mechanisms. First, non-streaming requests release slots in a `finally` block wrapping the backend HTTP call, so both success and exception paths release. Second, streaming requests use a generator wrapper (`_wrap_stream_with_slot_release`) whose `finally` clause releases the slot when the generator is closed by exhaustion, client disconnect, or exception. Third, a `slot_backend` variable tracks which backend name the slot was acquired on, handling the case where circuit breaker re-check after dequeue routes the request to a different backend -- `release_slot` is always called on the correct backend name. The combination of language-level finally semantics and explicit backend tracking makes slot leaks a code-level impossibility rather than a runtime hope.
+
+**Q: "What happens if Redis goes down while requests are queued?"**
+**A:** The in-process `_waiters` dict still holds the `asyncio.Event` objects, so already-queued requests continue waiting until their timeout expires. No new requests can be enqueued (the `ZADD` call will fail), so they fall through to immediate 503 rejection. When slots are released, `_signal_next_waiter` will fail on `ZPOPMIN` but the slot counter is still decremented (the counter is in-process, not in Redis). The worst case is that queued requests time out with 504 instead of being served. The system does not crash or deadlock -- it degrades to the "no queue" behavior. On Redis recovery, new requests can be enqueued again with no manual intervention.
+
+**Q: "Why per-model queues instead of per-backend queues?"**
+**A:** A model can be served by multiple backends (e.g., two vLLM instances both hosting `llama-70b`). If queues are per-backend and backend A is full while backend B has capacity, a request queued on backend A waits unnecessarily. Per-model queues decouple "what I need" (a model) from "where I get it" (a backend). When a slot opens on any backend serving that model, the next waiter is popped and re-runs backend selection, which routes it to whichever backend has capacity. This also interacts correctly with the circuit breaker: if backend A's circuit opens while a request is queued, the request is re-routed to backend B on dequeue rather than being sent to a known-bad destination.
