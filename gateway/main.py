@@ -122,6 +122,12 @@ app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(admin_router)
 
+# Prometheus metrics endpoint
+from prometheus_client import make_asgi_app
+
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
