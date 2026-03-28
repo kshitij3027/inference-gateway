@@ -85,3 +85,31 @@ async def flush_cache(request: Request):
         return {"status": "flushed", "entries_deleted": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cache flush error: {e}")
+
+
+@router.get("/queue")
+async def queue_stats(request: Request):
+    """Return priority queue statistics: concurrency per backend, depth per model."""
+    queue_manager = getattr(request.app.state, "queue_manager", None)
+    if queue_manager is None:
+        return {"enabled": False, "message": "Priority queue not available"}
+
+    registry = request.app.state.registry
+
+    concurrency = {}
+    for backend_name, backend_config in registry.backends.items():
+        concurrency[backend_name] = {
+            "active": queue_manager.get_concurrency(backend_name),
+            "max": backend_config.max_concurrent,
+        }
+
+    queues = {}
+    for model in registry.model_to_backends:
+        depth = await queue_manager.get_queue_depth(model)
+        queues[model] = {"depth": depth, "max_depth": queue_manager.max_queue_depth}
+
+    return {
+        "enabled": True,
+        "concurrency": concurrency,
+        "queues": queues,
+    }

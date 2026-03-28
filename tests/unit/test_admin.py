@@ -150,3 +150,31 @@ class TestCacheFlush:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.delete("/admin/cache")
         assert resp.status_code == 503
+
+
+class TestQueueStats:
+    async def test_returns_stats(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_qm = AsyncMock()
+        mock_qm.get_concurrency = lambda name: 3 if name == "test-backend" else 0
+        mock_qm.get_queue_depth = AsyncMock(return_value=2)
+        mock_qm.max_queue_depth = 100
+        app.state.queue_manager = mock_qm
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/queue")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["concurrency"]["test-backend"]["active"] == 3
+        assert data["concurrency"]["test-backend"]["max"] == 10
+        assert data["queues"]["tinyllama"]["depth"] == 2
+
+    async def test_returns_disabled_when_no_queue(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.queue_manager = None
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/queue")
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False

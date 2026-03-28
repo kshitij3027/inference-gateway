@@ -166,3 +166,36 @@ class TestQueueIntegration:
                 # Should still get a response (may be error)
                 # Important: release_slot was called despite failure
                 assert mock_qm.release_slot.call_count > 0
+
+    async def test_circuit_opens_while_queued(self, test_env, mock_translator):
+        """If circuit breaker opens while request is queued, return 503 after dequeue."""
+        async with app.router.lifespan_context(app):
+            mock_qm = AsyncMock(spec=PriorityQueueManager)
+            mock_qm.acquire_slot = AsyncMock(return_value=False)
+            mock_qm.enqueue = AsyncMock()
+            mock_qm.wait_for_slot = AsyncMock(return_value=100.0)
+
+            # After dequeue, trip ALL circuit breakers so no backend is available
+            original_find = app.state.registry.find_backend_for_model
+            call_count = [0]
+
+            def mock_find(model, routing_key=None, exclude=frozenset()):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    # First call (before enqueue): return normally
+                    return original_find(model, routing_key=routing_key, exclude=exclude)
+                # Second call (after dequeue): return None (all unavailable)
+                return None
+
+            app.state.registry.find_backend_for_model = mock_find
+            app.state.queue_manager = mock_qm
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "hello"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 503
+            assert "after dequeue" in resp.json()["detail"]
