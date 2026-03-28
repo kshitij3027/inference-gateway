@@ -112,6 +112,36 @@ async def chat_completions(
             detail=f"Model '{chat_request.model}' not allowed for tenant '{tenant.id}'",
         )
 
+    # Semantic cache check (after auth + rate-limit, before routing)
+    semantic_cache = getattr(request.app.state, "semantic_cache", None)
+    cache_isolation = getattr(tenant, "cache_isolation", "shared")
+
+    if semantic_cache is not None:
+        try:
+            cached_response, cache_similarity = await semantic_cache.lookup(
+                model=chat_request.model,
+                messages=chat_request.messages,
+                tenant_id=tenant.id,
+                cache_isolation=cache_isolation,
+            )
+            if cached_response is not None:
+                await semantic_cache.record_hit()
+                request.state.cache_status = "HIT"
+                request.state.cache_similarity = cache_similarity
+                logger.info(
+                    "cache_hit",
+                    model=chat_request.model,
+                    tenant_id=tenant.id,
+                    similarity=cache_similarity,
+                )
+                return cached_response
+            else:
+                await semantic_cache.record_miss()
+                request.state.cache_status = "MISS"
+        except Exception as e:
+            logger.warning("cache_lookup_failed", error=str(e))
+            request.state.cache_status = "MISS"
+
     # Find backend for model
     registry = request.app.state.registry
     routing_key = f"{tenant.id}:{chat_request.model}"
@@ -220,6 +250,19 @@ async def chat_completions(
                     await rate_limiter.record_tokens(tenant.id, result.usage.total_tokens)
                 except Exception as e:
                     logger.warning("token_recording_failed", error=str(e))
+
+            # Store in cache on miss
+            if semantic_cache is not None:
+                try:
+                    await semantic_cache.store(
+                        model=chat_request.model,
+                        messages=chat_request.messages,
+                        response=result,
+                        tenant_id=tenant.id,
+                        cache_isolation=cache_isolation,
+                    )
+                except Exception as e:
+                    logger.warning("cache_store_failed", error=str(e))
 
             return result
 

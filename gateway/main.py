@@ -52,6 +52,23 @@ async def lifespan(app: FastAPI):
         app.state.redis = None
         app.state.rate_limiter = None
 
+    # Semantic cache (requires Redis)
+    if app.state.redis is not None:
+        from gateway.semantic_cache import SemanticCache
+
+        cache_ttl = int(os.getenv("CACHE_TTL", "3600"))
+        similarity_threshold = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95"))
+        app.state.semantic_cache = SemanticCache(
+            app.state.redis,
+            similarity_threshold=similarity_threshold,
+            default_ttl=cache_ttl,
+        )
+        logger.info(
+            "semantic_cache_initialized", ttl=cache_ttl, threshold=similarity_threshold
+        )
+    else:
+        app.state.semantic_cache = None
+
     # SIGHUP handler for hot-reload
     def handle_sighup(signum, frame):
         try:
@@ -108,6 +125,12 @@ async def request_id_middleware(request: Request, call_next):
             response.headers["X-Ratelimit-Remaining-Rps"] = str(rate_limit_remaining["rps"])
         if "rpm" in rate_limit_remaining:
             response.headers["X-Ratelimit-Remaining-Rpm"] = str(rate_limit_remaining["rpm"])
+    cache_status = getattr(request.state, "cache_status", None)
+    if cache_status:
+        response.headers["X-Cache"] = cache_status
+    cache_similarity = getattr(request.state, "cache_similarity", None)
+    if cache_similarity is not None:
+        response.headers["X-Cache-Similarity"] = f"{cache_similarity:.4f}"
     logger.info(
         "request_completed",
         method=request.method,
