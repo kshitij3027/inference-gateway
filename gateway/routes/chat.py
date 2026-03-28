@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from gateway.auth import get_current_tenant
+from gateway.priority_queue import QueueFullError, QueueTimeoutError
 from gateway.backends import anthropic as anthropic_backend
 from gateway.backends import ollama
 from gateway.backends import openai as openai_backend
@@ -99,6 +100,15 @@ async def _stream_cached_response(response):
     yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
 
     yield "data: [DONE]\n\n"
+
+
+async def _wrap_stream_with_slot_release(gen, queue_manager, backend_name, model):
+    """Release concurrency slot when streaming response completes."""
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        await queue_manager.release_slot(backend_name, model)
 
 
 TRANSLATORS = {
@@ -260,10 +270,55 @@ async def chat_completions(
                 detail="All backends unavailable for this model",
             )
 
+        # Queue: acquire concurrency slot
+        queue_manager = getattr(request.app.state, "queue_manager", None)
+        slot_backend = None
+        if queue_manager is not None:
+            slot_acquired = await queue_manager.acquire_slot(
+                backend.name, backend.max_concurrent
+            )
+            if not slot_acquired:
+                try:
+                    await queue_manager.enqueue(
+                        chat_request.model, request_id, tenant.priority
+                    )
+                except QueueFullError:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Queue full",
+                        headers={"Retry-After": "5"},
+                    )
+                try:
+                    queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                    request.state.queue_wait_ms = queue_wait_ms
+                except QueueTimeoutError:
+                    await queue_manager.remove_from_queue(
+                        chat_request.model, request_id
+                    )
+                    raise HTTPException(
+                        status_code=504, detail="Queue timeout"
+                    )
+                # Re-check circuit breaker after dequeue
+                exclude = cb_registry.get_open_backends()
+                backend = registry.find_backend_for_model(
+                    chat_request.model, routing_key=routing_key, exclude=exclude
+                )
+                if backend is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="All backends unavailable after dequeue",
+                    )
+                await queue_manager.acquire_slot(
+                    backend.name, backend.max_concurrent
+                )
+            slot_backend = backend.name
+
         request.state.backend_name = backend.name
 
         stream_translator = STREAM_TRANSLATORS.get(backend.provider)
         if stream_translator is None:
+            if queue_manager is not None and slot_backend:
+                await queue_manager.release_slot(slot_backend, chat_request.model)
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported provider for streaming: {backend.provider}",
@@ -292,12 +347,18 @@ async def chat_completions(
                 wrapped_gen, semantic_cache, chat_request.model,
                 chat_request.messages, tenant.id, cache_isolation,
             )
+        # Slot release wrapper goes outermost
+        if queue_manager is not None and slot_backend:
+            wrapped_gen = _wrap_stream_with_slot_release(
+                wrapped_gen, queue_manager, slot_backend, chat_request.model
+            )
         return StreamingResponse(wrapped_gen, media_type="text/event-stream")
 
     # Non-streaming path with failover retry loop
     cb_registry = request.app.state.circuit_breakers
     exclude = cb_registry.get_open_backends()
     last_error: HTTPException | None = None
+    queue_manager = getattr(request.app.state, "queue_manager", None)
 
     for attempt in range(3):
         backend = registry.find_backend_for_model(
@@ -308,8 +369,54 @@ async def chat_completions(
 
         request.state.backend_name = backend.name
 
+        # Queue: acquire concurrency slot
+        slot_backend = None
+        if queue_manager is not None:
+            slot_acquired = await queue_manager.acquire_slot(
+                backend.name, backend.max_concurrent
+            )
+            if not slot_acquired:
+                # At capacity — enqueue for the model
+                try:
+                    await queue_manager.enqueue(
+                        chat_request.model, request_id, tenant.priority
+                    )
+                except QueueFullError:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Queue full",
+                        headers={"Retry-After": "5"},
+                    )
+                try:
+                    queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                    request.state.queue_wait_ms = queue_wait_ms
+                except QueueTimeoutError:
+                    await queue_manager.remove_from_queue(
+                        chat_request.model, request_id
+                    )
+                    raise HTTPException(
+                        status_code=504, detail="Queue timeout"
+                    )
+                # Re-check circuit breaker and re-route after dequeue
+                exclude = cb_registry.get_open_backends()
+                backend = registry.find_backend_for_model(
+                    chat_request.model, routing_key=routing_key, exclude=exclude
+                )
+                if backend is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="All backends unavailable after dequeue",
+                    )
+                request.state.backend_name = backend.name
+                await queue_manager.acquire_slot(
+                    backend.name, backend.max_concurrent
+                )
+            slot_backend = backend.name
+
         translator = TRANSLATORS.get(backend.provider)
         if translator is None:
+            if queue_manager is not None and slot_backend:
+                await queue_manager.release_slot(slot_backend, chat_request.model)
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported provider: {backend.provider}",
@@ -408,6 +515,11 @@ async def chat_completions(
                 attempt=attempt + 1,
             )
             continue
+
+        finally:
+            # Always release the slot for this attempt
+            if queue_manager is not None and slot_backend:
+                await queue_manager.release_slot(slot_backend, chat_request.model)
 
     # All attempts exhausted or no backend available
     if last_error:

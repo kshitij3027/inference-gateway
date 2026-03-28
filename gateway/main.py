@@ -69,6 +69,25 @@ async def lifespan(app: FastAPI):
     else:
         app.state.semantic_cache = None
 
+    # Priority queue (requires Redis)
+    if app.state.redis is not None:
+        from gateway.priority_queue import PriorityQueueManager
+
+        queue_max_depth = int(os.getenv("QUEUE_MAX_DEPTH", "100"))
+        queue_timeout = float(os.getenv("QUEUE_TIMEOUT", "30"))
+        app.state.queue_manager = PriorityQueueManager(
+            app.state.redis,
+            max_queue_depth=queue_max_depth,
+            queue_timeout=queue_timeout,
+        )
+        logger.info(
+            "queue_manager_initialized",
+            max_depth=queue_max_depth,
+            timeout=queue_timeout,
+        )
+    else:
+        app.state.queue_manager = None
+
     # SIGHUP handler for hot-reload
     def handle_sighup(signum, frame):
         try:
@@ -131,6 +150,9 @@ async def request_id_middleware(request: Request, call_next):
     cache_similarity = getattr(request.state, "cache_similarity", None)
     if cache_similarity is not None:
         response.headers["X-Cache-Similarity"] = f"{cache_similarity:.4f}"
+    queue_wait_ms = getattr(request.state, "queue_wait_ms", None)
+    if queue_wait_ms is not None:
+        response.headers["X-Queue-Wait-Ms"] = str(queue_wait_ms)
     logger.info(
         "request_completed",
         method=request.method,
