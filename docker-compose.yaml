@@ -13,6 +13,12 @@ services:
       - OPENAI_API_KEY=test-openai-key
       - ANTHROPIC_API_KEY=test-anthropic-key
       - REDIS_URL=redis://redis:6379/0
+      - CACHE_TTL=3600
+      - CACHE_SIMILARITY_THRESHOLD=0.95
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     volumes:
       - ./config:/app/config:ro
     depends_on:
