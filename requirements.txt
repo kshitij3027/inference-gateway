@@ -13,6 +13,12 @@ pyyaml>=6.0.1
 # Caching and rate limiting
 redis>=5.2.0
 
+# Semantic cache embeddings (CPU-only torch to keep image lean)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=3.0.0
+numpy>=1.26.0
+
 # Retry and failover
 tenacity>=9.0.0
 

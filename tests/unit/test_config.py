@@ -80,6 +80,32 @@ class TestTenantConfig:
                 allowed_models=["tinyllama"],
             )
 
+    def test_cache_isolation_defaults_to_shared(self):
+        t = TenantConfig(
+            id="t1",
+            api_key_env="TEST_KEY",
+            allowed_models=["tinyllama"],
+        )
+        assert t.cache_isolation == "shared"
+
+    def test_cache_isolation_accepts_tenant(self):
+        t = TenantConfig(
+            id="t1",
+            api_key_env="TEST_KEY",
+            allowed_models=["tinyllama"],
+            cache_isolation="tenant",
+        )
+        assert t.cache_isolation == "tenant"
+
+    def test_cache_isolation_rejects_invalid(self):
+        with pytest.raises(Exception):
+            TenantConfig(
+                id="t1",
+                api_key_env="TEST_KEY",
+                allowed_models=["tinyllama"],
+                cache_isolation="invalid",
+            )
+
 
 class TestGatewayConfig:
     def _make_backend(self, name="b1"):

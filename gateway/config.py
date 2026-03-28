@@ -39,6 +39,7 @@ class TenantConfig(BaseModel):
     rate_limit_rps: int | None = None
     rate_limit_rpm: int | None = None
     token_budget_daily: int | None = None
+    cache_isolation: Literal["shared", "tenant"] = "shared"
 
 
 class GatewayConfig(BaseModel):
