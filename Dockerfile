@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir pytest pytest-asyncio pytest-httpx pyyaml
 COPY pyproject.toml .
 COPY gateway/ gateway/
 COPY config/ config/
+COPY prometheus/ prometheus/
+COPY grafana/ grafana/
 COPY tests/ tests/
 CMD ["python", "-m", "pytest", "tests/", "-v"]
 
