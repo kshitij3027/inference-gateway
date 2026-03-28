@@ -49,3 +49,18 @@ class TestGrafanaDashboardProvider:
         data = yaml.safe_load(provider_path.read_text())
         assert "providers" in data
         assert len(data["providers"]) >= 1
+
+
+class TestDashboardJsonFiles:
+    def test_all_dashboards_valid(self):
+        import json
+
+        dashboards_dir = PROJECT_ROOT / "grafana" / "provisioning" / "dashboards"
+        json_files = list(dashboards_dir.glob("*.json"))
+        assert len(json_files) == 3, f"Expected 3 dashboards, found {len(json_files)}"
+        for json_file in json_files:
+            data = json.loads(json_file.read_text())
+            assert "uid" in data, f"{json_file.name} missing uid"
+            assert "title" in data, f"{json_file.name} missing title"
+            assert "panels" in data, f"{json_file.name} missing panels"
+            assert len(data["panels"]) > 0, f"{json_file.name} has no panels"
