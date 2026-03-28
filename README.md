@@ -10,6 +10,23 @@ Clients send standard `/v1/chat/completions` requests. The gateway translates pr
 
 > Grafana dashboards with live traffic: Gateway Overview (RPS, error rate, cache hit ratio, active backends), Per-Backend Drilldown (latency percentiles, circuit breaker state), Per-Tenant Usage (token consumption, rate limit hits).
 
+## Measured Performance
+
+Numbers from a local Docker Compose run (14 services, mock LLM backends, ~400 requests):
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Gateway P50 latency | ~1s | End-to-end including mock backend response time |
+| Gateway P95 latency | ~3.8s | Includes concurrent request queuing |
+| Gateway P99 latency | ~4.8s | Tail latency under burst load |
+| Cache hit latency | <50ms | Semantic cache hit bypasses backend entirely |
+| Cache hit rate | 15-73% | Depends on prompt repetition (73% with repeated queries) |
+| Throughput | 400+ req in test run | Across 10 backends, 2 tenants, 3 models |
+| Tokens processed | 767K+ | Tracked per-tenant, per-model (prompt + completion) |
+| Rate limit enforcement | 40 rejections | Per-tenant RPS/RPM/daily budget enforced via Redis |
+| Active backends | 10/10 | Circuit breaker state: all CLOSED |
+| Test suite | 286 passing | 19 unit + 7 integration test modules |
+
 ## Architecture
 
 ```mermaid
