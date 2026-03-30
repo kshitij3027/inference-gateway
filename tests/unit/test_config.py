@@ -12,6 +12,8 @@ from gateway.config import (
     TenantConfig,
     load_config,
 )
+from gateway.strategies import ConsistentHashStrategy, CostAwareStrategy, LatencyAwareStrategy
+from gateway.latency_tracker import LatencyTracker
 
 
 class TestBackendConfig:
@@ -493,3 +495,73 @@ class TestModelRoutingConfig:
         assert len(cfg.backends) >= 1
         assert len(cfg.tenants) >= 1
         assert cfg.routing == {}
+
+
+class TestRegistryStrategyConstruction:
+    """Tests for Registry building per-model strategies from config."""
+
+    def _make_config(self, routing=None):
+        return GatewayConfig.model_validate({
+            "backends": [
+                {"name": "b1", "provider": "ollama", "base_url": "http://b1:11434", "models": ["m1"]},
+                {"name": "b2", "provider": "ollama", "base_url": "http://b2:11434", "models": ["m1"]},
+                {"name": "b3", "provider": "openai", "base_url": "http://b3:3000", "models": ["m2"], "cost_per_1k_tokens": 0.03},
+                {"name": "b4", "provider": "openai", "base_url": "http://b4:3000", "models": ["m2"], "cost_per_1k_tokens": 0.01},
+            ],
+            "tenants": [{"id": "t1", "api_key_env": "T1_KEY", "allowed_models": ["m1", "m2"]}],
+            **({"routing": routing} if routing else {}),
+        })
+
+    def test_default_consistent_hash(self, monkeypatch):
+        """No routing section -> all models get ConsistentHashStrategy."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config()
+        reg = Registry(config)
+        assert isinstance(reg.model_strategies["m1"], ConsistentHashStrategy)
+        assert isinstance(reg.model_strategies["m2"], ConsistentHashStrategy)
+
+    def test_latency_aware_with_tracker(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config(routing={"m1": {"strategy": "latency_aware"}})
+        tracker = LatencyTracker()
+        reg = Registry(config, latency_tracker=tracker)
+        assert isinstance(reg.model_strategies["m1"], LatencyAwareStrategy)
+        assert isinstance(reg.model_strategies["m2"], ConsistentHashStrategy)
+
+    def test_latency_aware_without_tracker_falls_back(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config(routing={"m1": {"strategy": "latency_aware"}})
+        reg = Registry(config)  # No tracker
+        assert isinstance(reg.model_strategies["m1"], ConsistentHashStrategy)
+
+    def test_cost_aware(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config(routing={"m2": {"strategy": "cost_aware"}})
+        reg = Registry(config)
+        assert isinstance(reg.model_strategies["m2"], CostAwareStrategy)
+
+    def test_backward_compat_same_routing_key(self, monkeypatch):
+        """Default strategy produces same result as old code for same routing_key."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config()
+        reg = Registry(config)
+        results = {
+            reg.find_backend_for_model("m1", routing_key="tenant:m1").name
+            for _ in range(10)
+        }
+        assert len(results) == 1  # Deterministic
+
+    def test_find_delegates_to_strategy(self, monkeypatch):
+        """Cost-aware strategy picks cheapest backend."""
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config(routing={"m2": {"strategy": "cost_aware"}})
+        reg = Registry(config)
+        backend = reg.find_backend_for_model("m2", routing_key="anything")
+        assert backend.name == "b4"  # 0.01 < 0.03
+
+    def test_model_routing_config_stored(self, monkeypatch):
+        monkeypatch.setenv("T1_KEY", "key1")
+        config = self._make_config(routing={"m1": {"strategy": "latency_aware", "hedge_enabled": True}})
+        tracker = LatencyTracker()
+        reg = Registry(config, latency_tracker=tracker)
+        assert reg.model_routing_config["m1"].hedge_enabled is True

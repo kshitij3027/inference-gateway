@@ -9,6 +9,12 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from gateway.routing import ConsistentHashRing
+from gateway.strategies import (
+    ConsistentHashStrategy,
+    CostAwareStrategy,
+    LatencyAwareStrategy,
+    RoutingStrategy,
+)
 
 logger = structlog.get_logger()
 
@@ -98,7 +104,7 @@ def load_config(path: str | Path) -> GatewayConfig:
 class Registry:
     """In-memory registry of backends and tenants, built from config."""
 
-    def __init__(self, config: GatewayConfig) -> None:
+    def __init__(self, config: GatewayConfig, latency_tracker=None) -> None:
         self.backends: dict[str, BackendConfig] = {b.name: b for b in config.backends}
 
         # Build model -> backends reverse index
@@ -127,31 +133,50 @@ class Registry:
                 [(b.name, b.weight) for b in backends]
             )
 
+        # Build per-model routing strategies
+        self.model_routing_config: dict[str, ModelRoutingConfig] = dict(config.routing)
+        self.model_strategies: dict[str, RoutingStrategy] = {}
+        for model, backends in self.model_to_backends.items():
+            routing_cfg = config.routing.get(model, ModelRoutingConfig())
+            ring = self.model_rings[model]
+
+            if routing_cfg.strategy == "latency_aware" and latency_tracker is not None:
+                self.model_strategies[model] = LatencyAwareStrategy(
+                    latency_tracker, model
+                )
+            elif routing_cfg.strategy == "cost_aware":
+                costs = {
+                    b.name: b.cost_per_1k_tokens
+                    for b in backends
+                    if b.cost_per_1k_tokens is not None
+                }
+                self.model_strategies[model] = CostAwareStrategy(costs)
+            else:
+                self.model_strategies[model] = ConsistentHashStrategy(ring)
+
     def find_backend_for_model(
         self,
         model: str,
         routing_key: str | None = None,
         exclude: frozenset[str] = frozenset(),
     ) -> BackendConfig | None:
-        """Find a backend for the given model.
+        """Find a backend for the given model using the configured strategy.
 
-        If routing_key is provided, uses the consistent hash ring for
-        deterministic backend selection. Falls back to first match otherwise.
+        Delegates to the per-model RoutingStrategy. Falls back to first match
+        if no strategy is configured (model not in registry).
 
         Args:
             model: The model name to look up.
             routing_key: Optional key for consistent hash routing.
             exclude: Set of backend names to skip (for failover).
         """
-        if routing_key is not None:
-            ring = self.model_rings.get(model)
-            if ring is not None:
-                node_name = ring.get_node(routing_key, exclude=exclude)
-                if node_name is not None:
-                    return self.backends.get(node_name)
-                return None
+        strategy = self.model_strategies.get(model)
+        if strategy is not None:
+            candidates = [b.name for b in self.model_to_backends.get(model, [])]
+            node_name = strategy.select(candidates, exclude, routing_key)
+            return self.backends.get(node_name) if node_name else None
 
-        # Fallback: first match (backward compat), respecting exclude
+        # Fallback: first match (model not in registry at all)
         backends = [
             b for b in self.model_to_backends.get(model, []) if b.name not in exclude
         ]
