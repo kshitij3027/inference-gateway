@@ -537,6 +537,136 @@ async def chat_completions(
     # Non-streaming path with failover retry loop
     cb_registry = request.app.state.circuit_breakers
     exclude = cb_registry.get_open_backends()
+
+    # Hedge request support (non-streaming only)
+    hedge_requested = request.headers.get("x-hedge", "").lower() == "true"
+    routing_cfg = registry.model_routing_config.get(chat_request.model)
+    hedge_enabled = routing_cfg.hedge_enabled if routing_cfg else False
+
+    if hedge_requested and hedge_enabled:
+        backend1 = registry.find_backend_for_model(
+            chat_request.model, routing_key=routing_key, exclude=exclude
+        )
+        if backend1:
+            backend2 = registry.find_backend_for_model(
+                chat_request.model,
+                routing_key=routing_key,
+                exclude=exclude | frozenset({backend1.name}),
+            )
+            if backend2:
+                translator = TRANSLATORS.get(backend1.provider)
+                if translator:
+                    try:
+                        result, winner, loser, duration_ms = await _execute_hedge(
+                            request.app.state.http_client,
+                            backend1,
+                            backend2,
+                            chat_request,
+                            translator,
+                        )
+                        request.state.backend_name = winner.name
+                        request.state.hedge_winner = winner.name
+                        request.state.hedge_loser = loser.name
+
+                        from gateway.observability.metrics import (
+                            HEDGE_REQUESTS,
+                            HEDGE_WIN_RATE,
+                        )
+                        HEDGE_REQUESTS.labels(model=chat_request.model).inc()
+                        HEDGE_WIN_RATE.labels(
+                            backend=winner.name, model=chat_request.model
+                        ).inc()
+
+                        # Record latency for winner
+                        latency_tracker = getattr(
+                            request.app.state, "latency_tracker", None
+                        )
+                        if latency_tracker:
+                            latency_tracker.record(
+                                winner.name, chat_request.model, duration_ms
+                            )
+
+                        # Circuit breaker success for winner
+                        cb = cb_registry.get(winner.name)
+                        if cb:
+                            cb.record_success()
+
+                        logger.info(
+                            "hedge_request_completed",
+                            model=chat_request.model,
+                            tenant_id=tenant.id,
+                            winner=winner.name,
+                            loser=loser.name,
+                            duration_ms=duration_ms,
+                        )
+
+                        TOKENS_CONSUMED.labels(
+                            tenant=tenant.id,
+                            model=chat_request.model,
+                            type="prompt",
+                        ).inc(result.usage.prompt_tokens)
+                        TOKENS_CONSUMED.labels(
+                            tenant=tenant.id,
+                            model=chat_request.model,
+                            type="completion",
+                        ).inc(result.usage.completion_tokens)
+
+                        # Token budget recording
+                        if tenant.token_budget_daily and rate_limiter:
+                            try:
+                                await rate_limiter.record_tokens(
+                                    tenant.id, result.usage.total_tokens
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "token_recording_failed", error=str(e)
+                                )
+
+                        # Cache store
+                        if semantic_cache is not None:
+                            try:
+                                await semantic_cache.store(
+                                    model=chat_request.model,
+                                    messages=chat_request.messages,
+                                    response=result,
+                                    tenant_id=tenant.id,
+                                    cache_isolation=cache_isolation,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "cache_store_failed", error=str(e)
+                                )
+
+                        # Release stampede lock
+                        if lock_acquired and lock_key:
+                            try:
+                                await semantic_cache.release_stampede_lock(
+                                    lock_key
+                                )
+                            except Exception:
+                                pass
+
+                        # Journal
+                        if journal is not None:
+                            await journal.record_completion(
+                                request_id=request_id,
+                                status=200,
+                                latency_ms=duration_ms,
+                                backend=winner.name,
+                                cache_hit=False,
+                                tokens_prompt=result.usage.prompt_tokens,
+                                tokens_completion=result.usage.completion_tokens,
+                            )
+
+                        return result
+                    except Exception as e:
+                        logger.warning(
+                            "hedge_request_failed",
+                            model=chat_request.model,
+                            error=str(e),
+                        )
+                        # Fall through to normal retry loop
+
     last_error: HTTPException | None = None
     queue_manager = getattr(request.app.state, "queue_manager", None)
 

@@ -230,6 +230,13 @@ async def request_id_middleware(request: Request, call_next):
         if queue_wait_ms is not None:
             response.headers["X-Queue-Wait-Ms"] = str(queue_wait_ms)
 
+        hedge_winner = getattr(request.state, "hedge_winner", None)
+        if hedge_winner:
+            response.headers["X-Hedge-Winner"] = hedge_winner
+        hedge_loser = getattr(request.state, "hedge_loser", None)
+        if hedge_loser:
+            response.headers["X-Hedge-Loser"] = hedge_loser
+
         # Prometheus metrics
         from gateway.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
