@@ -8,7 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from gateway.auth import get_current_tenant
+from gateway.journal import RequestJournal
 from gateway.priority_queue import QueueFullError, QueueTimeoutError
+from gateway.token_counting import count_tokens
 from gateway.backends import anthropic as anthropic_backend
 from gateway.backends import ollama
 from gateway.backends import openai as openai_backend
@@ -120,6 +122,75 @@ async def _wrap_stream_with_slot_release(gen, queue_manager, backend_name, model
         await queue_manager.release_slot(backend_name, model)
 
 
+async def _wrap_stream_with_journal(
+    gen,
+    journal,
+    request_id,
+    tenant_id,
+    backend_name,
+    model,
+    messages,
+    start_time,
+    rate_limiter,
+    token_budget_daily,
+):
+    """Record journal completion and token metrics after streaming finishes."""
+    buffered_content = []
+    error_status = None
+    try:
+        async for chunk in gen:
+            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+                try:
+                    data = json.loads(chunk[6:])
+                    choices = data.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            buffered_content.append(content)
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
+            yield chunk
+    except Exception:
+        error_status = 500
+        raise
+    finally:
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        full_content = "".join(buffered_content)
+        prompt_text = "\n".join(m.content for m in messages)
+        tokens_prompt = count_tokens(prompt_text, model)
+        tokens_completion = count_tokens(full_content, model) if full_content else 0
+
+        # Record journal completion
+        if journal is not None:
+            await journal.record_completion(
+                request_id=request_id,
+                status=error_status or 200,
+                latency_ms=latency_ms,
+                backend=backend_name,
+                cache_hit=False,
+                tokens_prompt=tokens_prompt,
+                tokens_completion=tokens_completion,
+            )
+
+        # Fix streaming token metrics gap
+        TOKENS_CONSUMED.labels(
+            tenant=tenant_id, model=model, type="prompt"
+        ).inc(tokens_prompt)
+        TOKENS_CONSUMED.labels(
+            tenant=tenant_id, model=model, type="completion"
+        ).inc(tokens_completion)
+
+        # Record token budget for streaming
+        if rate_limiter and token_budget_daily:
+            try:
+                await rate_limiter.record_tokens(
+                    tenant_id, tokens_prompt + tokens_completion
+                )
+            except Exception:
+                pass
+
+
 TRANSLATORS = {
     "ollama": ollama.chat_completion,
     "openai": openai_backend.chat_completion,
@@ -142,6 +213,9 @@ async def chat_completions(
     # Set tenant and model on request state for metrics middleware
     request.state.tenant_id = tenant.id
     request.state.model_name = chat_request.model
+
+    journal = getattr(request.app.state, "journal", None)
+    request_start_time = time.perf_counter()
 
     # Rate limit check (after auth, before routing)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
@@ -206,6 +280,17 @@ async def chat_completions(
             detail=f"Model '{chat_request.model}' not allowed for tenant '{tenant.id}'",
         )
 
+    # Record journal entry
+    if journal is not None:
+        prompt_hash = RequestJournal.compute_prompt_hash(chat_request.messages)
+        await journal.record_request(
+            request_id=request_id,
+            tenant_id=tenant.id,
+            model=chat_request.model,
+            prompt_hash=prompt_hash,
+            timestamp=time.time(),
+        )
+
     # Semantic cache check (after auth + rate-limit, before routing)
     semantic_cache = getattr(request.app.state, "semantic_cache", None)
     cache_isolation = getattr(tenant, "cache_isolation", "shared")
@@ -230,6 +315,16 @@ async def chat_completions(
                     similarity=cache_similarity,
                     streaming=chat_request.stream,
                 )
+                if journal is not None:
+                    await journal.record_completion(
+                        request_id=request_id,
+                        status=200,
+                        latency_ms=round((time.perf_counter() - request_start_time) * 1000, 2),
+                        backend="cache",
+                        cache_hit=True,
+                        tokens_prompt=cached_response.usage.prompt_tokens,
+                        tokens_completion=cached_response.usage.completion_tokens,
+                    )
                 if chat_request.stream:
                     return StreamingResponse(
                         _stream_cached_response(cached_response),
@@ -377,6 +472,13 @@ async def chat_completions(
             wrapped_gen = _wrap_stream_with_slot_release(
                 wrapped_gen, queue_manager, slot_backend, chat_request.model
             )
+        # Journal wrapper outermost — records completion after stream finishes
+        if journal is not None:
+            wrapped_gen = _wrap_stream_with_journal(
+                wrapped_gen, journal, request_id, tenant.id,
+                backend.name, chat_request.model, chat_request.messages,
+                request_start_time, rate_limiter, tenant.token_budget_daily,
+            )
         return StreamingResponse(wrapped_gen, media_type="text/event-stream")
 
     # Non-streaming path with failover retry loop
@@ -517,6 +619,17 @@ async def chat_completions(
                 except Exception:
                     pass
 
+            if journal is not None:
+                await journal.record_completion(
+                    request_id=request_id,
+                    status=200,
+                    latency_ms=duration_ms,
+                    backend=backend.name,
+                    cache_hit=False,
+                    tokens_prompt=result.usage.prompt_tokens,
+                    tokens_completion=result.usage.completion_tokens,
+                )
+
             return result
 
         except HTTPException as e:
@@ -558,6 +671,16 @@ async def chat_completions(
                 await queue_manager.release_slot(slot_backend, chat_request.model)
 
     # All attempts exhausted or no backend available
+    if journal is not None:
+        await journal.record_completion(
+            request_id=request_id,
+            status=last_error.status_code if last_error else 404,
+            latency_ms=round((time.perf_counter() - request_start_time) * 1000, 2),
+            backend="",
+            cache_hit=False,
+            tokens_prompt=0,
+            tokens_completion=0,
+        )
     if last_error:
         raise last_error
     raise HTTPException(

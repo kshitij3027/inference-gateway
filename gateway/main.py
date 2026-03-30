@@ -94,6 +94,18 @@ async def lifespan(app: FastAPI):
     else:
         app.state.queue_manager = None
 
+    # Request journal (requires Redis)
+    if app.state.redis is not None:
+        from gateway.journal import RequestJournal
+
+        journal_max_len = int(os.getenv("JOURNAL_MAX_LEN", "100000"))
+        app.state.journal = RequestJournal(
+            app.state.redis, max_len=journal_max_len
+        )
+        logger.info("journal_initialized", max_len=journal_max_len)
+    else:
+        app.state.journal = None
+
     # SIGHUP handler for hot-reload
     def handle_sighup(signum, frame):
         try:
