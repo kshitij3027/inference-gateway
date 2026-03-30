@@ -26,6 +26,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.03
 
   - name: mock-openai-2
     provider: openai
@@ -36,6 +37,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.03
 
   - name: mock-openai-3
     provider: openai
@@ -46,6 +48,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.05
 
   - name: mock-openai-4
     provider: openai
@@ -56,6 +59,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.05
 
   - name: mock-openai-5
     provider: openai
@@ -66,6 +70,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.05
 
   - name: mock-anthropic-1
     provider: anthropic
@@ -76,6 +81,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.01
 
   - name: mock-anthropic-2
     provider: anthropic
@@ -86,6 +92,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.02
 
   - name: mock-anthropic-3
     provider: anthropic
@@ -96,6 +103,7 @@ backends:
     weight: 1
     max_concurrent: 10
     timeout_ms: 30000
+    cost_per_1k_tokens: 0.03
 
 tenants:
   - id: tenant-alpha
@@ -115,3 +123,11 @@ tenants:
     allowed_models:
       - "*"
     priority: 2
+
+routing:
+  mock-gpt-markdown:
+    strategy: latency_aware
+    hedge_enabled: true
+  mock-claude-markdown:
+    strategy: cost_aware
+    hedge_enabled: false

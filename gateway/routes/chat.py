@@ -53,6 +53,17 @@ async def _wrap_stream_with_circuit_breaker(gen, circuit_breaker):
                 circuit_breaker.record_success()
 
 
+async def _wrap_stream_with_latency(gen, latency_tracker, backend_name, model, start_time):
+    """Wrap a streaming generator to record latency when stream completes."""
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        if latency_tracker:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            latency_tracker.record(backend_name, model, duration_ms)
+
+
 async def _tee_stream_for_cache(gen, semantic_cache, model, messages, tenant_id, cache_isolation):
     """Wrap a streaming generator to buffer chunks and cache the assembled response."""
     buffered_content = []
@@ -462,6 +473,12 @@ async def chat_completions(
         )
 
         wrapped_gen = _wrap_stream_with_circuit_breaker(raw_gen, cb)
+        latency_tracker = getattr(request.app.state, "latency_tracker", None)
+        if latency_tracker:
+            wrapped_gen = _wrap_stream_with_latency(
+                wrapped_gen, latency_tracker, backend.name,
+                chat_request.model, time.perf_counter(),
+            )
         if semantic_cache is not None:
             wrapped_gen = _tee_stream_for_cache(
                 wrapped_gen, semantic_cache, chat_request.model,
@@ -570,6 +587,11 @@ async def chat_completions(
                 request=chat_request,
             )
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+            # Record latency for routing strategies
+            latency_tracker = getattr(request.app.state, "latency_tracker", None)
+            if latency_tracker:
+                latency_tracker.record(backend.name, chat_request.model, duration_ms)
 
             cb = cb_registry.get(backend.name)
             if cb:

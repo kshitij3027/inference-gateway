@@ -487,14 +487,13 @@ class TestModelRoutingConfig:
         assert config.routing["m1"].hedge_enabled is True
 
     def test_existing_config_loads_without_error(self):
-        """The actual config/backends.yaml (no routing section) should load fine."""
+        """The actual config/backends.yaml should load fine."""
         from pathlib import Path
 
         config_path = Path(__file__).resolve().parents[2] / "config" / "backends.yaml"
         cfg = load_config(config_path)
         assert len(cfg.backends) >= 1
         assert len(cfg.tenants) >= 1
-        assert cfg.routing == {}
 
 
 class TestRegistryStrategyConstruction:
