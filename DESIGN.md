@@ -1835,3 +1835,189 @@ Finally, the journal wrapper around streaming responses closes a metrics gap tha
 
 **Q: "What happens during a rolling deployment with this graceful shutdown design?"**
 **A:** Kubernetes sends SIGTERM to the old pod. The gateway sets `shutting_down = True` and the middleware begins rejecting new requests with 503 + `Retry-After: 5`. Simultaneously, Kubernetes removes the pod from Service endpoints, so the load balancer stops routing new traffic to it. In-flight requests continue processing. The gateway waits up to 10 seconds for all in-flight requests to complete (tracked via the asyncio counter and Event). If they finish in time, the gateway closes HTTP clients and Redis connections cleanly. If not, connections are closed forcibly, and Docker's `stop_grace_period: 15s` ensures the container runtime waits an additional 5 seconds before sending SIGKILL. The new pod's readiness probe must pass before Kubernetes adds it to Service endpoints, ensuring no traffic is routed until at least one backend is healthy.
+
+## Intelligent Routing
+
+### Why this exists
+
+The previous phase introduced consistent hashing for backend selection. Consistent hashing optimizes for cache locality -- the same tenant+model key always lands on the same backend, maximizing semantic cache hit rates. But cache locality is not always the right objective. Some workloads are latency-sensitive: a real-time chatbot needs the fastest backend, not the one with the best cache affinity. Other workloads are cost-sensitive: a batch processing pipeline should route to the cheapest backend regardless of cache behavior. And for latency-critical requests, even the fastest backend can occasionally produce a slow response (tail latency), so there is no way to hedge against that outlier without sending the request to multiple backends simultaneously.
+
+Without intelligent routing, the gateway is a one-strategy system. Every model gets consistent hashing, and operators have no knob to tune routing behavior per model or per workload. This phase introduces a pluggable strategy system with three implementations (consistent hash, latency-aware, cost-aware), per-model configuration, a rolling-window latency tracker, and hedge requests for tail latency reduction.
+
+### How it works
+
+1. The `routing` section in `config/backends.yaml` declares a per-model routing configuration. Each entry specifies a `strategy` (one of `consistent_hash`, `latency_aware`, `cost_aware`) and a `hedge_enabled` boolean. Models without an explicit entry default to `consistent_hash` with hedging disabled.
+
+2. At startup, `Registry.__init__()` iterates over the model-to-backends mapping and constructs a `RoutingStrategy` implementation for each model based on its `ModelRoutingConfig`. For `latency_aware`, it passes the shared `LatencyTracker` instance. For `cost_aware`, it builds a `{backend_name: cost_per_1k_tokens}` dict from `BackendConfig`. For `consistent_hash` (or any unrecognized strategy), it wraps the existing `ConsistentHashRing` in a `ConsistentHashStrategy` adapter.
+
+3. When a request arrives at `POST /v1/chat/completions`, the route handler calls `registry.find_backend_for_model(model, routing_key, exclude)`. This method looks up the per-model strategy and delegates to its `select()` method. The `exclude` set contains circuit-broken backends. The `routing_key` is `{tenant_id}:{model}` for consistent hash affinity.
+
+4. The selected backend handles the request. After the response completes, the route handler records the observed latency via `latency_tracker.record(backend_name, model, duration_ms)`. For streaming responses, latency is recorded when the stream finishes via the `_wrap_stream_with_latency` generator wrapper. This data feeds back into `LatencyAwareStrategy` for subsequent requests.
+
+5. For hedge requests: the client sends `X-Hedge: true`. The route handler checks whether the model has `hedge_enabled: true` in its routing config. If both conditions are met and the request is non-streaming, the handler selects two distinct backends (first via normal strategy, second by excluding the first), creates two `asyncio.Task` objects via `_execute_hedge()`, and races them with `asyncio.wait(FIRST_COMPLETED)`. The first response wins; the losing task is cancelled. The winner's backend name is recorded in `X-Hedge-Winner` and `X-Hedge-Loser` response headers. If the hedge path fails (both backends error, or only one backend is available), execution falls through to the normal retry loop.
+
+### Implementation
+
+**RoutingStrategy Protocol** (`gateway/strategies.py`):
+- `RoutingStrategy` -- a `typing.Protocol` with a single `select(candidates, exclude, routing_key) -> str | None` method. Any class with a matching `select` signature satisfies the protocol without inheriting from it.
+
+**ConsistentHashStrategy** (`gateway/strategies.py`):
+- Wraps the existing `ConsistentHashRing`. When `routing_key` is provided, delegates to `ring.get_node(routing_key, exclude=exclude)`. Without a routing key, falls back to the first non-excluded candidate. This adapter exists to give consistent hashing the same interface as the other strategies.
+
+**LatencyAwareStrategy** (`gateway/strategies.py`):
+- Holds a reference to the shared `LatencyTracker` and a model name. On `select()`, filters candidates by `exclude`, calls `tracker.get_all_p95(model)` to get per-backend P95 latencies, sorts eligible backends by P95 ascending (backends without data sort to infinity), and returns the lowest. Ties are broken alphabetically by backend name for determinism.
+
+**CostAwareStrategy** (`gateway/strategies.py`):
+- Initialized with a `{backend_name: cost_per_1k_tokens}` dict extracted from `BackendConfig` at registry construction time. On `select()`, sorts eligible backends by cost ascending (backends without cost data sort to infinity), tie-breaks alphabetically.
+
+**LatencyTracker** (`gateway/latency_tracker.py`):
+- Stores observations in a `dict[tuple[str, str], deque[tuple[float, float]]]` keyed by `(backend, model)`. Each observation is a `(monotonic_timestamp, latency_ms)` tuple.
+- `record(backend, model, latency_ms)` appends to the deque and triggers lazy pruning.
+- `p95(backend, model)` prunes expired observations, sorts remaining latencies, and returns the value at the 95th percentile index (`min(int(len * 0.95), len - 1)`). Returns `None` if no data exists.
+- `get_all_p95(model)` iterates all `(backend, model)` keys matching the requested model and returns a `{backend: p95_ms}` dict.
+- `snapshot()` returns an admin-friendly view with count, P95, min, and max per backend per model.
+- Pruning uses `time.monotonic()` for clock-immune timing. The window defaults to 60 seconds. Old observations are evicted from the left of the deque in O(1) per eviction.
+
+**ModelRoutingConfig** (`gateway/config.py`):
+- Pydantic model with `strategy: Literal["consistent_hash", "latency_aware", "cost_aware"]` (default `"consistent_hash"`) and `hedge_enabled: bool` (default `False`).
+- The `GatewayConfig` model includes `routing: dict[str, ModelRoutingConfig]` mapping model names to their routing configuration.
+
+**Registry strategy construction** (`gateway/config.py`):
+- `Registry.__init__()` builds `self.model_strategies: dict[str, RoutingStrategy]` during initialization. Strategy construction is deterministic: the latency tracker is passed in from the lifespan, costs are extracted from backend configs, and the hash ring is reused from the existing `model_rings` dict.
+- `find_backend_for_model()` delegates to the per-model strategy's `select()` method. If no strategy exists for the model (model not in registry), falls back to first non-excluded match.
+
+**Hedge execution** (`gateway/routes/chat.py`):
+- `_execute_hedge(http_client, backend1, backend2, chat_request, translator)` creates two `asyncio.Task` objects, each calling the same translator function against a different backend. Uses `asyncio.wait({task1, task2}, return_when=FIRST_COMPLETED)` to race them. The winning task's result is returned along with winner/loser identification and duration. Pending tasks are cancelled with `task.cancel()` followed by a guarded `await` to absorb `CancelledError`.
+
+**Lifespan wiring** (`gateway/main.py`):
+- `LatencyTracker()` is created in the lifespan and stored on `app.state.latency_tracker`. It is passed to `Registry()` during construction and again during SIGHUP hot-reload, ensuring the tracker survives config reloads while strategies get rebuilt with fresh config.
+
+**Response headers** (`gateway/main.py`):
+- The request middleware reads `request.state.hedge_winner` and `request.state.hedge_loser` and sets `X-Hedge-Winner` and `X-Hedge-Loser` response headers when present.
+
+**Admin endpoint** (`gateway/routes/admin.py`):
+- `GET /admin/routing` returns per-model routing state: strategy name, hedge enabled flag, and current P95 latencies from the tracker (when available).
+
+**Config** (`config/backends.yaml`):
+- The `routing` section maps model names to strategy and hedge config. Example: `mock-gpt-markdown` uses `latency_aware` with hedging enabled; `mock-claude-markdown` uses `cost_aware` with hedging disabled. Models without entries (e.g., `tinyllama`) default to `consistent_hash`.
+- `cost_per_1k_tokens` is declared per-backend in the `backends` section and consumed by `CostAwareStrategy` at registry construction.
+
+### Key design decisions
+
+1. **Protocol over ABC.** `RoutingStrategy` is a `typing.Protocol`, not an `abc.ABC`. This means any class with a matching `select()` signature satisfies the interface without inheriting from a base class. It enables structural subtyping (duck typing with type checker support), avoids coupling implementations to a base class they do not need, and keeps the strategy implementations pure data-in/data-out classes with no framework dependencies.
+
+2. **Rolling P95, not P50 or mean.** P50 is a measure of typical latency. P95 captures the tail -- the slow responses that matter most for user-perceived performance. A backend with a 50ms P50 but a 2-second P95 is worse for reliability than one with a 100ms P50 and 150ms P95. Using P95 as the routing signal causes the strategy to avoid backends that occasionally produce outlier responses, even if their median performance looks good.
+
+3. **Per-model config, not per-backend.** Routing strategy is configured at the model level, not the backend level. A single backend can serve multiple models, and the optimal routing strategy depends on the workload characteristics of each model, not the backend's capabilities. A latency-optimized model (real-time chat) and a cost-optimized model (batch summarization) can share backends but use different strategies.
+
+4. **Hedge restricted to non-streaming requests.** Streaming responses emit chunks incrementally. Racing two streaming responses would require either buffering both streams (doubling memory and defeating the purpose of streaming) or selecting a winner after the first chunk (unreliable latency signal). Restricting hedging to non-streaming requests keeps the implementation simple and the semantics clear: the client gets one complete response from whichever backend finishes first.
+
+5. **FIRST_COMPLETED + cancel, not gather.** `asyncio.wait(FIRST_COMPLETED)` returns as soon as one task finishes. The loser is explicitly cancelled. Using `asyncio.gather()` would wait for both to finish, wasting backend capacity. The cancel-and-await pattern ensures the cancelled task's resources are cleaned up and `CancelledError` does not propagate.
+
+6. **Latency tracker in-memory, not Redis.** Latency observations are inherently local to the gateway instance -- each instance measures its own RTT to each backend. Storing them in Redis would add a network hop to every observation and introduce cross-instance averaging that masks instance-specific routing conditions (e.g., one gateway instance in a closer data center). An in-memory deque with lazy pruning is simpler, faster, and more correct for this use case.
+
+7. **Latency tracker survives config reload.** During SIGHUP-triggered hot-reload, the `LatencyTracker` instance is preserved while the `Registry` (and its strategies) is rebuilt. This means latency data collected before the reload continues to inform routing decisions after the reload, avoiding a cold-start penalty on every config change.
+
+8. **Client opt-in for hedging via X-Hedge header.** Hedging doubles backend load. Making it client-initiated (rather than server-side always-on) gives callers control over the cost/latency trade-off. Latency-sensitive requests opt in; batch workloads do not. The server-side `hedge_enabled` flag acts as a guardrail so operators can disable hedging for models where it is not appropriate, regardless of client headers.
+
+### Alternatives considered
+
+1. **Weighted round-robin instead of latency-aware.** Round-robin distributes load evenly but does not adapt to real-time backend performance. If one backend is slow due to GPU memory pressure or a long-running batch job, round-robin continues sending it equal traffic. Latency-aware routing automatically shifts traffic away from degraded backends without manual weight tuning.
+
+2. **P50 instead of P95 for latency signal.** P50 tracks the median request. Two problems: (a) it ignores tail latency entirely, so a backend with occasional multi-second hangs looks identical to a consistent sub-100ms backend; (b) medians are less sensitive to the recent performance shifts that matter for real-time routing. P95 strikes a balance between being sensitive to outliers and not overreacting to a single bad request (which P99 or max would do).
+
+3. **Always-hedge (no client opt-in).** Simpler implementation -- no header parsing, no config flag. Rejected because it doubles backend load unconditionally. For models with a single backend or where latency is not critical, the extra load is pure waste. The dual opt-in (client header + server config) provides granular control.
+
+4. **Redis-backed latency tracker.** Would enable cross-instance P95 aggregation. Rejected for three reasons: (a) adds a Redis RTT to every latency recording, turning a nanosecond in-memory operation into a millisecond network call; (b) cross-instance averaging is not obviously useful -- if instance A has better connectivity to backend X, it should route there, not be influenced by instance B's measurements; (c) the gateway already has a Redis dependency for caching and rate limiting, and adding latency tracking to the hot path increases the blast radius of Redis outages.
+
+5. **ABC (abstract base class) instead of Protocol.** ABC requires explicit inheritance (`class MyStrategy(RoutingStrategy)`) and provides runtime `isinstance` checks. Protocol provides the same type safety at static analysis time without coupling implementations to the base. Since the gateway never does runtime `isinstance` checks on strategies, Protocol is strictly simpler.
+
+### Failure modes and edge cases
+
+- **Cold start (no latency data).** When the `LatencyTracker` has no observations for a model (first request, or all observations expired), `get_all_p95()` returns an empty dict. `LatencyAwareStrategy.select()` sorts all backends with `float("inf")` as their P95, then tie-breaks alphabetically by name. The result is deterministic and stable: the alphabetically first backend always handles cold-start traffic. After a few requests, real P95 data takes over.
+
+- **All backends excluded (circuit-broken).** If every candidate for a model is in the `exclude` set, `select()` returns `None`. `find_backend_for_model()` returns `None`. The route handler raises HTTP 503 ("All backends unavailable for this model"). This is correct behavior -- routing to a circuit-broken backend would produce immediate failure.
+
+- **Hedge: both backends fail.** If both hedge tasks raise exceptions, `asyncio.wait(FIRST_COMPLETED)` returns the first completed (failed) task. `winner_task.result()` re-raises the exception. The hedge code catches this and falls through to the normal retry loop, which tries backends one at a time with circuit breaker tracking. The hedge failure does not consume retry attempts.
+
+- **Hedge: only one backend available.** If `find_backend_for_model()` with the first backend excluded returns `None` for the second, the hedge path is skipped entirely and the normal single-backend path executes. No partial hedge is attempted.
+
+- **Cost data missing for a backend.** `CostAwareStrategy` treats backends without a `cost_per_1k_tokens` entry as `float("inf")`. They sort to the end of the list and are only selected when all priced backends are excluded. This is a safe default -- an unpriced backend is assumed expensive rather than free.
+
+- **Latency window expiry during low traffic.** If a model receives no traffic for longer than the window (60 seconds default), all observations expire. The next request hits the cold-start path (alphabetically first backend). This is intentional: stale latency data from a minute ago is worse than no data, because backend performance can change significantly in that time.
+
+- **Strategy mismatch after hot-reload.** If the config changes a model's strategy from `latency_aware` to `cost_aware`, the `Registry` is rebuilt with new strategy instances. The `LatencyTracker` retains its data (it survives reload), but the new `CostAwareStrategy` does not reference it. The old latency data is inert -- it is pruned away naturally by the window expiry. No stale-strategy bug is possible because strategy instances are rebuilt from scratch on each reload.
+
+### Observability
+
+**Prometheus metrics** (`gateway/observability/metrics.py`):
+- `gateway_hedge_requests_total` (Counter, labels: `model`) -- incremented on every successful hedge execution. Tracks hedge volume per model.
+- `gateway_hedge_win_rate` (Counter, labels: `backend`, `model`) -- incremented for the winning backend on each hedge. Comparing win counts across backends reveals which backend is consistently faster. Despite the name, it is a raw count, not a rate -- the rate is derived by dividing by `hedge_requests_total` in Grafana.
+
+**Response headers**:
+- `X-Hedge-Winner: <backend_name>` -- set when a hedge request completes successfully. Tells the client which backend responded.
+- `X-Hedge-Loser: <backend_name>` -- the cancelled backend. Useful for debugging latency discrepancies.
+
+**Admin endpoint**:
+- `GET /admin/routing` -- returns per-model routing state: `{"mock-gpt-markdown": {"strategy": "latency_aware", "hedge_enabled": true, "p95_latencies": {"mock-openai-1": 45.2, "mock-openai-2": 62.1}}}`. Provides real-time visibility into which strategy each model uses and the current P95 latency data driving routing decisions.
+
+**Structured logs**:
+- `hedge_request_completed` -- logged on successful hedge with `model`, `tenant_id`, `winner`, `loser`, `duration_ms`.
+- `hedge_request_failed` -- logged when the hedge path fails and falls through to the retry loop.
+- `chat_request_received` and `chat_request_completed` -- existing logs that now include the backend selected by the strategy, providing a full audit trail of routing decisions.
+
+### Testing
+
+**Unit tests -- strategies** (`tests/unit/test_strategies.py`):
+- `TestConsistentHashStrategy`: Deterministic routing (same key, same result over 100 calls), distribution (different keys hit at least 2 backends), exclusion (excluded backend never returned), all-excluded returns `None`, no-routing-key fallback to first candidate, and ring-equivalence (strategy produces identical results to the raw `ConsistentHashRing` for 200 keys).
+- `TestLatencyAwareStrategy`: Routes to lowest P95, cold-start returns first candidate (alphabetical tie-break at infinity), exclusion skips lowest-P95 backend and returns next, all-excluded returns `None`, equal-P95 tie-broken alphabetically.
+- `TestCostAwareStrategy`: Routes to cheapest, exclusion skips cheapest, missing cost treated as infinity (only selected when all priced backends excluded), all-excluded returns `None`, equal-cost tie-broken alphabetically.
+
+**Unit tests -- latency tracker** (`tests/unit/test_latency_tracker.py`):
+- Single observation P95, correct percentile calculation for 20 observations, unknown backend returns `None`, window expiry (time.monotonic mocked to advance past 60s), `get_all_p95` returns all backends for a model, model filtering (observations for other models not included), empty tracker returns empty dict, `snapshot()` returns count/P95/min/max per backend.
+
+**Unit tests -- hedge** (`tests/unit/test_hedge.py`):
+- Fast backend wins over slow backend (slow uses `asyncio.sleep(10)`), correct winner/loser identification when backend2 finishes first, both-fail raises the winner's exception, duration is positive.
+
+**Integration tests -- routing strategies** (`tests/integration/test_routing_strategies.py`):
+- `GET /admin/routing` returns correct strategy and hedge config for all three models (latency_aware, cost_aware, consistent_hash).
+- Cost-aware picks cheapest: `mock-claude-markdown` routes to `mock-anthropic-1` (cost 0.01, cheapest of three).
+- Hedge returns `X-Hedge-Winner` and `X-Hedge-Loser` headers with different values when `X-Hedge: true` is sent for a hedge-enabled model.
+- No hedge headers on normal requests (no `X-Hedge` header).
+- No hedge headers when `X-Hedge: true` is sent for a model with `hedge_enabled: false`.
+
+### Production gaps
+
+- **Single-instance latency tracker.** Each gateway instance maintains its own `LatencyTracker` in process memory. There is no cross-instance aggregation. In a multi-instance deployment behind a load balancer, each instance independently converges on its own view of backend latency. This is actually acceptable for most deployments (instances should route based on their own measurements), but it means the `GET /admin/routing` endpoint only shows one instance's data, and there is no global P95 dashboard without scraping all instances.
+
+- **No cross-instance P95 aggregation for admin visibility.** An operator querying `GET /admin/routing` sees latency data from the instance that handled the request. To get a fleet-wide view, the operator would need to query every instance or build a Prometheus query over the `gateway_request_duration_seconds` histogram (which already has backend labels).
+
+- **Hedge does not account for queue pressure.** The hedge implementation races two backends without checking their concurrency slot availability. If both backends are near capacity, the hedge consumes two slots instead of one, potentially pushing other requests into the priority queue. A production enhancement would check `queue_manager.get_concurrency()` before hedging and skip the hedge if either backend is above a configurable utilization threshold.
+
+- **No hedge for streaming requests.** Hedging is restricted to non-streaming requests. Streaming is the dominant mode for interactive LLM use cases. A production system might implement a "first-chunk" hedge that races two streams and commits to whichever produces the first token faster, but this adds complexity around stream lifecycle management and partial response cleanup.
+
+- **Static cost data.** `cost_per_1k_tokens` is configured statically in `backends.yaml`. Real provider pricing changes over time and varies by model variant. A production system would pull pricing from a cost catalog service or API and refresh periodically.
+
+- **No strategy-level metrics.** The gateway records which backend handled a request (in `REQUEST_COUNT` labels) but does not emit a metric for which strategy was used. Adding a `strategy` label to request metrics would enable per-strategy latency and error rate dashboards.
+
+### Interview talking points
+
+- The `RoutingStrategy` Protocol demonstrates Go-style structural typing in Python. Any class with a `select()` method of the right signature satisfies the interface, with no base class coupling. This is a concrete example of the Interface Segregation Principle -- consumers depend on a minimal interface, and implementations are free to carry whatever internal state they need.
+
+- The rolling-window P95 latency tracker solves the cold-start problem gracefully. Instead of requiring a warm-up period or manual configuration, the strategy falls back to deterministic alphabetical ordering when no data exists, then automatically adapts as observations accumulate. The 60-second window ensures the tracker reflects current backend health rather than historical averages, making it responsive to transient degradation.
+
+- The hedge request pattern is a well-known technique for reducing tail latency (popularized by Jeff Dean's "Tail at Scale" paper). The implementation here shows the key engineering decisions: `FIRST_COMPLETED` instead of `gather`, explicit task cancellation to avoid wasting backend compute, client opt-in to control the cost trade-off, and graceful fallthrough to the retry loop when hedging fails. This is a good example of a feature that is simple in concept but requires careful handling of async lifecycle and error propagation.
+
+### Likely interview questions
+
+**Q: "Why not use weighted round-robin with dynamic weight adjustment instead of latency-aware routing?"**
+**A:** Weighted round-robin requires a feedback loop to adjust weights, a policy for how aggressively to shift weights, and a stabilization mechanism to prevent oscillation. That is a full control-theory problem. Latency-aware routing sidesteps it entirely: there are no weights to tune, no oscillation risk, and no configuration beyond the window size. Each request independently picks the backend with the best current P95. The trade-off is that latency-aware routing does not guarantee even load distribution -- a backend with consistently low latency gets most traffic, which may itself cause latency to rise. In practice, the circuit breaker and retry loop handle this: if the preferred backend becomes overloaded and starts failing, the circuit breaker opens and the strategy automatically routes to the next-best backend.
+
+**Q: "What happens if the latency tracker's 60-second window is too short or too long?"**
+**A:** Too short: the tracker forgets data quickly, causing frequent cold-start fallbacks during low-traffic periods. A model with one request per minute loses its latency data between requests and always cold-starts. Too long: the tracker retains stale data that does not reflect current conditions. A backend that was fast 5 minutes ago but is now degraded still looks good. 60 seconds is a compromise for typical LLM workloads where requests arrive every few seconds. A production system could make the window configurable per model or use an adaptive window that lengthens during low traffic and shortens during high traffic.
+
+**Q: "Hedging doubles your backend load. How do you prevent it from causing cascading overload?"**
+**A:** Three mechanisms: (1) client opt-in via `X-Hedge: true` ensures only callers who value latency over efficiency request hedging; (2) server-side `hedge_enabled` flag per model lets operators disable hedging entirely for high-traffic models; (3) if the hedge fails (both backends error), the fallthrough to the retry loop means the total backend calls for a hedged request are at most 2 (hedge) + 3 (retry loop) = 5, which is bounded. The production gap is that there is no utilization-aware throttling -- hedging does not check whether backends are near capacity before sending duplicate requests. Adding a utilization threshold (e.g., skip hedging if either backend is above 80% concurrency) would close this gap.
+
+**Q: "Why is the latency tracker per-instance rather than shared across instances?"**
+**A:** Each gateway instance has its own network path to each backend. Instance A in availability zone us-east-1a may have 10ms RTT to backend X, while instance B in us-east-1b has 50ms. Sharing latency data would average out these differences, causing both instances to route to the globally-average-best backend instead of their locally-best backend. Per-instance tracking is more correct for routing decisions. The trade-off is admin visibility: the `GET /admin/routing` endpoint only shows one instance's data. For fleet-wide visibility, Prometheus already scrapes `gateway_request_duration_seconds` from all instances, and Grafana can compute per-backend P95 across the fleet.
