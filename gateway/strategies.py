@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from gateway.latency_tracker import LatencyTracker
 from gateway.routing import ConsistentHashRing
 
 
@@ -51,3 +52,50 @@ class ConsistentHashStrategy:
             if name not in exclude:
                 return name
         return None
+
+
+class LatencyAwareStrategy:
+    """Route to the backend with the lowest P95 latency.
+
+    Falls back to first non-excluded candidate when no latency data exists (cold start).
+    """
+
+    def __init__(self, tracker: LatencyTracker, model: str) -> None:
+        self._tracker = tracker
+        self._model = model
+
+    def select(
+        self,
+        candidates: list[str],
+        exclude: frozenset[str] = frozenset(),
+        routing_key: str | None = None,
+    ) -> str | None:
+        eligible = [c for c in candidates if c not in exclude]
+        if not eligible:
+            return None
+        p95_map = self._tracker.get_all_p95(self._model)
+        # Sort by P95 ascending; backends without data go last (inf); tie-break by name
+        eligible.sort(key=lambda b: (p95_map.get(b, float("inf")), b))
+        return eligible[0]
+
+
+class CostAwareStrategy:
+    """Route to the cheapest healthy backend.
+
+    Backends without cost data are treated as infinitely expensive.
+    """
+
+    def __init__(self, costs: dict[str, float]) -> None:
+        self._costs = costs
+
+    def select(
+        self,
+        candidates: list[str],
+        exclude: frozenset[str] = frozenset(),
+        routing_key: str | None = None,
+    ) -> str | None:
+        eligible = [c for c in candidates if c not in exclude]
+        if not eligible:
+            return None
+        eligible.sort(key=lambda b: (self._costs.get(b, float("inf")), b))
+        return eligible[0]

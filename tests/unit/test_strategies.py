@@ -1,5 +1,6 @@
+from gateway.latency_tracker import LatencyTracker
 from gateway.routing import ConsistentHashRing
-from gateway.strategies import ConsistentHashStrategy
+from gateway.strategies import ConsistentHashStrategy, CostAwareStrategy, LatencyAwareStrategy
 
 
 class TestConsistentHashStrategy:
@@ -88,3 +89,89 @@ class TestConsistentHashStrategy:
             assert strategy_result == ring_result, (
                 f"key={key}: ring={ring_result}, strategy={strategy_result}"
             )
+
+
+class TestLatencyAwareStrategy:
+    def _make_tracker(self, latencies: dict[str, float], model: str = "gpt-4") -> LatencyTracker:
+        """Create a tracker with recorded observations.
+
+        Records 20 identical observations per backend so P95 is deterministic.
+        """
+        tracker = LatencyTracker(window_seconds=300.0)
+        for backend, latency_ms in latencies.items():
+            for _ in range(20):
+                tracker.record(backend, model, latency_ms)
+        return tracker
+
+    def test_routes_to_lowest_p95(self):
+        """Selects backend with the lowest P95 latency."""
+        tracker = self._make_tracker({"backend-a": 100.0, "backend-b": 50.0, "backend-c": 200.0})
+        strategy = LatencyAwareStrategy(tracker, model="gpt-4")
+        result = strategy.select(["backend-a", "backend-b", "backend-c"])
+        assert result == "backend-b"
+
+    def test_cold_start_returns_first_candidate(self):
+        """Empty tracker returns first candidate (all tied at inf, alphabetical)."""
+        tracker = LatencyTracker(window_seconds=300.0)
+        strategy = LatencyAwareStrategy(tracker, model="gpt-4")
+        result = strategy.select(["a", "b", "c"])
+        assert result == "a"
+
+    def test_excludes_lowest_p95_backend(self):
+        """Excluded lowest-P95 backend is skipped; returns next lowest."""
+        tracker = self._make_tracker({"backend-a": 100.0, "backend-b": 50.0, "backend-c": 200.0})
+        strategy = LatencyAwareStrategy(tracker, model="gpt-4")
+        result = strategy.select(
+            ["backend-a", "backend-b", "backend-c"],
+            exclude=frozenset({"backend-b"}),
+        )
+        assert result == "backend-a"
+
+    def test_all_excluded_returns_none(self):
+        """All candidates excluded returns None."""
+        tracker = self._make_tracker({"a": 100.0, "b": 50.0})
+        strategy = LatencyAwareStrategy(tracker, model="gpt-4")
+        result = strategy.select(["a", "b"], exclude=frozenset({"a", "b"}))
+        assert result is None
+
+    def test_tie_breaking_by_name(self):
+        """Backends with equal P95 are tie-broken alphabetically."""
+        tracker = self._make_tracker({"backend-a": 100.0, "backend-b": 100.0})
+        strategy = LatencyAwareStrategy(tracker, model="gpt-4")
+        result = strategy.select(["backend-b", "backend-a"])
+        assert result == "backend-a"
+
+
+class TestCostAwareStrategy:
+    def test_routes_to_cheapest(self):
+        """Selects the backend with the lowest cost."""
+        strategy = CostAwareStrategy(costs={"a": 0.03, "b": 0.01, "c": 0.05})
+        result = strategy.select(["a", "b", "c"])
+        assert result == "b"
+
+    def test_excludes_cheapest(self):
+        """Cheapest backend excluded; returns next cheapest."""
+        strategy = CostAwareStrategy(costs={"a": 0.03, "b": 0.01, "c": 0.05})
+        result = strategy.select(["a", "b", "c"], exclude=frozenset({"b"}))
+        assert result == "a"
+
+    def test_missing_cost_treated_as_infinity(self):
+        """Backend without a cost entry is sorted last."""
+        strategy = CostAwareStrategy(costs={"a": 0.03, "b": 0.01})
+        result = strategy.select(["a", "b", "c"])
+        assert result == "b"
+        # Verify "c" (no cost) would only be picked if others excluded
+        result_only_c = strategy.select(["a", "b", "c"], exclude=frozenset({"a", "b"}))
+        assert result_only_c == "c"
+
+    def test_all_excluded_returns_none(self):
+        """All candidates excluded returns None."""
+        strategy = CostAwareStrategy(costs={"a": 0.03, "b": 0.01})
+        result = strategy.select(["a", "b"], exclude=frozenset({"a", "b"}))
+        assert result is None
+
+    def test_tie_breaking_by_name(self):
+        """Backends with equal cost are tie-broken alphabetically."""
+        strategy = CostAwareStrategy(costs={"a": 0.01, "b": 0.01})
+        result = strategy.select(["b", "a"])
+        assert result == "a"
