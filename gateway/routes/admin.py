@@ -113,3 +113,31 @@ async def queue_stats(request: Request):
         "concurrency": concurrency,
         "queues": queues,
     }
+
+
+@router.get("/journal/stats")
+async def journal_stats(request: Request):
+    """Return journal statistics: total entries, entries/min, in-flight count."""
+    journal = getattr(request.app.state, "journal", None)
+    if journal is None:
+        return {"enabled": False, "message": "Request journal not available"}
+    try:
+        stats = await journal.get_stats()
+        return {"enabled": True, **stats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Journal stats error: {e}")
+
+
+@router.get("/journal")
+async def journal_query(
+    request: Request, tenant: str | None = None, last: int = 20
+):
+    """Query recent journal entries, optionally filtered by tenant."""
+    journal = getattr(request.app.state, "journal", None)
+    if journal is None:
+        return {"enabled": False, "message": "Request journal not available"}
+    try:
+        entries = await journal.query(tenant_id=tenant, last=min(last, 100))
+        return {"enabled": True, "entries": entries, "count": len(entries)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Journal query error: {e}")

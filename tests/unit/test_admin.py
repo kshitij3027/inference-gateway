@@ -178,3 +178,67 @@ class TestQueueStats:
             resp = await client.get("/admin/queue")
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
+
+
+class TestJournalStats:
+    async def test_returns_stats(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_journal = AsyncMock()
+        mock_journal.get_stats = AsyncMock(return_value={
+            "total": 100, "inflight": 2, "entries_per_min": 5.5,
+        })
+        app.state.journal = mock_journal
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/journal/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["total"] == 100
+        assert data["inflight"] == 2
+
+    async def test_returns_disabled_when_no_journal(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.journal = None
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/journal/stats")
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
+
+
+class TestJournalQuery:
+    async def test_returns_entries(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_journal = AsyncMock()
+        mock_journal.query = AsyncMock(return_value=[
+            {"request_id": "req-1", "tenant_id": "t-a", "model": "gpt-4", "status": "200"},
+        ])
+        app.state.journal = mock_journal
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/journal?last=5")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert data["count"] == 1
+        assert data["entries"][0]["request_id"] == "req-1"
+
+    async def test_caps_last_at_100(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_journal = AsyncMock()
+        mock_journal.query = AsyncMock(return_value=[])
+        app.state.journal = mock_journal
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.get("/admin/journal?last=500")
+        mock_journal.query.assert_called_once_with(tenant_id=None, last=100)
+
+    async def test_returns_disabled_when_no_journal(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.journal = None
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/journal")
+        assert resp.status_code == 200
+        assert resp.json()["enabled"] is False
