@@ -1,4 +1,4 @@
-.PHONY: up down test logs build
+.PHONY: up down test logs build seed status
 
 up:
 	docker compose up --build -d
@@ -15,3 +15,9 @@ logs:
 
 build:
 	docker compose build
+
+seed:
+	@bash scripts/seed.sh
+
+status:
+	@bash scripts/status.sh
