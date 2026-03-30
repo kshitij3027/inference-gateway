@@ -68,3 +68,17 @@ ACTIVE_REQUESTS = Gauge(
     "Active concurrent requests per backend",
     ["backend"],
 )
+
+# --- Hedge metrics ---
+
+HEDGE_REQUESTS = Counter(
+    "gateway_hedge_requests_total",
+    "Total hedge requests",
+    ["model"],
+)
+
+HEDGE_WIN_RATE = Counter(
+    "gateway_hedge_win_rate",
+    "Hedge wins per backend",
+    ["backend", "model"],
+)

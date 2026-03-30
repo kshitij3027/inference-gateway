@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import uuid
@@ -200,6 +201,41 @@ async def _wrap_stream_with_journal(
                 )
             except Exception:
                 pass
+
+
+async def _execute_hedge(http_client, backend1, backend2, chat_request, translator):
+    """Race two backends, return the winner's result, cancel the loser.
+
+    Returns (result, winner_backend, loser_backend, duration_ms).
+    """
+
+    async def _call_backend(backend):
+        start = time.perf_counter()
+        result = await translator(
+            client=http_client, backend=backend, request=chat_request
+        )
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        return result, backend, duration_ms
+
+    task1 = asyncio.create_task(_call_backend(backend1))
+    task2 = asyncio.create_task(_call_backend(backend2))
+
+    done, pending = await asyncio.wait(
+        {task1, task2}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    winner_task = done.pop()
+    result, winner_backend, duration_ms = winner_task.result()
+
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    loser_backend = backend2 if winner_backend.name == backend1.name else backend1
+    return result, winner_backend, loser_backend, duration_ms
 
 
 TRANSLATORS = {
