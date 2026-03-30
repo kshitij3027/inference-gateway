@@ -1,7 +1,7 @@
 import structlog
 from fastapi import APIRouter, HTTPException, Request
 
-from gateway.config import ConfigError, Registry, load_config
+from gateway.config import ConfigError, ModelRoutingConfig, Registry, load_config
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 logger = structlog.get_logger()
@@ -11,9 +11,10 @@ logger = structlog.get_logger()
 async def reload_config(request: Request):
     """Hot-reload config from disk. Atomic swap of registry."""
     config_path = request.app.state.config_path
+    tracker = getattr(request.app.state, "latency_tracker", None)
     try:
         config = load_config(config_path)
-        new_registry = Registry(config)
+        new_registry = Registry(config, latency_tracker=tracker)
     except ConfigError as e:
         logger.error("config_reload_failed", error=str(e))
         raise HTTPException(status_code=400, detail=str(e))
@@ -141,3 +142,21 @@ async def journal_query(
         return {"enabled": True, "entries": entries, "count": len(entries)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Journal query error: {e}")
+
+
+@router.get("/routing")
+async def routing_state(request: Request):
+    """Return per-model routing strategy and latency data."""
+    registry = request.app.state.registry
+    tracker = getattr(request.app.state, "latency_tracker", None)
+    result = {}
+    for model in registry.model_strategies:
+        cfg = registry.model_routing_config.get(model, ModelRoutingConfig())
+        entry: dict = {
+            "strategy": cfg.strategy,
+            "hedge_enabled": cfg.hedge_enabled,
+        }
+        if tracker:
+            entry["p95_latencies"] = tracker.get_all_p95(model)
+        result[model] = entry
+    return result

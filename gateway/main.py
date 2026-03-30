@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from gateway.circuit_breaker import CircuitBreakerRegistry
 from gateway.config import ConfigError, Registry, load_config
+from gateway.latency_tracker import LatencyTracker
 from gateway.rate_limiter import RateLimiter
 from gateway.observability.logging import setup_logging
 from gateway.routes.admin import router as admin_router
@@ -36,7 +37,8 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
 
     app.state.config_path = CONFIG_PATH
-    app.state.registry = Registry(config)
+    app.state.latency_tracker = LatencyTracker()
+    app.state.registry = Registry(config, latency_tracker=app.state.latency_tracker)
     app.state.circuit_breakers = CircuitBreakerRegistry(
         list(app.state.registry.backends.keys())
     )
@@ -112,7 +114,9 @@ async def lifespan(app: FastAPI):
     def handle_sighup(signum, frame):
         try:
             new_config = load_config(CONFIG_PATH)
-            app.state.registry = Registry(new_config)
+            app.state.registry = Registry(
+                new_config, latency_tracker=app.state.latency_tracker
+            )
             app.state.circuit_breakers.sync_backends(
                 list(app.state.registry.backends.keys())
             )
