@@ -28,6 +28,7 @@ class BackendConfig(BaseModel):
     weight: int = 1
     max_concurrent: int = 10
     timeout_ms: int = 120000
+    cost_per_1k_tokens: float | None = None
 
 
 class TenantConfig(BaseModel):
@@ -42,9 +43,19 @@ class TenantConfig(BaseModel):
     cache_isolation: Literal["shared", "tenant"] = "shared"
 
 
+class ModelRoutingConfig(BaseModel):
+    """Per-model routing configuration."""
+
+    strategy: Literal["consistent_hash", "latency_aware", "cost_aware"] = (
+        "consistent_hash"
+    )
+    hedge_enabled: bool = False
+
+
 class GatewayConfig(BaseModel):
     backends: list[BackendConfig] = Field(..., min_length=1)
     tenants: list[TenantConfig] = Field(..., min_length=1)
+    routing: dict[str, ModelRoutingConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_uniqueness(self) -> GatewayConfig:

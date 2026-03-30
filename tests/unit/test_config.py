@@ -7,6 +7,7 @@ from gateway.config import (
     BackendConfig,
     ConfigError,
     GatewayConfig,
+    ModelRoutingConfig,
     Registry,
     TenantConfig,
     load_config,
@@ -418,3 +419,77 @@ class TestRegistry:
         reg = Registry(config)
         result = reg.find_backend_for_model("tinyllama", exclude=frozenset({"first"}))
         assert result.name == "second"
+
+
+class TestModelRoutingConfig:
+    """Tests for ModelRoutingConfig and related config schema additions."""
+
+    def _make_backend(self, name="b1", **kwargs):
+        return {
+            "name": name,
+            "provider": "ollama",
+            "base_url": f"http://{name}:11434",
+            "models": ["m1"],
+            **kwargs,
+        }
+
+    def _make_tenant(self, id="t1"):
+        return {"id": id, "api_key_env": "T1_KEY", "allowed_models": ["m1"]}
+
+    def test_cost_per_1k_tokens_default_none(self):
+        b = BackendConfig(
+            name="b1",
+            provider="ollama",
+            base_url="http://b1:11434",
+            models=["m1"],
+        )
+        assert b.cost_per_1k_tokens is None
+
+    def test_cost_per_1k_tokens_parsed(self):
+        b = BackendConfig(
+            name="b1",
+            provider="ollama",
+            base_url="http://b1:11434",
+            models=["m1"],
+            cost_per_1k_tokens=0.03,
+        )
+        assert b.cost_per_1k_tokens == 0.03
+
+    def test_model_routing_config_defaults(self):
+        rc = ModelRoutingConfig()
+        assert rc.strategy == "consistent_hash"
+        assert rc.hedge_enabled is False
+
+    def test_model_routing_config_explicit(self):
+        rc = ModelRoutingConfig(strategy="latency_aware", hedge_enabled=True)
+        assert rc.strategy == "latency_aware"
+        assert rc.hedge_enabled is True
+
+    def test_gateway_config_no_routing_section(self):
+        config = GatewayConfig.model_validate({
+            "backends": [self._make_backend()],
+            "tenants": [self._make_tenant()],
+        })
+        assert config.routing == {}
+
+    def test_gateway_config_with_routing(self):
+        config = GatewayConfig.model_validate({
+            "backends": [self._make_backend()],
+            "tenants": [self._make_tenant()],
+            "routing": {
+                "m1": {"strategy": "latency_aware", "hedge_enabled": True},
+            },
+        })
+        assert "m1" in config.routing
+        assert config.routing["m1"].strategy == "latency_aware"
+        assert config.routing["m1"].hedge_enabled is True
+
+    def test_existing_config_loads_without_error(self):
+        """The actual config/backends.yaml (no routing section) should load fine."""
+        from pathlib import Path
+
+        config_path = Path(__file__).resolve().parents[2] / "config" / "backends.yaml"
+        cfg = load_config(config_path)
+        assert len(cfg.backends) >= 1
+        assert len(cfg.tenants) >= 1
+        assert cfg.routing == {}
