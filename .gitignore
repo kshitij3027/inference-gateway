@@ -46,3 +46,7 @@ htmlcov/
 
 # Redis dump
 dump.rdb
+
+# Load test reports
+tests/load/report.html
+tests/load/results*.csv
