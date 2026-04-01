@@ -2212,3 +2212,208 @@ Advanced caching addresses all three problems: an L1 in-process LRU cache elimin
 
 **Q: "The prefix cache is unbounded. What would happen at 100,000 distinct system prompts?"**
 **A:** Each prefix cache entry stores a 384-float embedding as a Python list. A Python float is 24 bytes (object overhead), so 384 floats is ~9.2KB per entry. At 100,000 entries, the prefix cache would consume ~920MB — a significant fraction of available RAM for a gateway process. The fix is straightforward: wrap `_prefix_cache` in an LRU with a cap (e.g., `functools.lru_cache` on a method that takes `sys_hash` as the key, or a manual OrderedDict like L1Cache). In practice, 100,000 distinct system prompts suggests a design issue in the calling application — system prompts should be templates, not per-request unique strings.
+
+## Resilience & Chaos Testing
+
+### Why this exists
+
+The gateway has retry logic, circuit breakers with rolling-window error tracking, per-tenant rate limiting, and multi-backend failover. All of these components were built and unit-tested in isolation, but none had been validated under deliberate, concurrent failure injection. Unit tests for the circuit breaker prove it trips at the right threshold — they do not prove it trips correctly when a retry loop is simultaneously failing over to a different backend while the rate limiter is rejecting a concurrent request from another tenant. Chaos testing fills this gap by injecting realistic faults at the backend HTTP layer and observing how the full stack responds.
+
+Without chaos testing, the first time these components interact under failure is production. The goal is to discover failure modes — compounding errors, resource leaks on injected timeouts, malformed error responses under partial failure — before they affect real traffic.
+
+### How it works
+
+**Chaos injection (per-request):**
+
+1. When `CHAOS_ENABLED=true`, the lifespan in `gateway/main.py` wraps the shared `httpx.AsyncClient` in a `ChaosHttpClient`. All downstream code (translators, retry loops) calls `client.post()` or `client.stream()` on this wrapper without knowing chaos is active.
+2. On each `post()` or `stream()` call, `ChaosHttpClient._roll_injection()` consults its seeded `random.Random` instance and checks three independent probabilities in priority order: timeout (highest severity, checked first), 5xx error, then latency.
+3. If timeout is selected, `httpx.ReadTimeout` is raised immediately — the real backend is never contacted. The translator's exception handler converts this to a 504, which triggers the retry loop in the chat route to try the next backend.
+4. If error is selected, `httpx.HTTPStatusError` with a 500 response is raised. The translator converts this to an `HTTPException`, which again triggers retry/failover.
+5. If latency is selected, `asyncio.sleep(delay_ms / 1000)` is awaited before delegating to the real client. The request eventually succeeds but with added delay. This exercises timeout boundaries and latency tracking.
+6. If no injection fires, the call passes through to the real `httpx.AsyncClient` unchanged.
+
+**Streaming chaos:**
+
+For streaming requests (`client.stream()`), `ChaosHttpClient` returns a `_ChaosStreamContext` async context manager. Injection happens in `__aenter__` — before the real stream is opened. If a fault is injected, the exception propagates and `_real_ctx` is never set. The `__aexit__` method checks for this and short-circuits: `if self._real_ctx is not None: return await self._real_ctx.__aexit__(*args)`. This avoids attempting to close a stream that was never opened.
+
+**Load generation (locust):**
+
+1. `make loadtest` runs the `locustio/locust` Docker image with `--network host`, targeting the gateway at `http://localhost:8080`.
+2. Two user classes simulate distinct tenant profiles. `TenantAlphaUser` (weight 1) uses `test-alpha-key` with steady request intervals (0.5–2.0s wait). `TenantBetaUser` (weight 2, so 2x the alpha population) uses `test-beta-key` with bursty intervals (0.1–1.0s wait).
+3. Request mix is weighted: 70% `mock-gpt-markdown`, 30% `mock-claude-markdown`, with Beta users additionally making 20% streaming requests.
+4. Prompt lengths follow a 50/30/20 distribution (short/medium/long) via `_pick_prompt()`, generating variable-size payloads that exercise different backend processing paths.
+5. Locust runs headless for 60 seconds with 20 users, ramp rate 5/s. An HTML report is written to `tests/load/report.html`.
+
+**End-to-end flow:**
+
+`make chaos` starts the gateway with chaos injection active, then `make loadtest` drives traffic through it. The full path exercised per request is: locust HTTP call -> FastAPI middleware -> rate limiter check -> retry loop (up to 3 backends) -> chaos injection -> translator error handling -> circuit breaker recording -> failover to next backend (on failure) -> response to client. This is the same path production traffic takes, with faults injected at the backend boundary.
+
+### Implementation
+
+**ChaosConfig** (`gateway/chaos.py`):
+- Dataclass with six fields: `error_rate` (default 0.10), `timeout_rate` (0.05), `latency_rate` (0.30), `latency_min_ms` (50.0), `latency_max_ms` (2000.0), `seed` (optional, for deterministic replay).
+- All rates are independent probabilities, not mutually exclusive. The check order (timeout > error > latency) creates implicit priority: if timeout fires, error and latency are never checked. This models real failure patterns where a hard timeout preempts slower failure modes.
+
+**ChaosHttpClient** (`gateway/chaos.py`):
+- `__init__(client, config)` stores the real client and creates a `random.Random(config.seed)` instance for deterministic injection sequences.
+- `post(url, **kwargs)` calls `_roll_injection(url)`, then either raises immediately (timeout/error), sleeps then delegates (latency), or delegates directly (no injection).
+- `stream(method, url, **kwargs)` returns a `_ChaosStreamContext` that performs injection in `__aenter__`.
+- `__getattr__(name)` delegates all other attribute access to the real client. This means `chaos_client.headers`, `chaos_client.aclose()`, etc., work transparently.
+- `_roll_injection(url)` returns `"timeout"`, `"error"`, a `float` (latency ms), or `None`. Each check uses an independent `self._rng.random()` call against the configured rate. Latency values are drawn from `uniform(latency_min_ms, latency_max_ms)`.
+
+**_ChaosStreamContext** (`gateway/chaos.py`):
+- Async context manager that wraps `client.stream()`. Injection fires in `__aenter__`, not during iteration. This means the failure point is connection establishment, not mid-stream — matching the most common real-world failure pattern (connection timeout, not mid-response drop).
+- `__aexit__` guards against `self._real_ctx is None`, which happens when injection fires before the real stream is opened. Without this guard, calling `__aexit__` on a `None` context would raise `AttributeError`.
+
+**Lifespan integration** (`gateway/main.py`):
+- Conditional import: `from gateway.chaos import ChaosConfig, ChaosHttpClient` only runs when `CHAOS_ENABLED=true`. The chaos module is not imported in normal operation.
+- Six environment variables control chaos behavior: `CHAOS_ENABLED`, `CHAOS_ERROR_RATE`, `CHAOS_TIMEOUT_RATE`, `CHAOS_LATENCY_RATE`, `CHAOS_LATENCY_MIN_MS`, `CHAOS_LATENCY_MAX_MS`. All have sensible defaults matching `ChaosConfig`.
+- The wrapped client replaces `app.state.http_client`, so all downstream code automatically uses it. No changes to translators, retry logic, or any other module.
+
+**Docker Compose override** (`docker-compose.chaos.yml`):
+- Sets `CHAOS_ENABLED=true` and all six rate/latency environment variables on the gateway service.
+- Used via `docker compose -f docker-compose.yaml -f docker-compose.chaos.yml up`. The override file only adds environment variables — it does not change ports, volumes, or service topology.
+
+**Makefile targets:**
+- `make chaos` — starts the full stack with chaos overlay: `docker compose -f docker-compose.yaml -f docker-compose.chaos.yml up --build -d`.
+- `make chaos-down` — stops the chaos stack.
+- `make loadtest` — runs locust in a disposable Docker container with `--network host`, targeting `http://localhost:8080`. Parameters: 20 users, ramp rate 5/s, 60-second run, HTML report output.
+
+**Locust harness** (`tests/load/locustfile.py`):
+- `TenantAlphaUser` — steady traffic (wait 0.5–2.0s), two task types (`mock-gpt-markdown` weight 7, `mock-claude-markdown` weight 3).
+- `TenantBetaUser` — bursty traffic (wait 0.1–1.0s), three task types including a streaming endpoint (`mock-gpt-markdown` streaming weight 2). Streaming task uses `catch_response=True` and consumes the full SSE stream via `iter_lines()`.
+- `_pick_prompt()` — weighted random selection: 50% short (1 message, 2-5 words), 30% medium (2-4 messages with system prompt), 20% long (6 messages, multi-turn conversation with detailed system prompt).
+
+### Key design decisions
+
+1. **httpx wrapper instead of middleware.** A FastAPI middleware would intercept requests at the HTTP boundary of the gateway itself — before routing, before the retry loop, before the translator. Faults injected at that layer would be indistinguishable from a client-side error. By wrapping `httpx.AsyncClient`, chaos is injected at the backend call boundary — the exact point where real backend failures occur. This means the translator's exception handling, the retry loop's failover logic, and the circuit breaker's failure recording all execute their real code paths. A middleware-level injection would bypass all of them.
+
+2. **Configurable rates via environment variables, not code changes.** Every chaos parameter is an env var with a default. This means an operator can tune chaos intensity without rebuilding the Docker image: `CHAOS_ERROR_RATE=0.50 make chaos` instantly doubles the error rate. The same gateway binary runs with and without chaos — no feature flags, no conditional compilation, no separate build.
+
+3. **Separate compose override file.** The chaos configuration lives in `docker-compose.chaos.yml`, not in the main `docker-compose.yaml`. This keeps the primary compose file clean for development and CI. The compose `-f` flag's override semantics (later files merge into earlier ones) means only the six environment variables are added — nothing else changes. There is no risk of accidentally running chaos in a non-test environment because the override file must be explicitly specified.
+
+4. **Seeded RNG for determinism.** `ChaosConfig.seed` allows reproducible injection sequences. Two runs with the same seed produce the exact same fault pattern, making failures debuggable: "the 7th request always gets a timeout with seed=42." The per-instance `random.Random` avoids polluting the global random state. In tests, seed is set explicitly. In Docker, seed is omitted (defaults to `None`), producing non-deterministic chaos — closer to real-world conditions.
+
+5. **Locust in Docker with `--network host`.** Running locust inside a Docker container eliminates the need to install locust or its dependencies on the host machine. `--network host` means locust connects directly to `localhost:8080` where the gateway is running. The alternative — adding locust as a service in docker-compose — would create a dependency between the load generator and the system under test. Keeping them decoupled means `make loadtest` works against any running gateway, whether started with `make up`, `make chaos`, or running natively.
+
+6. **Injection in `__aenter__`, not during stream iteration.** Real streaming failures most commonly occur at connection time (DNS resolution, TCP handshake, TLS negotiation, HTTP upgrade), not mid-stream. Injecting in `__aenter__` models this pattern. Mid-stream injection (dropping bytes, corrupting chunks) would require wrapping the async iterator, adding complexity for a less common failure mode. The trade-off is that the chaos system does not test partial stream delivery — a production gap acknowledged below.
+
+7. **Timeout check before error check in `_roll_injection()`.** When both timeout_rate and error_rate could fire, timeout takes priority. This models real network behavior: a complete timeout (no response at all) is more severe than a fast 500 error, and when a backend is failing badly, timeouts are what the caller typically experiences first. The priority ordering also ensures deterministic behavior under extreme configurations (`timeout_rate=1.0, error_rate=1.0` always produces a timeout, not a coin flip).
+
+### Alternatives considered
+
+1. **Middleware-level injection.** Injecting faults in a FastAPI middleware (e.g., randomly returning 500 before the route handler runs) would be simpler to implement — a single middleware function instead of a wrapper class. Rejected because it bypasses the retry loop, circuit breaker, and translator error handling entirely. The whole point of chaos testing is to exercise the resilience mechanisms, and middleware injection skips all of them. A middleware approach would test "does the client handle 500s?" which is not what this system validates.
+
+2. **Network-level chaos (tc, iptables, Toxiproxy).** Tools like `tc netem` (Linux traffic control) or Toxiproxy inject latency and packet loss at the network layer, which is more realistic than application-level injection. Rejected for local development: `tc` requires Linux with `NET_ADMIN` capability (not available on macOS Docker), Toxiproxy requires an additional service in docker-compose with proxy port mapping for every backend. The operational complexity does not justify the marginal realism gain for a local development and interview-demo project. The application-level wrapper tests the same code paths (exception handling, retry, circuit breaker) because those code paths are triggered by exceptions, not by network conditions directly.
+
+3. **Always-on low-rate chaos in production.** Netflix's Chaos Monkey runs continuously against production services at a low rate. For this gateway, always-on chaos was rejected because the system has no redundancy beyond what it already implements (retry across backends). If the only backend for a model is hit by chaos, the request fails with no fallback. In a real multi-region deployment with per-region backend pools, low-rate production chaos would be safe. Here it would simply degrade service quality for the locust load test with no observability benefit beyond what the `make chaos` overlay provides.
+
+4. **Chaos as a pytest plugin.** Instead of a runtime wrapper, implement chaos as a pytest fixture that monkeypatches `httpx.AsyncClient.post`. This would make chaos testing part of the CI pipeline rather than a manual `make chaos` + `make loadtest` workflow. Rejected because the value of chaos testing comes from running it against the real, containerized stack with all services running — not against mocked backends in pytest. The integration tests in `test_chaos_integration.py` cover the "chaos + circuit breaker + retry" interactions at the unit level; the Docker-based chaos testing covers the full-stack behavior that unit tests cannot.
+
+### Failure modes and edge cases
+
+- **All backends hit by chaos simultaneously.** The chaos wrapper does not discriminate by backend — every `post()` call has the same injection probability. If the gateway has 5 backends for a model and the retry loop tries 3 of them, the probability that all 3 fail at a 30% error rate is 0.30^3 = 2.7%. At a 90% error rate, it is 0.90^3 = 72.9%. When all retries fail, the client receives the last backend's error (500 or 504). The circuit breaker records failures for each attempted backend independently, which is correct behavior — if all backends are genuinely failing, all their breakers should trip.
+
+- **Chaos + real failures compound.** If a real backend is down (e.g., Ollama container crashed) and chaos is also injecting errors, the effective failure rate is higher than configured. A backend that is genuinely returning 500s gets chaos 500s on top, accelerating circuit breaker trips. This is actually desirable: chaos should make real problems worse faster so they are detected sooner. But it means the observed error rate during chaos testing is a ceiling, not an exact measurement of the configured rate.
+
+- **Stream context cleanup on injection.** When `_ChaosStreamContext.__aenter__` raises (timeout or error injection), `_real_ctx` is `None`. The `__aexit__` method handles this with `if self._real_ctx is not None`. Without this guard, the `async with` block would attempt to call `__aexit__` on `None`, raising `AttributeError` — an implementation bug masquerading as a backend error. This edge case is covered by `test_stream_aexit_skipped_on_injection`.
+
+- **Latency injection exceeding the httpx client timeout.** The chaos system can inject up to 2000ms of latency (default `CHAOS_LATENCY_MAX_MS`). The httpx client has a 120-second timeout. The injected latency is added before the real backend call, so the total request time is `chaos_delay + backend_processing_time`. If both are large, the request can exceed client-side timeouts at the locust level (locust's default timeout is not explicitly set, relying on requests' defaults). This is a realistic scenario — real network latency stacks with backend processing time in the same way.
+
+- **Deterministic seed does not guarantee identical cross-run behavior.** The seed makes `_roll_injection()` produce the same sequence of injection decisions for the same sequence of calls. But the sequence of calls depends on the retry loop: if request N triggers a retry (different from a pass-through), the total number of `_roll_injection()` calls differs from a run where request N passes through. This means the seed guarantees determinism within a single execution but not across executions with different retry outcomes. The unit tests verify same-sequence determinism; they do not verify cross-retry-path determinism.
+
+- **No per-backend chaos rates.** The same `ChaosConfig` applies to all backends. If one backend is meant to be more reliable than another, chaos cannot model that asymmetry. A per-backend config would require mapping backend names to chaos rates, adding complexity to the configuration surface.
+
+### Observability
+
+**Structured logs (structlog):**
+- `chaos_injection` — emitted by `_roll_injection()` on every injection event. Fields: `injection_type` ("timeout", "error_5xx", or "latency"), `url` (backend URL being called), `delay_ms` (for latency injections only). Log level is `warning` to distinguish chaos events from normal request flow at a glance.
+- `chaos_mode_enabled` — emitted once during lifespan startup when `CHAOS_ENABLED=true`. Fields: `config` (full dict of ChaosConfig values). Confirms chaos is active and shows the effective rates.
+
+**Admin endpoint — circuit breaker state:**
+- `GET /admin/backends` returns each backend's circuit breaker snapshot: `state` (CLOSED/OPEN/HALF_OPEN), `error_rate`, `requests_in_window`, `current_cooldown_s`. Under chaos, this endpoint shows which backends have tripped and how fast they are recovering. Polling this during a `make loadtest` run gives a live view of how chaos is interacting with the circuit breaker state machine.
+
+**Prometheus metrics:**
+- `gateway_circuit_breaker_state{backend}` — gauge set to 0 (CLOSED), 1 (OPEN), or 2 (HALF_OPEN). Updated on every state transition via `CircuitBreaker._transition()`. Under chaos, this metric shows breakers oscillating between states as failures accumulate and cooldowns expire.
+- `gateway_request_count_total{tenant, model, backend, status_code, method}` — counter. Under chaos, the `status_code` label distribution shifts: more 500/502/504 responses appear alongside 200s. Comparing the status code distribution with and without chaos quantifies the resilience improvement from retries.
+- `gateway_request_latency_seconds{tenant, model, backend}` — histogram. Under chaos with latency injection, the histogram shows a bimodal distribution: a cluster at normal latency and a tail extending to `latency_max_ms`. This mirrors real-world latency distributions under network degradation.
+
+**Locust reports:**
+- `tests/load/report.html` — generated by `make loadtest`. Contains request/response time percentiles (p50, p95, p99), failure rate by endpoint, throughput over time, and request distribution across user classes. Under chaos, the report shows elevated p99 latency and non-zero failure rates, which can be compared against a baseline `make up` + `make loadtest` run to measure resilience effectiveness.
+
+### Testing
+
+**Unit tests — ChaosConfig (2 tests in `tests/unit/test_chaos.py`):**
+- `test_defaults` — verifies default rates: error 0.10, timeout 0.05, latency 0.30, min/max latency 50/2000ms, seed None.
+- `test_custom_values` — verifies custom config overrides are applied correctly.
+
+**Unit tests — ChaosHttpClient post (5 tests in `tests/unit/test_chaos.py`):**
+- `test_passthrough_when_disabled` — all rates at 0, call passes through to the real client unchanged. Verifies that with chaos disabled, behavior is identical to a plain httpx.AsyncClient.
+- `test_error_injection` — error_rate=1.0, raises `HTTPStatusError` with status 500. Verifies the real client is never called.
+- `test_timeout_injection` — timeout_rate=1.0, raises `ReadTimeout`. Verifies the real client is never called.
+- `test_latency_injection` — latency_rate=1.0 with fixed 100ms min/max, verifies elapsed time >= 90ms (with tolerance) and the real client is still called after the delay.
+- `test_timeout_priority_over_error` — both timeout_rate and error_rate at 1.0, verifies `ReadTimeout` is raised (timeout checked first).
+
+**Unit tests — ChaosHttpClient stream (4 tests in `tests/unit/test_chaos.py`):**
+- `test_stream_passthrough` — rates at 0, stream delegates to real client context manager.
+- `test_stream_error_injection` — error_rate=1.0, raises `HTTPStatusError` during `__aenter__`.
+- `test_stream_timeout_injection` — timeout_rate=1.0, raises `ReadTimeout` during `__aenter__`.
+- `test_stream_aexit_skipped_on_injection` — verifies `__aexit__` handles `None` `_real_ctx` without error after injection fires.
+
+**Unit tests — delegation and determinism (4 tests in `tests/unit/test_chaos.py`):**
+- `test_getattr_delegation` — attribute access on ChaosHttpClient delegates to real client.
+- `test_seed_determinism` — same seed produces identical injection sequence across two independent instances.
+- `test_different_seeds_differ` — different seeds produce different sequences.
+
+**Unit tests — _roll_injection (5 tests in `tests/unit/test_chaos.py`):**
+- `test_no_injection_when_all_rates_zero` — 100 calls, all return None.
+- `test_always_timeout_when_rate_one` — 10 calls, all return "timeout".
+- `test_always_error_when_rate_one` — 10 calls, all return "error".
+- `test_always_latency_when_rate_one` — 10 calls, all return float.
+- `test_latency_within_bounds` — 50 calls, all latency values fall within min/max range.
+
+**Integration tests — chaos + full stack (8 tests in `tests/unit/test_chaos_integration.py`):**
+- `TestChaosStructuredResponses` (2 tests): 20 requests with 30% error + 10% timeout chaos, every response is valid JSON with either `choices` (200) or `detail` (error). Second test verifies 200 responses have correct shape (choices array, message, usage).
+- `TestChaosCircuitBreaker` (2 tests): 30 requests with 90% error rate, verifies at least one backend's circuit breaker transitions to OPEN or HALF_OPEN via `/admin/backends`. Second test with 70% error rate verifies non-zero error rates in backend snapshots.
+- `TestChaosRateLimiter` (2 tests): 30 requests with 20% error + 5% timeout, all status codes are in the allowed set {200, 429, 500, 502, 503, 504}. Second test with 80% error rate verifies error responses have the `detail` key.
+- `TestChaosRetryFailover` (2 tests): 15 requests with 30% error rate, verifies >= 5 successes (P(all 3 retries fail) = 0.3^3 = 2.7% per request). Second test with 100% error rate verifies total failure still returns structured error with `detail`.
+
+**Load tests — locust (manual, Docker-based):**
+- `make loadtest` against `make up` (no chaos) — establishes baseline latency and throughput.
+- `make loadtest` against `make chaos` — measures degradation under fault injection.
+- Comparison of the two HTML reports shows the effect of chaos on p50/p95/p99 latency, failure rate, and throughput.
+
+### Production gaps
+
+- **No Kubernetes pod kill or node drain.** The chaos system only injects faults at the HTTP client level within the gateway process. It cannot simulate pod evictions, node failures, or container OOM kills. A production chaos system would use tools like Chaos Mesh or Litmus Chaos to inject infrastructure-level faults that test the orchestration layer (pod rescheduling, health check failures, rolling restart behavior).
+
+- **No network partition simulation.** The gateway and its backends run on the same Docker network. There is no way to simulate a network partition between the gateway and Redis, or between the gateway and a specific backend. Tools like Toxiproxy or `tc netem` (on Linux) would be needed to model partial connectivity — a critical failure mode where the gateway can reach some backends but not others.
+
+- **No persistent failure memory.** The chaos system is stateless per request — each `_roll_injection()` call is independent. It cannot simulate scenarios like "backend X is down for 5 minutes then recovers" or "Redis becomes unreachable for 30 seconds." Stateful chaos would require a time-based failure schedule or an external controller that flips failure modes during the test. This matters because circuit breaker recovery (HALF_OPEN probe) behaves differently under sustained failure vs. intermittent failure.
+
+- **No mid-stream failure injection.** Chaos fires in `__aenter__`, never during stream iteration. A real backend can fail mid-response: TCP connection reset after 3 chunks, HTTP/2 stream error after headers are sent, or a backend that streams 90% of the response then crashes. Testing this would require wrapping the async iterator returned by `__aenter__` and injecting faults during `__anext__()`. This is the most impactful production gap for streaming-heavy workloads.
+
+- **No gradual rollout of chaos.** Chaos is either on or off for all requests. A production system would support canary chaos: inject faults into 1% of requests, observe metrics, then ramp to 5%, 10%, etc. This requires either per-request sampling with dynamic rate adjustment or a control plane that updates chaos configuration at runtime.
+
+- **No per-backend chaos rates.** A single `ChaosConfig` applies uniformly to all backends. In reality, different backends have different reliability profiles — a self-hosted Ollama instance is more likely to fail than a managed OpenAI API. Supporting per-backend chaos rates would require mapping backend names to individual `ChaosConfig` instances, which adds configuration complexity but enables more realistic failure simulation.
+
+- **No chaos dashboard.** The chaos injection logs are interleaved with normal request logs. There is no dedicated view showing injection rate over time, injection type distribution, or correlation between injections and circuit breaker state changes. A Grafana dashboard with panels for `chaos_injection` log rate, breaker state gauge, and error code distribution would make chaos testing observable at a glance.
+
+### Interview talking points
+
+- The decision to wrap `httpx.AsyncClient` rather than inject at the middleware layer is the single most important design choice. Middleware injection tests whether the client handles errors — useful but trivial. HTTP client wrapper injection tests whether the gateway's resilience mechanisms (retry, circuit breaker, failover) actually work under the failure conditions they were designed for. The wrapper exercises the translator's exception handler, the retry loop's backend rotation, and the circuit breaker's failure counting — the same code path that runs when a real backend returns a 500 or times out. This is the difference between testing error display and testing error recovery.
+
+- The `_ChaosStreamContext` implementation reveals a subtle resource management issue. When an exception is raised in `__aenter__`, the `async with` protocol still calls `__aexit__`. If the stream context naively forwarded to `self._real_ctx.__aexit__()` without checking for `None`, it would crash with an `AttributeError` — turning a simulated backend failure into an internal gateway error. This is the kind of bug that only surfaces under failure conditions and is invisible in happy-path testing. The chaos system both tests for this and documents it.
+
+- Seeded randomness for chaos injection provides a debugging superpower: "run with seed=42, the failure happens on the 7th request every time." This turns non-deterministic failures into deterministic reproductions. The implementation uses `random.Random(seed)` (instance-level, not the global `random` module) so chaos injection does not affect random number generation elsewhere in the process. This is a general principle: testing infrastructure should be deterministic and isolated, even when simulating non-deterministic conditions.
+
+### Likely interview questions
+
+**Q: "Why inject chaos at the application level instead of using network-level tools like Toxiproxy?"**
+**A:** Both test different things. Network-level tools (Toxiproxy, `tc netem`) inject faults below the HTTP layer — they simulate packet loss, connection resets, and bandwidth limits that the HTTP client library must handle. Application-level injection tests the gateway's own resilience code: retry logic, circuit breaker state transitions, failover backend selection, and error response formatting. For this project, the application-level approach was chosen because: (1) it works identically on macOS and Linux (no `NET_ADMIN` capability needed), (2) it requires no additional services or port remapping in docker-compose, and (3) the gateway's httpx client already handles network-level errors (converting them to exceptions), so application-level injection triggers the same exception-handling code paths. The trade-off is that we cannot test httpx's own connection pool behavior under network degradation — but that is httpx's responsibility, not the gateway's.
+
+**Q: "How do you know your chaos testing is actually exercising the circuit breaker, not just generating errors that bypass it?"**
+**A:** The integration test `test_circuit_breaker_trips_under_chaos` proves it directly. It sends 30 requests with a 90% chaos error rate, then queries `GET /admin/backends` and asserts that at least one backend's circuit breaker state is OPEN or HALF_OPEN. If chaos were bypassing the circuit breaker (e.g., if errors were caught before reaching the breaker's `record_failure()` call), all breakers would remain CLOSED regardless of the error rate. The test also verifies non-zero `error_rate` in the breaker's snapshot, confirming that failures are being recorded in the rolling window. The `test_retry_loop_survives_partial_chaos` test complements this by verifying that with moderate chaos (30% error rate), the retry loop successfully finds healthy backends — which only works if the circuit breaker is correctly excluding tripped backends from the routing pool.
+
+**Q: "What happens if you accidentally deploy with CHAOS_ENABLED=true in production?"**
+**A:** Three safeguards exist. First, the chaos import is conditional (`if os.getenv("CHAOS_ENABLED", "false").lower() == "true"`) — it is not loaded by default. Second, enabling chaos emits a `chaos_mode_enabled` log at `warning` level with the full config, making it immediately visible in log aggregation. Third, the chaos configuration lives in `docker-compose.chaos.yml`, a separate override file that must be explicitly specified in the `docker compose -f` command — it is not part of the default `docker-compose.yaml` used by `make up`. That said, there is no runtime kill switch: if chaos is enabled, it stays enabled until the process restarts. A production-grade system would add a `/admin/chaos` toggle endpoint or read configuration from a feature flag service, allowing operators to disable chaos without restarting the gateway.
