@@ -20,6 +20,7 @@ services:
       - QUEUE_TIMEOUT=30
       - L1_MAX_ENTRIES=500
       - L1_TTL=3600
+      - CHAOS_ENABLED=false
     deploy:
       resources:
         limits:

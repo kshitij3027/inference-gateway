@@ -44,6 +44,22 @@ async def lifespan(app: FastAPI):
     )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
 
+    # Chaos mode (disabled by default)
+    if os.getenv("CHAOS_ENABLED", "false").lower() == "true":
+        from gateway.chaos import ChaosConfig, ChaosHttpClient
+
+        chaos_config = ChaosConfig(
+            error_rate=float(os.getenv("CHAOS_ERROR_RATE", "0.10")),
+            timeout_rate=float(os.getenv("CHAOS_TIMEOUT_RATE", "0.05")),
+            latency_rate=float(os.getenv("CHAOS_LATENCY_RATE", "0.30")),
+            latency_min_ms=float(os.getenv("CHAOS_LATENCY_MIN_MS", "50")),
+            latency_max_ms=float(os.getenv("CHAOS_LATENCY_MAX_MS", "2000")),
+        )
+        app.state.http_client = ChaosHttpClient(
+            app.state.http_client, chaos_config
+        )
+        logger.warning("chaos_mode_enabled", config=vars(chaos_config))
+
     # Initialize circuit breaker gauges to CLOSED (0) for all backends
     from gateway.observability.metrics import CIRCUIT_BREAKER_STATE
 
