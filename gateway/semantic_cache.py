@@ -39,6 +39,7 @@ class SemanticCache:
         self.similarity_threshold = similarity_threshold
         self.default_ttl = default_ttl
         self._model = None  # Lazy loaded
+        self._prefix_cache: dict[str, list[float]] = {}  # sys_hash → system prompt embedding
         self._l1 = L1Cache(
             max_entries=l1_max_entries,
             ttl_seconds=float(l1_ttl if l1_ttl is not None else default_ttl),
@@ -81,6 +82,20 @@ class SemanticCache:
         system_text = "\n".join(m.content for m in messages if m.role == "system")
         return hashlib.sha256(system_text.encode()).hexdigest()[:16]
 
+    def compute_system_embedding(self, messages: list) -> tuple[str, list[float]]:
+        """Compute and cache the system prompt embedding.
+
+        Returns (sys_hash, embedding). The embedding is cached by sys_hash
+        so repeated system prompts avoid redundant embedding computation.
+        """
+        system_text = "\n".join(m.content for m in messages if m.role == "system")
+        sys_hash = self._extract_system_hash(messages)
+
+        if sys_hash not in self._prefix_cache and system_text:
+            self._prefix_cache[sys_hash] = self.compute_embedding(system_text)
+
+        return sys_hash, self._prefix_cache.get(sys_hash, [])
+
     def _build_scope_key(
         self, model: str, sys_hash: str, tenant_id: str, cache_isolation: str
     ) -> str:
@@ -114,7 +129,7 @@ class SemanticCache:
         if not user_text:
             return None, None, None
 
-        sys_hash = self._extract_system_hash(messages)
+        sys_hash, _sys_embedding = self.compute_system_embedding(messages)
         scope_key = self._build_scope_key(model, sys_hash, tenant_id, cache_isolation)
 
         # Compute query embedding
@@ -182,7 +197,7 @@ class SemanticCache:
         if not user_text:
             return
 
-        sys_hash = self._extract_system_hash(messages)
+        sys_hash, _sys_embedding = self.compute_system_embedding(messages)
         scope_key = self._build_scope_key(model, sys_hash, tenant_id, cache_isolation)
 
         embedding = self.compute_embedding(user_text)

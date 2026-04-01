@@ -556,3 +556,80 @@ class TestL1Integration:
 
         await cache.flush()
         assert cache._l1.stats()["l1_entries"] == 0
+
+
+class TestPrefixCache:
+    """Tests for system prompt embedding prefix cache."""
+
+    async def test_system_embedding_cached(self):
+        """Same system prompt should only compute embedding once."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+
+        call_count = 0
+
+        def counting_compute(text):
+            nonlocal call_count
+            call_count += 1
+            return [1.0, 0.0, 0.0]
+
+        cache.compute_embedding = counting_compute
+
+        messages = [
+            ChatMessage(role="system", content="You are helpful."),
+            ChatMessage(role="user", content="Hi"),
+        ]
+
+        # First call computes system embedding
+        sys_hash1, emb1 = cache.compute_system_embedding(messages)
+        system_calls_after_first = call_count
+
+        # Second call with same system prompt should NOT recompute
+        sys_hash2, emb2 = cache.compute_system_embedding(messages)
+        assert call_count == system_calls_after_first  # No additional calls
+        assert sys_hash1 == sys_hash2
+        assert emb1 == emb2
+
+    async def test_different_system_prompts_cached_separately(self):
+        """Different system prompts get separate cache entries."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+        cache.compute_embedding = lambda text: [hash(text) % 100 / 100.0, 0.0, 0.0]
+
+        msg_a = [ChatMessage(role="system", content="You are a poet."), ChatMessage(role="user", content="Hi")]
+        msg_b = [ChatMessage(role="system", content="You are a coder."), ChatMessage(role="user", content="Hi")]
+
+        hash_a, _ = cache.compute_system_embedding(msg_a)
+        hash_b, _ = cache.compute_system_embedding(msg_b)
+        assert hash_a != hash_b
+        assert len(cache._prefix_cache) == 2
+
+    async def test_empty_system_not_cached(self):
+        """Messages with no system role should not create prefix cache entry."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+
+        messages = [ChatMessage(role="user", content="Hi")]
+        sys_hash, emb = cache.compute_system_embedding(messages)
+        assert emb == []  # No system embedding
+        assert sys_hash not in cache._prefix_cache or len(cache._prefix_cache) == 0
+
+    async def test_prefix_used_in_lookup(self):
+        """lookup() should use compute_system_embedding (not _extract_system_hash directly)."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+        cache.compute_embedding = lambda text: [1.0, 0.0, 0.0]
+
+        # Set up Redis to return empty (miss)
+        redis.smembers = AsyncMock(return_value=set())
+
+        messages = [
+            ChatMessage(role="system", content="Be brief."),
+            ChatMessage(role="user", content="Hi"),
+        ]
+
+        await cache.lookup("model", messages, "t1", "shared")
+
+        # After lookup, the system embedding should be cached
+        sys_hash = cache._extract_system_hash(messages)
+        assert sys_hash in cache._prefix_cache
