@@ -2021,3 +2021,194 @@ Without intelligent routing, the gateway is a one-strategy system. Every model g
 
 **Q: "Why is the latency tracker per-instance rather than shared across instances?"**
 **A:** Each gateway instance has its own network path to each backend. Instance A in availability zone us-east-1a may have 10ms RTT to backend X, while instance B in us-east-1b has 50ms. Sharing latency data would average out these differences, causing both instances to route to the globally-average-best backend instead of their locally-best backend. Per-instance tracking is more correct for routing decisions. The trade-off is admin visibility: the `GET /admin/routing` endpoint only shows one instance's data. For fleet-wide visibility, Prometheus already scrapes `gateway_request_duration_seconds` from all instances, and Grafana can compute per-backend P95 across the fleet.
+
+## Advanced Caching
+
+### Why this exists
+
+Phase 8 introduced a Redis-backed semantic cache that eliminated redundant LLM backend calls for semantically similar prompts. Every cache lookup required a network round-trip to Redis (~1-5ms per lookup), even for queries that had been seen seconds ago on the same gateway instance. For hot queries — the same question asked repeatedly during a traffic spike — this network overhead is entirely avoidable with an in-process cache.
+
+Two additional inefficiencies remained. First, system prompts (e.g., "You are a helpful assistant") are repeated verbatim across thousands of requests but get re-embedded on every lookup. Computing a 384-dimensional embedding via sentence-transformers takes ~5-15ms on CPU; for a system prompt that never changes, this is wasted compute. Second, operators had no way to pre-populate the cache before anticipated traffic spikes — the cache could only be warmed organically by real user traffic, meaning the first wave of requests after a deployment or cache flush always hit backends directly.
+
+Advanced caching addresses all three problems: an L1 in-process LRU cache eliminates network round-trips for hot queries, a prefix cache avoids redundant system prompt embedding computation, and a cache warming endpoint lets operators pre-populate the cache before traffic arrives.
+
+### How it works
+
+**Two-tier lookup (L1 → L2 → backend):**
+
+1. Client sends a chat completion request. After auth and rate limiting, the route handler calls `SemanticCache.lookup()`.
+2. `lookup()` computes the query embedding for the user text and builds a scope key from `(model, system_hash, tenant_id, cache_isolation)`.
+3. The L1 cache (in-process `L1Cache`) is checked first. It scans all entries within the matching scope, computes cosine similarity against each stored embedding, and returns the best match above the similarity threshold. If found, the response is returned immediately with tier `L1_HIT`. No network I/O occurs.
+4. On L1 miss, the L2 cache (Redis) is checked. Entry IDs are fetched from the scope set via `SMEMBERS`, embeddings are batch-fetched via `HGETALL`, and cosine similarity is computed against each. The best match above threshold is returned with tier `L2_HIT`.
+5. On L2 hit, the entry is **promoted to L1**: `L1Cache.store()` is called with the entry ID, scope key, embedding, and response JSON. The next identical or similar query will hit L1 directly.
+6. On complete miss (both tiers), the request proceeds to the backend. After the backend responds, the result is stored in both L1 and L2 simultaneously.
+7. The middleware sets `X-Cache` response header to `L1_HIT`, `L2_HIT`, or `MISS`, and `X-Cache-Similarity` to the cosine similarity score on hits.
+
+**Prefix cache for system prompt embeddings:**
+
+1. On every `lookup()` and `store()` call, `compute_system_embedding()` is invoked with the message list.
+2. The method extracts and hashes all system-role message content using SHA-256 (truncated to 16 characters).
+3. If the hash is not in `_prefix_cache`, the system prompt text is embedded via sentence-transformers and the resulting vector is stored in the dict keyed by the hash.
+4. If the hash already exists, the cached embedding is returned immediately — no model inference.
+5. The prefix cache is a plain `dict[str, list[float]]` on the `SemanticCache` instance. It persists for the lifetime of the process.
+
+**Cache warming:**
+
+1. Operator sends `POST /admin/cache/warm` with a JSON body containing a list of prompts (each with `model` and `messages`).
+2. For each prompt, the endpoint finds the appropriate backend, calls the translator to get a real LLM response, and stores the result in the semantic cache with `tenant_id="__warm__"` and `cache_isolation="shared"`.
+3. Because warmed entries use shared isolation, they are visible to all tenants. Entries flow into both L1 and L2 via the normal `SemanticCache.store()` path.
+4. The endpoint returns a summary: `{"warmed": N, "errors": M}`.
+
+### Implementation
+
+**L1Cache** (`gateway/l1_cache.py`):
+- `L1Cache` class with `OrderedDict[str, L1Entry]` for O(1) LRU operations. `L1Entry` is a dataclass holding `scope_key`, `embedding` (list of floats), `response_json` (serialized string), `created_at` (monotonic timestamp), and `hit_count`.
+- `_scope_index: dict[str, set[str]]` maps scope keys to entry IDs, enabling scoped lookup without scanning the entire cache. Only entries matching the query's `(model, system_hash)` scope are compared.
+- `lookup(scope_key, query_embedding, threshold)` iterates entries in the matching scope, computes cosine similarity via NumPy (`np.dot` + `np.linalg.norm`), returns the best match above threshold. Expired entries are lazily evicted during the scan. On hit, the entry is moved to the end of the OrderedDict via `move_to_end()`.
+- `store(entry_id, scope_key, embedding, response_json)` appends to the OrderedDict. If at capacity (`max_entries`), `_evict_oldest()` removes from the front (LRU victim). Duplicate entry IDs are deduplicated via `move_to_end()` without overwriting.
+- `flush()` clears both `_entries` and `_scope_index`, resets hit/miss counters.
+- `stats()` returns `l1_entries`, `l1_max_entries`, `l1_hits`, `l1_misses`.
+- `cosine_similarity(a, b)` is a module-level function computing similarity between two float vectors using NumPy for vectorized performance.
+
+**SemanticCache L1/L2 integration** (`gateway/semantic_cache.py`):
+- `SemanticCache.__init__()` creates an `L1Cache` instance with configurable `l1_max_entries` and `l1_ttl` parameters.
+- `lookup()` returns a 3-tuple `(response, similarity, tier)` where `tier` is `"L1_HIT"`, `"L2_HIT"`, or `None`. L1 is checked before L2. On L2 hit, the entry is promoted to L1 via `self._l1.store()`.
+- `store()` writes to both L2 (Redis pipeline: `HSET` + `EXPIRE` + `SADD` + `EXPIRE`) and L1 (`self._l1.store()`) in sequence.
+- `get_stats()` merges L2 stats (Redis `cache:stats` hash) with L1 stats (`self._l1.stats()`), returning a combined dict with `hits`, `misses`, `hit_rate`, `entries`, `l1_entries`, `l1_max_entries`, `l1_hits`, `l1_misses`.
+- `flush()` clears both L1 (`self._l1.flush()`) and L2 (Redis `SCAN` + `DELETE`), returns the combined count.
+
+**Prefix cache** (`gateway/semantic_cache.py`):
+- `_prefix_cache: dict[str, list[float]]` on `SemanticCache`, keyed by the 16-character SHA-256 hash of concatenated system message content.
+- `compute_system_embedding(messages)` returns `(sys_hash, embedding)`. If the hash is already in `_prefix_cache`, the embedding is returned without calling `SentenceTransformer.encode()`. If not, the system text is embedded and cached. Empty system text produces an empty embedding list and is not cached.
+- Both `lookup()` and `store()` call `compute_system_embedding()` to benefit from the prefix cache.
+
+**Cache warming** (`gateway/routes/admin.py`):
+- `CacheWarmRequest` Pydantic model validates the request body: `prompts` is a list of dicts, each containing `model` (str) and `messages` (list of message dicts).
+- `POST /admin/cache/warm` iterates prompts, finds a backend via `registry.find_backend_for_model()` (respecting circuit breaker exclusions), calls the appropriate translator, and stores the result via `semantic_cache.store()` with `tenant_id="__warm__"` and `cache_isolation="shared"`.
+- Invalid prompts (missing model, bad message format) increment the `errors` counter and are skipped. Backend failures are caught and logged as warnings.
+
+**Configuration** (`gateway/main.py`):
+- `L1_MAX_ENTRIES` — environment variable, default 500. Controls the maximum number of entries in the L1 cache.
+- `L1_TTL` — environment variable, defaults to `CACHE_TTL` (which defaults to 3600 seconds). Controls how long L1 entries survive before lazy expiration.
+
+### Key design decisions
+
+1. **OrderedDict for O(1) LRU.** Python's `OrderedDict` provides `move_to_end()` in O(1) and `popitem(last=False)` in O(1), which is exactly what an LRU cache needs. The alternative — a plain `dict` plus a separate access-time list — would require O(n) scans to find and remove the LRU victim. `functools.lru_cache` was not suitable because the cache key is a high-dimensional embedding vector (not hashable in a useful way), and cache entries must be scoped by `(model, system_hash)`.
+
+2. **No locks.** The L1 cache is accessed only from async coroutines running on asyncio's single-threaded event loop. There is no preemptive multithreading, so no data races are possible. Adding locks would introduce unnecessary overhead and complexity. If the gateway were to use multiple worker processes (e.g., via `--workers N` in uvicorn), each process gets its own L1 cache, which is the correct behavior — each process should cache its own hot set.
+
+3. **TTL checked lazily, not via background sweeper.** Expired entries are discovered and evicted during `lookup()` scans, not by a background task. This avoids the complexity of a periodic sweeper (timer management, cancellation on shutdown, potential race conditions with concurrent lookups). The trade-off is that expired entries consume memory until the next lookup in their scope. With a 500-entry cap, this is at most ~2MB of wasted memory — negligible for a gateway process.
+
+4. **500-entry default cap (~2MB memory).** Each L1 entry stores a 384-float embedding (~1.5KB as a Python list) plus a serialized JSON response (~2-4KB for typical LLM responses). At 500 entries, the L1 cache consumes roughly 1.5-3MB. This is small enough to be negligible in a gateway process that already loads a sentence-transformers model (~80MB) but large enough to cover the hot working set for most workloads.
+
+5. **Prefix cache is unbounded.** System prompts are few in practice — most applications use 1-5 distinct system prompts. An unbounded `dict` is the simplest and fastest implementation. Even with 1000 distinct system prompts, the prefix cache would consume ~600KB (1000 * 384 floats * 4 bytes). The risk of unbounded growth is acknowledged as a production gap.
+
+6. **Warm writes to shared isolation only.** The warming endpoint uses `tenant_id="__warm__"` with `cache_isolation="shared"`, making warmed entries visible to all tenants. This is intentional: warming is an operator action to benefit the entire fleet, not a tenant-specific operation. Tenants configured with `cache_isolation="tenant"` will not see warmed entries, which is consistent with their isolation guarantee — they opted out of shared caching.
+
+7. **L2 hits promote to L1.** When a query misses L1 but hits L2, the entry is immediately copied into L1. This means the second identical query avoids the Redis round-trip entirely. The alternative — only populating L1 on backend responses — would miss the optimization for queries that are popular enough to be in Redis but not yet in the local process's L1.
+
+### Alternatives considered
+
+1. **Redis-only with connection pooling.** Instead of an in-process L1, optimize the Redis path with connection pooling and pipelining. This would avoid the complexity of a two-tier cache and the consistency issues of an L1 that can go stale. Rejected because even an optimized Redis lookup is ~1ms (network round-trip), while an in-process dict lookup is ~10us. For hot queries during traffic spikes, this 100x difference matters. The consistency trade-off (L1 staleness up to TTL) is acceptable for a cache that already uses approximate matching.
+
+2. **`dict` + `list` instead of `OrderedDict`.** Use a plain `dict` for O(1) key lookup and a `list` of `(access_time, key)` tuples sorted by access time for eviction. This would require O(n) scans to update access order on each hit and O(n log n) sorts for eviction. `OrderedDict.move_to_end()` is O(1), making it strictly better for LRU.
+
+3. **Combined embedding (system + user text).** Instead of separate prefix caching, concatenate system and user text and embed them together. This would produce a single embedding that captures both contexts. Rejected because the system prompt is repeated across many requests with different user text. By caching the system embedding separately, we avoid recomputing it for every request. The scope key `(model, system_hash)` already partitions the cache so that entries with different system prompts are never compared against each other.
+
+4. **Background warming via async tasks.** Instead of a synchronous warm endpoint that blocks until all prompts are processed, spawn background tasks for each prompt. This would make the warm endpoint return immediately with a job ID. Rejected for simplicity: the number of prompts in a warm request is typically small (10-50), and the total time is bounded by the slowest LLM response (~30s). A production system handling thousands of warm prompts would benefit from background processing, but that adds job tracking, progress reporting, and failure handling complexity.
+
+5. **Write-through L1 on L2 store instead of promote-on-hit.** Populate L1 every time an entry is written to L2, not just when L2 is hit. The current implementation already does this — `SemanticCache.store()` writes to both tiers. The promote-on-hit mechanism is an additional optimization for entries that were already in L2 (e.g., stored by a different request or before a gateway restart) but not yet in the current process's L1.
+
+### Failure modes and edge cases
+
+- **L1 stale after Redis invalidation.** If an operator flushes the Redis cache via `DELETE /admin/cache`, L2 entries are deleted but L1 entries persist until their TTL expires. During this window, queries may return stale cached responses from L1 that no longer exist in L2. The staleness window is bounded by `L1_TTL` (default 3600s). Calling `DELETE /admin/cache` through the gateway endpoint does flush both tiers via `SemanticCache.flush()`, but direct Redis manipulation (e.g., `redis-cli FLUSHDB`) bypasses L1.
+
+- **Prefix cache unbounded growth.** If the gateway serves requests with many distinct system prompts (e.g., a multi-tenant platform where each tenant has a unique system prompt), the prefix cache grows without bound. Each entry is ~1.5KB (384 floats). With 10,000 distinct system prompts, the prefix cache would consume ~15MB. There is no eviction policy. A production system would add an LRU wrapper or a max-size cap to `_prefix_cache`.
+
+- **Warm endpoint timeout on large prompt lists.** The warm endpoint processes prompts sequentially. If each LLM call takes 10 seconds and there are 50 prompts, the total wall time is ~500 seconds — likely exceeding the client's HTTP timeout. There is no progress streaming or partial result reporting. Large warm jobs should be split into multiple smaller requests.
+
+- **L1 capacity exhaustion under cardinality explosion.** If request patterns have high cardinality (many unique queries, few repeats), the L1 cache churns through entries via LRU eviction without producing hits. Every store triggers an eviction, and the evicted entry was never looked up. In this pathology, L1 adds overhead (store + evict) without benefit. The 500-entry cap bounds the memory waste, but the CPU overhead of cosine similarity comparisons during fruitless lookups is proportional to the number of entries in each scope.
+
+- **Embedding model lazy-load latency spike.** The sentence-transformers model is loaded on the first call to `compute_embedding()`. This first call takes several seconds as the model is loaded from disk into memory. If the first request to the gateway happens to be a cache warm call with many prompts, the lazy load happens once and subsequent embeddings are fast. But if the first request is a normal user query, that query pays the load-time penalty. There is no explicit pre-loading of the model during startup.
+
+- **L1 entry deduplication preserves stale response.** When `L1Cache.store()` is called with an `entry_id` that already exists, it calls `move_to_end()` but does not update the stored embedding or response JSON. If the same entry was updated in Redis (e.g., by another gateway instance), the L1 copy retains the original data until it expires or is evicted.
+
+- **Scope index orphans.** If `_evict()` is called for an entry whose scope key has already been removed from `_scope_index` (e.g., due to a race in cleanup), the `discard()` call is a no-op. This is safe but can leave empty sets in `_scope_index` if the cleanup path has a bug. The code handles this by checking `if not scope_entries: del self._scope_index[entry.scope_key]` after each discard.
+
+### Observability
+
+**Response headers:**
+- `X-Cache: L1_HIT` — served from in-process L1 cache (no network I/O).
+- `X-Cache: L2_HIT` — served from Redis L2 cache (one Redis round-trip).
+- `X-Cache: MISS` — no cache hit, request forwarded to backend.
+- `X-Cache-Similarity: 0.9812` — cosine similarity score of the matched entry (present on hits only).
+
+**Admin endpoints:**
+- `GET /admin/cache/stats` returns combined L1/L2 statistics: `l1_entries`, `l1_max_entries`, `l1_hits`, `l1_misses` (from L1), plus `hits`, `misses`, `hit_rate`, `entries` (from L2/Redis). This gives operators a single view of both tiers.
+- `POST /admin/cache/warm` returns `{"status": "completed", "warmed": N, "errors": M}` for pre-population results.
+- `DELETE /admin/cache` flushes both L1 and L2, returning the total count of deleted entries across both tiers.
+
+**Prometheus metrics:**
+- `gateway_cache_operations_total{model, status}` — counter with `status="hit"` or `status="miss"`, incremented in the chat route on every cache-eligible request.
+
+**Structured logs:**
+- `cache_hit` — emitted on L1 or L2 hit with `model`, `tenant_id`, `similarity`, and `streaming` fields.
+- `cache_warm_completed` — emitted after warming with `warmed` and `errors` counts.
+- `cache_warm_failed` — emitted per-prompt on warming failure with `model` and `error`.
+- `cache_warm_no_backend` — emitted when no backend is available for a warmed model.
+- `cache_warm_invalid_prompt` — emitted when a warm prompt fails validation.
+- `embedding_model_loaded` — emitted once when the sentence-transformers model is lazy-loaded.
+
+### Testing
+
+**Unit tests — L1Cache (14 tests in `tests/unit/test_l1_cache.py`):**
+- `TestL1Lookup` (6 tests): hit above threshold returns response and similarity, miss below threshold returns None, miss on empty scope returns None, best match selected when multiple entries exist, LRU touch on hit (move_to_end verified by evicting and checking which entry survives), expired entry lazily evicted during lookup (uses mocked `time.monotonic`).
+- `TestL1Store` (4 tests): store and retrieve round-trip, dedup of existing entry ID (move_to_end without overwrite), capacity eviction removes oldest entry, scope index populated on store.
+- `TestL1Eviction` (3 tests): evict_oldest removes front of OrderedDict, evict cleans scope index but preserves scope with remaining entries, evict removes empty scope from index.
+- `TestL1Stats` (2 tests): hit/miss counters increment correctly, flush returns count and resets all state.
+
+**Unit tests — SemanticCache L1 integration (7 tests in `tests/unit/test_semantic_cache.py`):**
+- `TestL1Integration` (3 tests): L1 hit after store (store populates L1, second lookup returns `L1_HIT`), L2 hit promotes to L1 (first lookup `L2_HIT`, second lookup `L1_HIT`), flush clears L1 entries.
+- `TestPrefixCache` (4 tests): system embedding cached (second call does not recompute), different system prompts cached separately, empty system text not cached, prefix cache populated during lookup.
+
+**Integration tests — two-tier cache (3 tests in `tests/integration/test_semantic_cache.py`):**
+- `TestTwoTierCache`: L1_HIT header appears in response, L2_HIT header appears in response, MISS header appears on cache miss. Uses `httpx.ASGITransport` with mocked `SemanticCache` to verify header propagation through the middleware stack.
+
+**Integration tests — cache warming (1 test in `tests/integration/test_semantic_cache.py`):**
+- `TestCacheWarmIntegration`: warming endpoint returns correct warmed count with mocked translator and cache.
+
+### Production gaps
+
+- **No cross-instance L1 invalidation.** When one gateway instance flushes the cache via `DELETE /admin/cache`, only that instance's L1 is cleared. Other instances retain their L1 entries until TTL expiry. In a multi-instance deployment behind a load balancer, this means a flush request must be broadcast to all instances, or operators must accept a staleness window equal to `L1_TTL`. A production system would use Redis Pub/Sub or a shared invalidation channel to propagate flush events to all instances.
+
+- **No L1 cache sharding or size-based eviction.** The L1 cache uses a single `OrderedDict` with a fixed entry count limit. There is no memory-based limit (e.g., "max 50MB"). An entry with a 10KB response and an entry with a 100KB response consume the same "slot." A production system would track actual memory usage and evict based on memory pressure rather than entry count.
+
+- **Warm endpoint is synchronous.** The warming endpoint processes each prompt sequentially, blocking until completion. For large prompt lists, this can exceed HTTP timeouts. A production system would accept the warm request, return a job ID immediately, and process prompts asynchronously with progress tracking via a separate status endpoint.
+
+- **Prefix cache is unbounded.** No maximum size or eviction policy for the system prompt embedding cache. In a deployment with thousands of distinct system prompts, memory grows linearly without bound. Adding an LRU wrapper with a configurable cap (e.g., 100 entries) would bound memory while preserving the optimization for the most frequently used system prompts.
+
+- **No L1 hit rate monitoring or adaptive sizing.** The L1 cache size is a fixed configuration value. There is no runtime feedback loop that increases the size if the hit rate is high (suggesting the working set is larger than the cache) or decreases it if the hit rate is low (suggesting the cache is wasting memory on non-repeating queries). A production system could expose L1 hit rate as a Prometheus metric and use it to auto-tune the cache size.
+
+- **No warming for tenant-isolated caches.** The warm endpoint always stores with `cache_isolation="shared"`. Tenants configured with `cache_isolation="tenant"` receive no benefit from warming. Supporting tenant-specific warming would require an optional `tenant_id` field in the warm request body.
+
+### Interview talking points
+
+- The two-tier cache architecture mirrors CPU cache hierarchies (L1/L2/L3). The design principle is the same: put the fastest, smallest cache closest to the consumer (in-process), and use a larger, slower shared cache (Redis) as a backing store. The L1-to-L2 promotion on hit is analogous to a cache line fill in hardware. This is a well-understood pattern that works because of temporal locality — queries that were asked recently are likely to be asked again soon.
+
+- The decision to skip locking on L1 is a direct consequence of asyncio's cooperative multitasking model. In asyncio, coroutines yield control explicitly at `await` points, and L1 operations (`lookup`, `store`, `_evict`) contain no `await` statements — they are pure synchronous Python operating on in-process data structures. This means they execute atomically with respect to other coroutines. This is a concrete example of how understanding your concurrency model eliminates unnecessary synchronization overhead.
+
+- Prefix caching for system prompts is a domain-specific optimization that exploits a structural property of LLM workloads: the system prompt is repeated verbatim across many requests while the user text varies. By hashing and caching the system prompt embedding separately, the gateway converts an O(n) embedding computation (where n is the system prompt token count) into an O(1) hash lookup for every request after the first. This is analogous to common subexpression elimination in compilers — identifying repeated work and computing it once.
+
+### Likely interview questions
+
+**Q: "The L1 cache can serve stale data after a Redis flush. Why is this acceptable for a cache but not for, say, a database?"**
+**A:** A semantic cache is inherently approximate — it already returns responses from *similar* queries, not exact matches. The similarity threshold (0.95) means every cache hit is already a "close enough" answer. Serving a response that was valid 30 minutes ago but has since been flushed from Redis is the same class of approximation. The staleness window is bounded by L1_TTL, and the impact of a stale cache hit is that the user gets a slightly older response — not data corruption or incorrect state. For a database, staleness means returning data that contradicts the system's committed state, which violates correctness guarantees. For a cache, staleness is a performance trade-off, not a correctness violation.
+
+**Q: "Why not use Redis Pub/Sub for L1 invalidation instead of accepting staleness?"**
+**A:** Redis Pub/Sub would solve cross-instance invalidation but adds operational complexity: every gateway instance must maintain a persistent subscription, handle reconnection on Redis failover, and process invalidation messages on a background task. The invalidation message must include enough information to identify which L1 entries to evict (scope key? entry ID? full flush?). For a local development gateway with 1-2 instances, this complexity is not justified. The staleness window (up to TTL) is acceptable because the cache already serves approximate results. In a production deployment with strict freshness requirements, Pub/Sub or a shared invalidation bus would be the right addition.
+
+**Q: "How would you handle a workload where every query is unique and the L1 cache has a 0% hit rate?"**
+**A:** The L1 cache adds two costs per request on miss: `store()` (~O(1) OrderedDict insert + potential eviction) and `lookup()` (O(k) cosine similarity computations where k is the number of entries in the matching scope). If every query is unique, every store triggers an eviction and no lookup ever matches. The overhead is small in absolute terms (~100us per request) but provides zero benefit. Two mitigations: (1) monitor the L1 hit rate via `/admin/cache/stats` and if it is consistently near zero, disable L1 by setting `L1_MAX_ENTRIES=0`; (2) a more sophisticated approach would be an adaptive cache that automatically shrinks when the hit rate drops below a threshold, reallocating memory to more useful purposes.
+
+**Q: "The prefix cache is unbounded. What would happen at 100,000 distinct system prompts?"**
+**A:** Each prefix cache entry stores a 384-float embedding as a Python list. A Python float is 24 bytes (object overhead), so 384 floats is ~9.2KB per entry. At 100,000 entries, the prefix cache would consume ~920MB — a significant fraction of available RAM for a gateway process. The fix is straightforward: wrap `_prefix_cache` in an LRU with a cap (e.g., `functools.lru_cache` on a method that takes `sys_hash` as the key, or a manual OrderedDict like L1Cache). In practice, 100,000 distinct system prompts suggests a design issue in the calling application — system prompts should be templates, not per-request unique strings.
