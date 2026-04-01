@@ -68,13 +68,21 @@ async def lifespan(app: FastAPI):
 
         cache_ttl = int(os.getenv("CACHE_TTL", "3600"))
         similarity_threshold = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.95"))
+        l1_max_entries = int(os.getenv("L1_MAX_ENTRIES", "500"))
+        l1_ttl = int(os.getenv("L1_TTL", str(cache_ttl)))
         app.state.semantic_cache = SemanticCache(
             app.state.redis,
             similarity_threshold=similarity_threshold,
             default_ttl=cache_ttl,
+            l1_max_entries=l1_max_entries,
+            l1_ttl=l1_ttl,
         )
         logger.info(
-            "semantic_cache_initialized", ttl=cache_ttl, threshold=similarity_threshold
+            "semantic_cache_initialized",
+            ttl=cache_ttl,
+            threshold=similarity_threshold,
+            l1_max_entries=l1_max_entries,
+            l1_ttl=l1_ttl,
         )
     else:
         app.state.semantic_cache = None

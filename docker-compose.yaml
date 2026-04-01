@@ -18,6 +18,8 @@ services:
       - CACHE_SIMILARITY_THRESHOLD=0.95
       - QUEUE_MAX_DEPTH=100
       - QUEUE_TIMEOUT=30
+      - L1_MAX_ENTRIES=500
+      - L1_TTL=3600
     deploy:
       resources:
         limits:
