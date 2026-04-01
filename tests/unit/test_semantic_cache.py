@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -121,9 +122,10 @@ class TestLookup:
         cache.redis.hincrby = AsyncMock()
 
         messages = [ChatMessage(role="user", content="hello")]
-        result, similarity = await cache.lookup("test-model", messages, "t1", "shared")
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is not None
         assert similarity == pytest.approx(1.0)
+        assert tier == "L2_HIT"
 
     async def test_miss_below_threshold(self, cache):
         response = _make_response()
@@ -136,22 +138,25 @@ class TestLookup:
         cache.redis.hgetall = AsyncMock(return_value=entry_data)
 
         messages = [ChatMessage(role="user", content="hello")]
-        result, similarity = await cache.lookup("test-model", messages, "t1", "shared")
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is None
+        assert tier is None
 
     async def test_miss_empty_scope(self, cache):
         cache.redis.smembers = AsyncMock(return_value=set())
         messages = [ChatMessage(role="user", content="hello")]
-        result, similarity = await cache.lookup("test-model", messages, "t1", "shared")
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is None
+        assert tier is None
 
     async def test_model_scoping(self, cache):
         """Entry for model A should not be returned when looking up model B."""
         # Scope for model-b is empty
         cache.redis.smembers = AsyncMock(return_value=set())
         messages = [ChatMessage(role="user", content="hello")]
-        result, _ = await cache.lookup("model-b", messages, "t1", "shared")
+        result, _, tier = await cache.lookup("model-b", messages, "t1", "shared")
         assert result is None
+        assert tier is None
 
     async def test_expired_entry_cleaned_up(self, cache):
         cache.redis.smembers = AsyncMock(return_value={"expired-id"})
@@ -159,16 +164,18 @@ class TestLookup:
         cache.redis.srem = AsyncMock()
 
         messages = [ChatMessage(role="user", content="hello")]
-        result, _ = await cache.lookup("test-model", messages, "t1", "shared")
+        result, _, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is None
+        assert tier is None
         cache.redis.srem.assert_called_once()
 
     async def test_no_user_text_returns_none(self, cache):
         """Messages with no user role should return None immediately."""
         messages = [ChatMessage(role="system", content="sys")]
-        result, similarity = await cache.lookup("test-model", messages, "t1", "shared")
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is None
         assert similarity is None
+        assert tier is None
 
     async def test_best_match_selected(self, cache):
         """When multiple entries exist, the highest similarity is returned."""
@@ -197,9 +204,10 @@ class TestLookup:
         cache.redis.hincrby = AsyncMock()
 
         messages = [ChatMessage(role="user", content="hello")]
-        result, similarity = await cache.lookup("test-model", messages, "t1", "shared")
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
         assert result is not None
         assert similarity == pytest.approx(1.0)
+        assert tier == "L2_HIT"
 
     async def test_hit_increments_hit_count(self, cache):
         """A cache hit should increment the hit_count on the matched entry."""
@@ -312,8 +320,8 @@ class TestTenantIsolation:
 
         messages = [ChatMessage(role="user", content="hello")]
         # Both tenants use same scope key in shared mode
-        result_a, _ = await cache.lookup("test-model", messages, "tenant-a", "shared")
-        result_b, _ = await cache.lookup("test-model", messages, "tenant-b", "shared")
+        result_a, _, tier_a = await cache.lookup("test-model", messages, "tenant-a", "shared")
+        result_b, _, tier_b = await cache.lookup("test-model", messages, "tenant-b", "shared")
         assert result_a is not None
         assert result_b is not None
 
@@ -338,8 +346,8 @@ class TestTenantIsolation:
         cache.redis.hgetall = AsyncMock(return_value=entry_data)
         cache.redis.hincrby = AsyncMock()
 
-        result_a, _ = await cache.lookup("test-model", messages, "tenant-a", "tenant")
-        result_b, _ = await cache.lookup("test-model", messages, "tenant-b", "tenant")
+        result_a, _, _ = await cache.lookup("test-model", messages, "tenant-a", "tenant")
+        result_b, _, _ = await cache.lookup("test-model", messages, "tenant-b", "tenant")
         assert result_a is not None
         assert result_b is None
 
@@ -445,3 +453,106 @@ class TestStats:
         cache = SemanticCache(redis_mock)
         await cache.record_miss()
         redis_mock.hincrby.assert_called_once_with("cache:stats", "misses", 1)
+
+
+def _make_mock_redis():
+    """Create a mock Redis client with default empty responses."""
+    redis = AsyncMock()
+    redis.smembers = AsyncMock(return_value=set())
+    redis.hgetall = AsyncMock(return_value={})
+    redis.pipeline = MagicMock(return_value=AsyncMock())
+    return redis
+
+
+class TestL1Integration:
+    """Tests for L1 cache integration within SemanticCache."""
+
+    async def test_l1_hit_after_store(self):
+        """After store(), lookup() should return L1_HIT."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+        cache.compute_embedding = lambda text: [1.0, 0.0, 0.0]
+
+        messages = [ChatMessage(role="user", content="hello")]
+        response = ChatCompletionResponse(
+            model="test-model",
+            choices=[Choice(message=ChatMessageResponse(content="Hi!"))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        # Store populates both L1 and L2
+        await cache.store("test-model", messages, response, "t1", "shared")
+
+        # Lookup should hit L1 first
+        result, similarity, tier = await cache.lookup("test-model", messages, "t1", "shared")
+        assert result is not None
+        assert tier == "L1_HIT"
+        assert result.choices[0].message.content == "Hi!"
+
+    async def test_l2_hit_promotes_to_l1(self):
+        """L2 hit should populate L1, so second lookup returns L1_HIT."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+        cache.compute_embedding = lambda text: [1.0, 0.0, 0.0]
+
+        messages = [ChatMessage(role="user", content="hello")]
+        response = ChatCompletionResponse(
+            model="test-model",
+            choices=[Choice(message=ChatMessageResponse(content="Hi!"))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        # Manually populate Redis (L2) without L1
+        scope_key = cache._build_scope_key(
+            "test-model", cache._extract_system_hash(messages), "t1", "shared"
+        )
+        entry_id = "test-entry-123"
+        entry_data = {
+            "embedding": json.dumps([1.0, 0.0, 0.0]),
+            "response": response.model_dump_json(),
+            "model": "test-model",
+            "sys_hash": cache._extract_system_hash(messages),
+            "tenant_id": "t1",
+            "created_at": str(time.time()),
+            "hit_count": "0",
+            "entry_id": entry_id,
+        }
+
+        redis.smembers = AsyncMock(return_value={entry_id})
+        redis.hgetall = AsyncMock(return_value=entry_data)
+        redis.hincrby = AsyncMock()
+
+        # First lookup: L2 hit (L1 is empty)
+        result1, sim1, tier1 = await cache.lookup("test-model", messages, "t1", "shared")
+        assert tier1 == "L2_HIT"
+        assert result1 is not None
+
+        # Second lookup: L1 hit (promoted from L2)
+        result2, sim2, tier2 = await cache.lookup("test-model", messages, "t1", "shared")
+        assert tier2 == "L1_HIT"
+
+    async def test_flush_clears_l1(self):
+        """flush() should clear both L1 and L2."""
+        redis = _make_mock_redis()
+        cache = SemanticCache(redis, similarity_threshold=0.90)
+        cache.compute_embedding = lambda text: [1.0, 0.0, 0.0]
+
+        messages = [ChatMessage(role="user", content="hello")]
+        response = ChatCompletionResponse(
+            model="test-model",
+            choices=[Choice(message=ChatMessageResponse(content="Hi!"))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        await cache.store("test-model", messages, response, "t1", "shared")
+        assert cache._l1.stats()["l1_entries"] > 0
+
+        # Create async iterator mock for scan_iter
+        async def mock_scan_iter(**kwargs):
+            for key in []:
+                yield key
+
+        redis.scan_iter = mock_scan_iter
+
+        await cache.flush()
+        assert cache._l1.stats()["l1_entries"] == 0
