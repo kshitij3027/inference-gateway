@@ -344,7 +344,7 @@ async def chat_completions(
 
     if semantic_cache is not None:
         try:
-            cached_response, cache_similarity, _cache_tier = await semantic_cache.lookup(
+            cached_response, cache_similarity, cache_tier = await semantic_cache.lookup(
                 model=chat_request.model,
                 messages=chat_request.messages,
                 tenant_id=tenant.id,
@@ -353,7 +353,7 @@ async def chat_completions(
             if cached_response is not None:
                 await semantic_cache.record_hit()
                 CACHE_OPERATIONS.labels(model=chat_request.model, status="hit").inc()
-                request.state.cache_status = "HIT"
+                request.state.cache_status = cache_tier or "L2_HIT"
                 request.state.cache_similarity = cache_similarity
                 logger.info(
                     "cache_hit",
@@ -402,7 +402,7 @@ async def chat_completions(
                 )
                 if waited_response is not None:
                     await semantic_cache.record_hit()
-                    request.state.cache_status = "HIT"
+                    request.state.cache_status = "L2_HIT"
                     request.state.cache_similarity = waited_similarity
                     logger.info(
                         "stampede_guard_hit",

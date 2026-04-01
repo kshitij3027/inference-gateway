@@ -82,7 +82,7 @@ class TestCacheIntegration:
                     headers={"Authorization": "Bearer test-alpha-key"},
                 )
             assert resp.status_code == 200
-            assert resp.headers.get("X-Cache") == "HIT"
+            assert resp.headers.get("X-Cache") == "L2_HIT"
             assert resp.headers.get("X-Cache-Similarity") == "0.9812"
             body = resp.json()
             assert body["choices"][0]["message"]["content"] == "cached: Paris"
@@ -162,7 +162,7 @@ class TestCacheIntegration:
                 )
             assert resp.status_code == 200
             assert resp.headers.get("content-type") == "text/event-stream; charset=utf-8"
-            assert resp.headers.get("X-Cache") == "HIT"
+            assert resp.headers.get("X-Cache") == "L2_HIT"
             # Verify SSE format
             text = resp.text
             assert "data: " in text
@@ -251,7 +251,7 @@ class TestStampedeGuardIntegration:
                     headers={"Authorization": "Bearer test-alpha-key"},
                 )
             assert resp.status_code == 200
-            assert resp.headers.get("X-Cache") == "HIT"
+            assert resp.headers.get("X-Cache") == "L2_HIT"
             body = resp.json()
             assert body["choices"][0]["message"]["content"] == "stampede cached"
 
