@@ -5,7 +5,7 @@ Three independent dimensions: RPS (1s), RPM (60s), daily token budget.
 """
 
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import structlog
 
@@ -148,7 +148,7 @@ class RateLimiter:
             midnight = now_utc.replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
-            midnight_tomorrow = midnight.replace(day=midnight.day + 1)
+            midnight_tomorrow = midnight + timedelta(days=1)
             retry_after = (midnight_tomorrow - now_utc).total_seconds()
             return False, {
                 "limit_type": "token_budget_daily",
