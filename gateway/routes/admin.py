@@ -1,5 +1,6 @@
 import structlog
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel as PydanticBaseModel
 
 from gateway.config import ConfigError, ModelRoutingConfig, Registry, load_config
 
@@ -160,3 +161,83 @@ async def routing_state(request: Request):
             entry["p95_latencies"] = tracker.get_all_p95(model)
         result[model] = entry
     return result
+
+
+class CacheWarmRequest(PydanticBaseModel):
+    """Request body for cache warming."""
+
+    prompts: list[dict]  # [{"model": "m1", "messages": [{"role": "user", "content": "..."}]}]
+
+
+@router.post("/cache/warm")
+async def warm_cache(request: Request, body: CacheWarmRequest):
+    """Pre-populate cache by sending prompts to backends and storing results.
+
+    Each prompt is sent to the appropriate backend, and the response is
+    stored in the semantic cache. Useful for pre-warming before traffic spikes.
+    """
+    semantic_cache = getattr(request.app.state, "semantic_cache", None)
+    if semantic_cache is None:
+        raise HTTPException(status_code=503, detail="Semantic cache not available")
+
+    registry = request.app.state.registry
+    http_client = request.app.state.http_client
+    cb_registry = request.app.state.circuit_breakers
+
+    warmed = 0
+    errors = 0
+
+    for prompt_spec in body.prompts:
+        model = prompt_spec.get("model")
+        raw_messages = prompt_spec.get("messages", [])
+
+        if not model or not raw_messages:
+            errors += 1
+            continue
+
+        try:
+            from gateway.models import ChatCompletionRequest, ChatMessage
+
+            messages = [ChatMessage(**m) for m in raw_messages]
+            chat_req = ChatCompletionRequest(model=model, messages=messages)
+        except Exception as e:
+            logger.warning("cache_warm_invalid_prompt", error=str(e))
+            errors += 1
+            continue
+
+        # Find backend
+        exclude = cb_registry.get_open_backends()
+        backend = registry.find_backend_for_model(model, exclude=exclude)
+        if backend is None:
+            logger.warning("cache_warm_no_backend", model=model)
+            errors += 1
+            continue
+
+        # Get translator
+        from gateway.routes.chat import TRANSLATORS
+
+        translator = TRANSLATORS.get(backend.provider)
+        if translator is None:
+            errors += 1
+            continue
+
+        try:
+            result = await translator(
+                client=http_client,
+                backend=backend,
+                request=chat_req,
+            )
+            await semantic_cache.store(
+                model=model,
+                messages=messages,
+                response=result,
+                tenant_id="__warm__",
+                cache_isolation="shared",
+            )
+            warmed += 1
+        except Exception as e:
+            logger.warning("cache_warm_failed", model=model, error=str(e))
+            errors += 1
+
+    logger.info("cache_warm_completed", warmed=warmed, errors=errors)
+    return {"status": "completed", "warmed": warmed, "errors": errors}

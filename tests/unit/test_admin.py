@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from gateway.circuit_breaker import CircuitBreakerRegistry
 from gateway.config import GatewayConfig, Registry
+from gateway.models import ChatCompletionResponse, Choice, ChatMessageResponse, Usage
 from gateway.routes.admin import router as admin_router
 
 
@@ -242,3 +243,95 @@ class TestJournalQuery:
             resp = await client.get("/admin/journal")
         assert resp.status_code == 200
         assert resp.json()["enabled"] is False
+
+
+def _mock_response() -> ChatCompletionResponse:
+    """Create a mock ChatCompletionResponse for testing."""
+    return ChatCompletionResponse(
+        model="mock-model",
+        choices=[Choice(index=0, message=ChatMessageResponse(content="Hello!"))],
+        usage=Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+    )
+
+
+class TestCacheWarm:
+    """Tests for POST /admin/cache/warm endpoint."""
+
+    async def test_warm_success(self, monkeypatch):
+        """Warming with valid prompts returns warmed count."""
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_cache = AsyncMock()
+        mock_cache.store = AsyncMock()
+        mock_translator = AsyncMock(return_value=_mock_response())
+        app.state.semantic_cache = mock_cache
+        app.state.http_client = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            with patch.dict("gateway.routes.chat.TRANSLATORS", {"ollama": mock_translator}):
+                resp = await client.post(
+                    "/admin/cache/warm",
+                    json={
+                        "prompts": [
+                            {
+                                "model": "tinyllama",
+                                "messages": [{"role": "user", "content": "What is Python?"}],
+                            }
+                        ]
+                    },
+                )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["warmed"] == 1
+        assert data["errors"] == 0
+        mock_cache.store.assert_called_once()
+
+    async def test_warm_no_cache(self, monkeypatch):
+        """Returns 503 when semantic cache is not available."""
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        app.state.semantic_cache = None
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/admin/cache/warm",
+                json={"prompts": [{"model": "m1", "messages": [{"role": "user", "content": "Hi"}]}]},
+            )
+        assert resp.status_code == 503
+
+    async def test_warm_empty_prompts(self, monkeypatch):
+        """Empty prompts list returns warmed=0, errors=0."""
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_cache = AsyncMock()
+        app.state.semantic_cache = mock_cache
+        app.state.http_client = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/admin/cache/warm",
+                json={"prompts": []},
+            )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "completed", "warmed": 0, "errors": 0}
+
+    async def test_warm_invalid_model_counts_error(self, monkeypatch):
+        """Prompt with missing model counts as error."""
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        mock_cache = AsyncMock()
+        app.state.semantic_cache = mock_cache
+        app.state.http_client = AsyncMock()
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                "/admin/cache/warm",
+                json={
+                    "prompts": [
+                        {"messages": [{"role": "user", "content": "Hi"}]},  # missing model
+                    ]
+                },
+            )
+        assert resp.status_code == 200
+        assert resp.json()["errors"] == 1
+        assert resp.json()["warmed"] == 0
