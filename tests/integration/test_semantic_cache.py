@@ -277,3 +277,97 @@ class TestStampedeGuardIntegration:
             assert resp.status_code == 200
             # Should have fallen through to backend
             assert resp.headers.get("X-Cache") == "MISS"
+
+
+class TestTwoTierCache:
+    """Tests for L1/L2 cache tier header granularity."""
+
+    async def test_l1_hit_header(self, client):
+        """L1_HIT tier should appear in X-Cache header."""
+        cached = _make_response(content="L1 cached")
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.99, "L1_HIT"))
+            mock_cache.record_hit = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "test"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            assert resp.headers.get("X-Cache") == "L1_HIT"
+
+    async def test_l2_hit_header(self, client):
+        """L2_HIT tier should appear in X-Cache header."""
+        cached = _make_response(content="L2 cached")
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.95, "L2_HIT"))
+            mock_cache.record_hit = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                resp = await ac.post(
+                    "/v1/chat/completions",
+                    json={"model": "tinyllama", "messages": [{"role": "user", "content": "test"}]},
+                    headers={"Authorization": "Bearer test-alpha-key"},
+                )
+            assert resp.status_code == 200
+            assert resp.headers.get("X-Cache") == "L2_HIT"
+
+    async def test_miss_header(self, client):
+        """MISS should appear in X-Cache header when cache misses."""
+        mock_chat = AsyncMock(return_value=_make_response())
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.lookup = AsyncMock(return_value=(None, None, None))
+            mock_cache.record_miss = AsyncMock()
+            mock_cache.store = AsyncMock()
+            mock_cache.acquire_stampede_lock = AsyncMock(return_value=(True, "lock-key"))
+            mock_cache.release_stampede_lock = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                with patch.dict("gateway.routes.chat.TRANSLATORS", {"ollama": mock_chat}):
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "test"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+            assert resp.status_code == 200
+            assert resp.headers.get("X-Cache") == "MISS"
+
+
+class TestCacheWarmIntegration:
+    """Integration tests for cache warming endpoint."""
+
+    async def test_warm_returns_count(self, client):
+        """Warming returns warmed count."""
+        mock_translator = AsyncMock(return_value=_make_response())
+        async with app.router.lifespan_context(app):
+            mock_cache = AsyncMock()
+            mock_cache.store = AsyncMock()
+            app.state.semantic_cache = mock_cache
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                with patch.dict("gateway.routes.chat.TRANSLATORS", {"openai": mock_translator}):
+                    resp = await ac.post(
+                        "/admin/cache/warm",
+                        json={
+                            "prompts": [
+                                {"model": "mock-gpt-markdown", "messages": [{"role": "user", "content": "What is Java?"}]},
+                                {"model": "mock-gpt-markdown", "messages": [{"role": "user", "content": "What is Go?"}]},
+                            ]
+                        },
+                    )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["warmed"] == 2
+            assert data["errors"] == 0
