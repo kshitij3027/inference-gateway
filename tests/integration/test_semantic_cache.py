@@ -48,7 +48,7 @@ class TestCacheIntegration:
         async with app.router.lifespan_context(app):
             # Replace semantic_cache with a mock that returns miss
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.lookup = AsyncMock(return_value=(None, None, None))
             mock_cache.record_miss = AsyncMock()
             mock_cache.store = AsyncMock()
             app.state.semantic_cache = mock_cache
@@ -70,7 +70,7 @@ class TestCacheIntegration:
         cached = _make_response(content="cached: Paris")
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9812))
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9812, "L2_HIT"))
             mock_cache.record_hit = AsyncMock()
             app.state.semantic_cache = mock_cache
 
@@ -93,7 +93,7 @@ class TestCacheIntegration:
         cached = _make_response()
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9567))
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9567, "L2_HIT"))
             mock_cache.record_hit = AsyncMock()
             app.state.semantic_cache = mock_cache
 
@@ -145,7 +145,7 @@ class TestCacheIntegration:
         cached = _make_response(content="cached streamed response")
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9900))
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.9900, "L2_HIT"))
             mock_cache.record_hit = AsyncMock()
             app.state.semantic_cache = mock_cache
 
@@ -183,7 +183,7 @@ class TestCacheIntegration:
         ):
             async with app.router.lifespan_context(app):
                 mock_cache = AsyncMock()
-                mock_cache.lookup = AsyncMock(return_value=(None, None))
+                mock_cache.lookup = AsyncMock(return_value=(None, None, None))
                 mock_cache.record_miss = AsyncMock()
                 mock_cache.store = AsyncMock()
                 app.state.semantic_cache = mock_cache
@@ -213,7 +213,7 @@ class TestStampedeGuardIntegration:
         """On cache miss, stampede lock should be acquired and released."""
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.lookup = AsyncMock(return_value=(None, None, None))
             mock_cache.record_miss = AsyncMock()
             mock_cache.store = AsyncMock()
             mock_cache.acquire_stampede_lock = AsyncMock(return_value=(True, "cache:lock:abc"))
@@ -236,7 +236,7 @@ class TestStampedeGuardIntegration:
         cached = _make_response(content="stampede cached")
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.lookup = AsyncMock(return_value=(None, None, None))
             mock_cache.record_miss = AsyncMock()
             mock_cache.record_hit = AsyncMock()
             mock_cache.acquire_stampede_lock = AsyncMock(return_value=(False, "cache:lock:abc"))
@@ -259,7 +259,7 @@ class TestStampedeGuardIntegration:
         """When stampede wait times out, request should fall through to backend."""
         async with app.router.lifespan_context(app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(None, None))
+            mock_cache.lookup = AsyncMock(return_value=(None, None, None))
             mock_cache.record_miss = AsyncMock()
             mock_cache.store = AsyncMock()
             mock_cache.acquire_stampede_lock = AsyncMock(return_value=(False, "cache:lock:abc"))

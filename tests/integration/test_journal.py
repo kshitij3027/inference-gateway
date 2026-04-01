@@ -85,7 +85,7 @@ class TestJournalIntegration:
         async with app.router.lifespan_context(app):
             mock_journal = AsyncMock()
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(cached, 0.99))
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.99, "L2_HIT"))
             mock_cache.record_hit = AsyncMock()
             app.state.journal = mock_journal
             app.state.semantic_cache = mock_cache

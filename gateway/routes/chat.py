@@ -344,7 +344,7 @@ async def chat_completions(
 
     if semantic_cache is not None:
         try:
-            cached_response, cache_similarity = await semantic_cache.lookup(
+            cached_response, cache_similarity, _cache_tier = await semantic_cache.lookup(
                 model=chat_request.model,
                 messages=chat_request.messages,
                 tenant_id=tenant.id,

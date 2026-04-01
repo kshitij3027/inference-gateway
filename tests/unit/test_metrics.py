@@ -153,7 +153,7 @@ class TestMetricIncrements:
         cached = _make_response(content="cached")
         async with gateway_app.router.lifespan_context(gateway_app):
             mock_cache = AsyncMock()
-            mock_cache.lookup = AsyncMock(return_value=(cached, 0.98))
+            mock_cache.lookup = AsyncMock(return_value=(cached, 0.98, "L2_HIT"))
             mock_cache.record_hit = AsyncMock()
             gateway_app.state.semantic_cache = mock_cache
             gateway_app.state.queue_manager = None
