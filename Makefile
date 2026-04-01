@@ -1,4 +1,4 @@
-.PHONY: up down test logs build seed status
+.PHONY: up down test logs build seed status chaos chaos-down
 
 up:
 	docker compose up --build -d
@@ -21,3 +21,9 @@ seed:
 
 status:
 	@bash scripts/status.sh
+
+chaos:
+	docker compose -f docker-compose.yaml -f docker-compose.chaos.yml up --build -d
+
+chaos-down:
+	docker compose -f docker-compose.yaml -f docker-compose.chaos.yml down
