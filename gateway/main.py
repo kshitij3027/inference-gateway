@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -153,6 +154,9 @@ async def lifespan(app: FastAPI):
     except (OSError, AttributeError):
         logger.warning("sighup_not_available")
 
+    # Instance identification
+    app.state.instance_id = os.getenv("INSTANCE_ID", socket.gethostname())
+
     # Graceful shutdown state
     app.state.shutting_down = False
     app.state.inflight_count = 0
@@ -174,6 +178,7 @@ async def lifespan(app: FastAPI):
 
     logger.info(
         "gateway_started",
+        instance_id=app.state.instance_id,
         backends=len(config.backends),
         tenants=len(config.tenants),
     )
@@ -235,6 +240,9 @@ async def request_id_middleware(request: Request, call_next):
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
 
         response.headers["X-Request-ID"] = request_id
+        instance_id = getattr(request.app.state, "instance_id", None)
+        if instance_id:
+            response.headers["X-Instance-ID"] = instance_id
         backend_name = getattr(request.state, "backend_name", None)
         if backend_name:
             response.headers["X-Backend"] = backend_name
