@@ -2417,3 +2417,166 @@ For streaming requests (`client.stream()`), `ChaosHttpClient` returns a `_ChaosS
 
 **Q: "What happens if you accidentally deploy with CHAOS_ENABLED=true in production?"**
 **A:** Three safeguards exist. First, the chaos import is conditional (`if os.getenv("CHAOS_ENABLED", "false").lower() == "true"`) — it is not loaded by default. Second, enabling chaos emits a `chaos_mode_enabled` log at `warning` level with the full config, making it immediately visible in log aggregation. Third, the chaos configuration lives in `docker-compose.chaos.yml`, a separate override file that must be explicitly specified in the `docker compose -f` command — it is not part of the default `docker-compose.yaml` used by `make up`. That said, there is no runtime kill switch: if chaos is enabled, it stays enabled until the process restarts. A production-grade system would add a `/admin/chaos` toggle endpoint or read configuration from a feature flag service, allowing operators to disable chaos without restarting the gateway.
+
+## Multi-Instance Gateway
+
+### Why this exists
+
+A single gateway instance is a single point of failure. If the process crashes, the entire inference API is unavailable. Deploying new code requires stopping the service, which means dropped requests during every deployment. There is no way to scale horizontally — throughput is bounded by one process on one host. Multi-instance deployment solves three problems simultaneously: fault tolerance (one instance dies, others continue serving), zero-downtime deploys (rolling restart cycles through instances one at a time), and horizontal scaling (more instances means more concurrent request capacity).
+
+### How it works
+
+1. Three gateway instances (`gateway-1`, `gateway-2`, `gateway-3`) run as separate Docker Compose services, all built from the same Dockerfile and sharing the same configuration. Each instance receives a unique `INSTANCE_ID` environment variable.
+2. Nginx sits in front of all three instances as a reverse proxy and load balancer. The `upstream gateway_cluster` block lists all three instances with round-robin distribution — Nginx cycles through them sequentially, spreading load evenly.
+3. Clients connect to Nginx on port 8080. Nginx forwards each request to one of the three gateway instances via `proxy_pass http://gateway_cluster`. The client is unaware of which instance handles its request.
+4. All three instances share the same Redis server for state that must be consistent across the cluster: rate limiting (sorted set sliding windows), L2 semantic cache (hash keys), priority queue (sorted sets), and request journal (stream). This means a rate limit counter incremented by `gateway-1` is visible to `gateway-2` and `gateway-3` on the next request.
+5. L1 cache (in-process LRU) and circuit breaker state are per-instance by design. Each instance maintains its own view of backend health based on the requests it handles. This is an intentional trade-off: sharing circuit breaker state via Redis would add latency to every request for a marginal consistency benefit, since all instances talk to the same backends and will converge on similar state within seconds.
+6. Every response includes an `X-Instance-ID` header set in `request_id_middleware` in `gateway/main.py`. The value comes from `app.state.instance_id`, which is read from the `INSTANCE_ID` environment variable (falling back to `socket.gethostname()` if unset). This header enables request tracing through the load balancer — operators can correlate a specific response to a specific instance in logs.
+7. Rolling restart (`scripts/rolling-restart.sh`) deploys new code without dropping requests. For each instance in sequence: (a) `docker compose stop` sends SIGTERM, triggering the graceful shutdown handler that sets `app.state.shutting_down = True` and drains in-flight requests for up to 10 seconds; (b) `docker compose up -d --build` rebuilds and starts the instance; (c) the script polls `/health` via `curl` inside the container, waiting up to 30 seconds for a 200 response; (d) only after the instance is confirmed healthy does the script move to the next instance. During each restart, Nginx's passive health checks detect the stopped instance (connection refused counts toward `max_fails`) and route traffic to the remaining two.
+8. If any instance fails to become healthy within the 30-second timeout, the script aborts immediately with `exit 1`. This fail-fast behavior prevents a cascading failure where a bad build takes down all three instances sequentially.
+
+### Implementation
+
+**Docker Compose (`docker-compose.yaml`):**
+- `x-gateway-env` YAML anchor (`&gateway-env`) defines all shared environment variables once: `CONFIG_PATH`, `LOG_LEVEL`, tenant keys, provider keys, Redis URL, cache/queue tuning parameters.
+- `x-gateway-common` YAML anchor (`&gateway-common`) defines shared service configuration: build context and target, `stop_grace_period: 15s`, memory limit (2G), config volume mount (read-only), dependency declarations on Ollama/Redis/mock backends, and `restart: unless-stopped`.
+- Each gateway service (`gateway-1`, `gateway-2`, `gateway-3`) uses `<<: *gateway-common` for merge and `<<: *gateway-env` for environment, adding only the unique `INSTANCE_ID` and `container_name`.
+
+**Nginx (`nginx/nginx.conf`):**
+- `upstream gateway_cluster` with three servers, each configured with `max_fails=3 fail_timeout=10s`. After 3 consecutive failures, Nginx marks the upstream as unavailable for 10 seconds before retrying.
+- `proxy_buffering off` disables response buffering — essential for SSE streaming where tokens must reach the client immediately as the LLM generates them. Without this, Nginx would buffer the entire response before forwarding, defeating the purpose of streaming.
+- `proxy_http_version 1.1` with `Connection ''` enables HTTP keep-alive between Nginx and the gateway instances, avoiding per-request TCP handshake overhead.
+- Timeouts tuned for LLM workloads: `proxy_connect_timeout 5s` (fail fast if instance is down), `proxy_read_timeout 120s` (LLM inference can be slow), `proxy_send_timeout 30s` (request bodies are small).
+- `/nginx-health` endpoint returns 200 directly from Nginx without proxying — used to verify Nginx itself is running.
+
+**Instance identification (`gateway/main.py`):**
+- `app.state.instance_id = os.getenv("INSTANCE_ID", socket.gethostname())` set during lifespan startup.
+- `request_id_middleware` adds `X-Instance-ID: {instance_id}` to every response, including health checks, chat completions, and admin endpoints.
+
+**Graceful shutdown (`gateway/main.py`):**
+- SIGTERM handler sets `app.state.shutting_down = True`.
+- Middleware checks `shutting_down` on every request. If true, non-health/metrics endpoints receive 503 with `Retry-After: 5` header, telling clients and load balancers to retry elsewhere.
+- In-flight request tracking via `app.state.inflight_count` with an `asyncio.Lock` and `asyncio.Event`. On shutdown, the lifespan waits up to 10 seconds for in-flight requests to drain before closing connections.
+- `stop_grace_period: 15s` in Docker Compose gives the container 15 seconds after SIGTERM before SIGKILL — enough for the 10-second drain plus cleanup.
+
+**Rolling restart (`scripts/rolling-restart.sh`):**
+- `set -euo pipefail` — any command failure aborts the script immediately.
+- Accepts `--build` flag (passed by `make rolling-restart`) to rebuild images before starting.
+- Iterates through `gateway-1 gateway-2 gateway-3` sequentially.
+- Health probe uses `docker compose exec -T` to run `curl` inside the container, avoiding host networking assumptions. The `-T` flag disables TTY allocation for non-interactive use.
+- 30-second health timeout with 1-second polling interval.
+
+**Makefile:**
+- `make rolling-restart` runs `scripts/rolling-restart.sh --build`.
+
+### Key design decisions
+
+1. **Nginx over HAProxy or Traefik.** Nginx is the simplest option for this use case: a static upstream list with round-robin distribution and passive health checks. HAProxy offers more sophisticated load balancing algorithms (least connections, weighted) but requires more configuration. Traefik's service discovery features are unnecessary when the upstream list is static in Docker Compose. Nginx's `proxy_buffering off` directive is a single line that solves SSE streaming — achieving the same in HAProxy requires `option http-no-delay` plus careful tuning.
+
+2. **YAML anchors for DRY compose configuration.** Without anchors, the three gateway services would require 60+ lines of duplicated configuration. A change to the memory limit, a new environment variable, or a new dependency would require editing three services identically. The `x-gateway-common` and `x-gateway-env` anchors reduce this to a single source of truth. The `<<:` merge key combines the anchor with service-specific overrides (like `INSTANCE_ID`).
+
+3. **Passive health checks (open-source Nginx limitation).** Nginx Plus offers active health checks that probe backends on a schedule, detecting failures before client requests arrive. The open-source version only supports passive checks: Nginx counts failures observed during real request forwarding. This means the first `max_fails` requests after a backend goes down will fail before Nginx marks it unavailable. For a 3-instance cluster, this is acceptable — at most 3 requests hit a dead instance before Nginx routes around it. The `fail_timeout=10s` recovery window is short enough to detect a restarted instance quickly.
+
+4. **Per-instance circuit breakers (no shared state via Redis).** Circuit breakers track backend health based on recent failure rates. Sharing this state across instances via Redis would mean every request incurs a Redis round-trip for breaker state lookup and update — adding latency to the critical path. Since all instances talk to the same backends, their circuit breakers converge independently within a few seconds of failure onset. The worst case is that instance A trips its breaker on backend X while instance B is still sending a few more requests to backend X — a brief window of extra failures, not a correctness issue.
+
+5. **Rolling restart aborts on first failure.** If `gateway-2` fails to become healthy after rebuild, the script exits immediately rather than continuing to `gateway-3`. This prevents a scenario where a bad build takes down the entire cluster. The operator investigates `gateway-2`, fixes the issue, and re-runs the rolling restart. The alternative — skip the failed instance and continue — risks deploying a known-bad build to more instances.
+
+6. **`stop_grace_period: 15s` exceeds the 10-second drain timeout.** The drain timeout in `gateway/main.py` waits 10 seconds for in-flight requests to complete. Docker's `stop_grace_period` gives 15 seconds after SIGTERM before sending SIGKILL. This 5-second buffer ensures the Python process has time to close Redis and httpx connections after draining, rather than being killed mid-cleanup.
+
+### Alternatives considered
+
+1. **HAProxy.** More powerful load balancing algorithms (least connections, weighted round-robin) and built-in active health checks. Rejected because the configuration complexity is not justified for a 3-instance static upstream. HAProxy's SSE streaming support requires more tuning than Nginx's single `proxy_buffering off` directive.
+
+2. **Traefik.** Automatic service discovery via Docker labels, built-in Let's Encrypt, and a dashboard. Rejected because the service list is static (defined in docker-compose.yaml), TLS is not needed for local development, and Traefik's label-based configuration is harder to reason about than Nginx's explicit upstream block.
+
+3. **Shared circuit breaker state via Redis.** Would provide cluster-wide consistency: if one instance trips a breaker, all instances immediately stop sending to that backend. Rejected because: (a) every request would need a Redis read for breaker state and a Redis write for failure recording, adding 1-2ms latency to the critical path; (b) distributed breaker state introduces its own failure mode — if Redis is unavailable, breaker state is lost; (c) independent breakers converge within seconds, which is fast enough for a proxy where requests arrive continuously.
+
+4. **Nginx Plus active health checks.** Would detect backend failures proactively by polling `/health` endpoints on a schedule, removing backends before client requests fail. Rejected because Nginx Plus is a commercial product. The passive health check trade-off (up to `max_fails` requests fail before Nginx detects the issue) is acceptable for 3 instances with `max_fails=3`.
+
+5. **Kubernetes Deployment instead of Docker Compose.** Provides built-in rolling updates, readiness probes, horizontal pod autoscaler, and service discovery. Rejected because the project targets local development with `docker compose up`. The rolling restart script demonstrates the same concepts (health-gated sequential restart) at a smaller scale. Migration to Kubernetes is a deployment concern, not an architecture change.
+
+### Failure modes and edge cases
+
+- **All three instances down simultaneously.** Nginx returns 502 Bad Gateway for every request. No automatic recovery — requires operator intervention to restart instances. The `/nginx-health` endpoint still returns 200, so monitoring can distinguish between "Nginx is down" and "all upstreams are down."
+
+- **Nginx upstream pool exhausted.** If all three backends exceed `max_fails` within `fail_timeout`, Nginx marks all upstreams as unavailable. On the next request, Nginx resets and tries all backends again (round-robin through the "failed" list). This means Nginx does not permanently blackhole traffic — it retries after the fail window expires.
+
+- **Rolling restart during active failure.** If a backend (e.g., Ollama) is down and a rolling restart begins, the restarted instances inherit the same backend failure. Circuit breakers on restarted instances start in CLOSED state (fresh process), so they will re-discover the failure independently. This is a brief window of increased error rate until breakers trip again.
+
+- **L1 cache divergence after restart.** When an instance restarts, its in-process L1 cache is empty. The instance will experience a cold-cache period with higher L2 (Redis) hit rates until the L1 warms up. This is transient and self-correcting — no operator action needed.
+
+- **Split-brain rate limiting.** Rate limits are enforced via Redis (shared), so there is no split-brain for rate limiting. However, if Redis becomes unreachable, all instances degrade gracefully — rate limiting is disabled rather than enforced locally, which means a Redis failure temporarily removes rate limiting protection.
+
+- **Health check race during restart.** The rolling restart script polls `/health` inside the container via `docker compose exec`. There is a brief window after `docker compose up -d` where the container is running but the FastAPI process has not yet bound to port 8080. The `curl` probe fails during this window and retries on the next 1-second interval. The 30-second timeout is generous enough to accommodate slow startups (e.g., Redis connection, config parsing).
+
+- **SIGTERM during long-running LLM request.** If a gateway instance receives SIGTERM while proxying a 60-second LLM inference call, the graceful shutdown handler sets `shutting_down = True` and the drain waits up to 10 seconds. If the LLM call takes longer than 10 seconds to complete, the drain times out, and Docker sends SIGKILL 5 seconds later. The client receives a connection reset. This is the expected trade-off: the 15-second grace period cannot accommodate arbitrarily long LLM calls without blocking the rolling restart indefinitely.
+
+### Observability
+
+**Response headers:**
+- `X-Instance-ID` on every response identifies which gateway instance handled the request. Combined with `X-Request-ID`, this enables full request tracing through the load balancer layer.
+
+**Structured logs:**
+- `gateway_started` event includes `instance_id`, `backends` count, and `tenants` count — one log line per instance on startup.
+- `sigterm_received` logged when graceful shutdown begins.
+- `draining_inflight` with count logged when waiting for in-flight requests.
+- `drain_complete` or `drain_timeout` logged when drain finishes or times out.
+- `gateway_stopped` logged after all connections are closed.
+
+**Prometheus metrics:**
+- All three instances expose `/metrics` independently. Prometheus scrape config targets all three instances, so metrics are labeled per-instance. Grafana dashboards can filter or aggregate by instance.
+
+**Nginx:**
+- `/nginx-health` returns 200 if Nginx is running, independent of upstream health.
+- Nginx access logs (stdout by default in the `nginx:alpine` image) show upstream response times and status codes.
+
+**Rolling restart output:**
+- The script prints each step: stopping, starting, waiting for health, success/failure. On failure, it prints the instance name and abort message, providing a clear indication of which instance failed.
+
+### Testing
+
+**Unit/integration tests (`tests/integration/test_multi_instance.py`, 5 tests):**
+- `TestMultiInstanceHeaders` (4 tests): Verifies `X-Instance-ID` header is present on chat completion responses, health endpoint responses, and admin endpoint responses. Each test sets a different `INSTANCE_ID` via `monkeypatch.setenv` and asserts the header value matches. A fourth test iterates through all three instance IDs to verify each instance reports its own ID.
+- `TestSharedState` (2 tests): Architecture validation tests that confirm the rate limiter and L2 semantic cache are Redis-based (shared state) rather than in-process (per-instance state). These are structural assertions — the real multi-instance sharing is validated by Docker E2E tests.
+
+**E2E validation (Docker-based):**
+- `make up` starts all three gateway instances, Nginx, Redis, and backend mocks.
+- Requests to `http://localhost:8080/v1/chat/completions` are distributed across instances by Nginx round-robin.
+- The `X-Instance-ID` response header confirms which instance handled each request — sending multiple requests shows different instance IDs in the responses.
+- `make rolling-restart` performs a full rolling restart cycle, verifying zero-downtime deployment capability.
+
+**Load testing (Locust):**
+- `make loadtest` against the multi-instance cluster exercises Nginx load balancing under sustained traffic. The report shows request distribution and latency percentiles across the instance pool.
+
+### Production gaps
+
+- **No active health checks.** Nginx open-source only supports passive health checks. Up to 3 requests may fail before Nginx routes around a dead instance. A production deployment would use Nginx Plus, HAProxy, or a cloud load balancer with active health probes that detect failures before they impact client traffic.
+
+- **No autoscaling.** The instance count (3) is static in docker-compose.yaml. A production deployment would use Kubernetes Horizontal Pod Autoscaler or cloud auto-scaling groups to adjust instance count based on CPU, memory, or request queue depth.
+
+- **No sticky sessions.** Round-robin distribution means sequential requests from the same client may hit different instances. This is fine for stateless chat completions, but if the gateway adds features like conversation context or session state, sticky sessions (via IP hash or cookie-based affinity) would be needed.
+
+- **No connection draining at the Nginx level.** When an upstream is removed, Nginx drops existing connections immediately. A production setup would use `drain` directives (Nginx Plus) or a service mesh sidecar (Envoy) to finish in-flight requests on the old instance before removing it from the pool.
+
+- **No blue-green or canary deployments.** Rolling restart deploys the same build to all instances sequentially. There is no mechanism to route a percentage of traffic to a new version while keeping the old version running. A production system would use weighted upstream groups or a service mesh traffic split.
+
+- **No TLS between Nginx and gateway instances.** Traffic between Nginx and the gateway instances is unencrypted on the Docker network. In production, this would use mTLS or a service mesh for internal encryption.
+
+### Interview talking points
+
+- The YAML anchor pattern (`x-gateway-common`, `x-gateway-env`) is a practical DRY technique that eliminates configuration drift between instances. When a new environment variable is added, it goes in one place. The `<<:` merge key with per-service overrides (like `INSTANCE_ID`) demonstrates the YAML merge key specification — a feature many developers are unaware of. The trade-off is readability: someone unfamiliar with YAML anchors must trace the `*gateway-common` reference to understand what a service inherits.
+
+- The graceful shutdown sequence (SIGTERM -> reject new requests with 503 + Retry-After -> drain in-flight -> close connections -> SIGKILL after grace period) is the standard pattern used by Kubernetes, ECS, and other orchestration systems. The gateway implements it explicitly so the rolling restart script can depend on it. The 503 with `Retry-After` header is important: it tells the load balancer and clients to retry on another instance rather than treating the response as a permanent error.
+
+- Per-instance circuit breakers are an intentional architectural choice, not a simplification. Sharing breaker state via Redis makes every request depend on Redis for the critical-path decision "should I send to this backend." If Redis is slow or unavailable, every request pays the latency penalty or loses breaker protection. Independent breakers mean each instance is self-sufficient for routing decisions, and the worst case of state divergence is a few extra failed requests during the convergence window — seconds, not minutes.
+
+### Likely interview questions
+
+**Q: "Why not use Kubernetes instead of Docker Compose with a rolling restart script?"**
+**A:** The rolling restart script demonstrates the same fundamental concepts as a Kubernetes rolling update: health-gated sequential replacement, graceful shutdown with drain, and abort on failure. Docker Compose is the appropriate tool for local development and demonstration. Migrating to Kubernetes would replace the script with a Deployment spec (`strategy: RollingUpdate`, `maxUnavailable: 1`, `readinessProbe`), but the gateway code is unchanged — the SIGTERM handler, health endpoint, and graceful drain work identically in both environments. The script makes the deployment mechanics explicit and inspectable, which is valuable for understanding what Kubernetes automates.
+
+**Q: "What happens if Redis goes down while all three instances are running?"**
+**A:** All three instances degrade gracefully and identically. Rate limiting is disabled (requests pass through unchecked), L2 cache is unavailable (every request goes to the backend), the priority queue is unavailable (requests are processed immediately without queuing), and the request journal stops recording. L1 cache and circuit breakers continue working because they are in-process. The gateway remains functional for its primary purpose (proxying LLM requests) — it loses rate limiting, caching, and queuing but does not crash or reject requests. When Redis recovers, all three instances reconnect and resume shared state operations.
+
+**Q: "How do you handle the L1 cache being different on each instance?"**
+**A:** L1 cache divergence is expected and acceptable. Each instance caches responses it has seen based on its own traffic. With round-robin distribution, each instance sees roughly one-third of total traffic, so L1 hit rates are lower per-instance than they would be with a single instance. However, the L2 cache in Redis is shared, so a cache miss in instance A's L1 may still hit instance B's L2 entry. The net effect is that L1 provides a fast-path optimization (no Redis round-trip) for repeated requests to the same instance, while L2 provides cluster-wide cache coverage. This two-tier design means adding instances does not reduce cache effectiveness — it only changes the L1/L2 hit ratio.
