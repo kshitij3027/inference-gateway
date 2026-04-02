@@ -1,4 +1,4 @@
-.PHONY: up down test logs build seed status chaos chaos-down loadtest
+.PHONY: up down test logs build seed status chaos chaos-down loadtest rolling-restart
 
 up:
 	docker compose up --build -d
@@ -35,3 +35,6 @@ loadtest:
 	  --host http://localhost:8080 \
 	  --headless -u 20 -r 5 -t 60s \
 	  --html /mnt/locust/report.html
+
+rolling-restart:
+	@bash scripts/rolling-restart.sh --build
