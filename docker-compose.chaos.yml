@@ -1,10 +1,19 @@
 # Chaos testing override — use with: docker compose -f docker-compose.yaml -f docker-compose.chaos.yml up
+x-chaos-env: &chaos-env
+  CHAOS_ENABLED: "true"
+  CHAOS_ERROR_RATE: "0.10"
+  CHAOS_TIMEOUT_RATE: "0.05"
+  CHAOS_LATENCY_RATE: "0.30"
+  CHAOS_LATENCY_MIN_MS: "50"
+  CHAOS_LATENCY_MAX_MS: "2000"
+
 services:
-  gateway:
+  gateway-1:
     environment:
-      - CHAOS_ENABLED=true
-      - CHAOS_ERROR_RATE=0.10
-      - CHAOS_TIMEOUT_RATE=0.05
-      - CHAOS_LATENCY_RATE=0.30
-      - CHAOS_LATENCY_MIN_MS=50
-      - CHAOS_LATENCY_MAX_MS=2000
+      <<: *chaos-env
+  gateway-2:
+    environment:
+      <<: *chaos-env
+  gateway-3:
+    environment:
+      <<: *chaos-env

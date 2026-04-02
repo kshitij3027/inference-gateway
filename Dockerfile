@@ -25,6 +25,7 @@ COPY --from=base /root/.cache/huggingface /home/appuser/.cache/huggingface
 RUN chown -R appuser:appuser /home/appuser/.cache
 COPY gateway/ gateway/
 COPY config/ config/
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 EXPOSE 8080
 USER appuser
 CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]

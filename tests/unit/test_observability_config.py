@@ -25,7 +25,9 @@ class TestPrometheusConfig:
         data = yaml.safe_load(config_path.read_text())
         gateway_job = next(j for j in data["scrape_configs"] if j["job_name"] == "gateway")
         targets = gateway_job["static_configs"][0]["targets"]
-        assert "gateway:8080" in targets
+        assert "gateway-1:8080" in targets
+        assert "gateway-2:8080" in targets
+        assert "gateway-3:8080" in targets
 
 
 class TestGrafanaDatasource:
