@@ -2580,3 +2580,178 @@ A single gateway instance is a single point of failure. If the process crashes, 
 
 **Q: "How do you handle the L1 cache being different on each instance?"**
 **A:** L1 cache divergence is expected and acceptable. Each instance caches responses it has seen based on its own traffic. With round-robin distribution, each instance sees roughly one-third of total traffic, so L1 hit rates are lower per-instance than they would be with a single instance. However, the L2 cache in Redis is shared, so a cache miss in instance A's L1 may still hit instance B's L2 entry. The net effect is that L1 provides a fast-path optimization (no Redis round-trip) for repeated requests to the same instance, while L2 provides cluster-wide cache coverage. This two-tier design means adding instances does not reduce cache effectiveness — it only changes the L1/L2 hit ratio.
+
+## Token-Level Streaming Analytics
+
+### Why this exists
+
+Total request latency (measured by `gateway_request_duration_seconds`) is a single number that conflates two fundamentally different phases of LLM inference: the time the model spends processing the prompt before producing any output, and the time it spends generating tokens sequentially. These phases have different causes, different optimization levers, and different user-facing impact.
+
+**Time to first token (TTFT)** measures perceived responsiveness — how long the user stares at a blank screen before text begins appearing. A high TTFT indicates the model is slow to start, which could mean prompt processing is bottlenecked (long context window), the backend is overloaded (queuing before inference begins), or the network path to the backend is slow. TTFT is the single most important metric for user experience in streaming LLM applications.
+
+**Inter-token latency (ITL)** measures generation consistency — the time between consecutive content tokens. Steady ITL means smooth text streaming; spiky ITL means visible stuttering. High ITL can indicate GPU memory pressure, KV cache eviction, or backend contention during generation. ITL is the metric that distinguishes "fast model, slow start" from "slow model, fast start."
+
+**Generation duration** measures the total time from the first content token to the last, capturing the full generation phase independent of prompt processing time. Combined with token count, this yields effective tokens-per-second — the throughput metric that matters for capacity planning.
+
+Without these three metrics, an operator seeing `gateway_request_duration_seconds` p99 = 8 seconds cannot distinguish between "the model takes 6 seconds to start but generates fast" (TTFT problem) and "the model starts instantly but generates slowly" (ITL problem). The remediation is completely different: the first requires prompt optimization or a faster backend; the second requires a faster model or more GPU memory.
+
+### How it works
+
+1. Client sends `POST /v1/chat/completions` with `"stream": true`. The gateway resolves the backend, acquires a concurrency slot, and begins proxying SSE chunks from the backend.
+
+2. The raw SSE generator from the backend translator is wrapped in `_wrap_stream_with_analytics()`. This wrapper sits in the streaming chain between the circuit breaker wrapper (innermost, closest to the backend) and the latency tracker wrapper (next layer out). This position captures timing closest to actual backend behavior, excluding downstream processing overhead.
+
+3. The wrapper records `start_time = time.perf_counter()` (passed from the caller at stream creation time) and iterates over incoming SSE chunks.
+
+4. For each chunk that starts with `data: ` and is not `data: [DONE]`, the wrapper parses the JSON payload and checks if `choices[0].delta.content` is non-empty — this indicates a content token (as opposed to a role token, tool call, or stop signal).
+
+5. On the **first content token**: the wrapper computes `ttft = now - start_time`, records it in the `gateway_ttft_seconds` histogram with `[model, backend]` labels, yields the original chunk, then yields an SSE comment `": ttft_ms=X\n\n"`. The SSE comment is a valid SSE line (starts with `:`) that compliant clients ignore but that can be observed in network traces and test assertions.
+
+6. On **subsequent content tokens**: the wrapper computes `itl = now - last_content_time` and records it in the `gateway_itl_seconds` histogram. No additional SSE output is emitted for ITL — recording every ITL as an SSE comment would bloat the response.
+
+7. When the `data: [DONE]` sentinel arrives: if at least two content tokens were received (meaning both `first_content_time` and `last_content_time` are set and differ), the wrapper computes `generation_duration = last_content_time - first_content_time` and records it in the `gateway_generation_duration_seconds` histogram.
+
+8. All original SSE chunks pass through unmodified. The only addition to the stream is the single `": ttft_ms=X"` comment after the first content token.
+
+### Implementation
+
+**Prometheus histograms** (`gateway/observability/metrics.py`):
+
+- `gateway_ttft_seconds` — Time to first content token. Labels: `[model, backend]`. Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`. The bucket range covers sub-10ms local inference through 10-second cold starts. The lower buckets (10ms, 25ms) are relevant for GPU-accelerated backends; the upper buckets (5s, 10s) capture CPU inference and overloaded backends.
+
+- `gateway_itl_seconds` — Inter-token latency. Labels: `[model, backend]`. Buckets: `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]`. Tighter bucket range than TTFT because ITL is typically much shorter — a healthy GPU backend produces tokens at 5-50ms intervals. The 1-second upper bound captures severely degraded generation.
+
+- `gateway_generation_duration_seconds` — Duration from first to last content token. Labels: `[model, backend]`. Buckets: `[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]`. Wide range to accommodate short completions (a few tokens) through long generations (multi-paragraph responses on CPU).
+
+**Streaming wrapper** (`gateway/routes/chat.py: _wrap_stream_with_analytics`):
+
+- Async generator that wraps the upstream generator, maintaining `first_content_time` and `last_content_time` state across chunks.
+- JSON parsing is wrapped in `except (json.JSONDecodeError, IndexError, KeyError): pass` — malformed chunks are yielded through without recording metrics, ensuring the stream is never broken by a parse failure.
+- The SSE comment format `": ttft_ms=X\n\n"` uses the SSE comment syntax (line starting with `:`). The `\n\n` suffix follows the SSE event boundary convention.
+
+**Streaming chain insertion** (`gateway/routes/chat.py`, streaming path):
+
+```
+raw_gen (backend translator)
+  -> _wrap_stream_with_circuit_breaker  (CB success/failure recording)
+  -> _wrap_stream_with_analytics        (TTFT/ITL/generation duration)
+  -> _wrap_stream_with_latency          (overall request latency)
+  -> _tee_stream_for_cache              (buffer + cache store)
+  -> _wrap_stream_with_slot_release     (concurrency slot release)
+  -> _wrap_stream_with_journal          (journal + token metrics)
+```
+
+**Grafana dashboard** (`grafana/provisioning/dashboards/streaming-analytics.json`):
+
+Six panels:
+1. **TTFT P50/P95/P99** — time series of `histogram_quantile` over `gateway_ttft_seconds_bucket`.
+2. **ITL P50/P95/P99** — time series of `histogram_quantile` over `gateway_itl_seconds_bucket`.
+3. **Generation Duration by Model** — time series of generation duration percentiles, split by model.
+4. **Effective Tokens/Second** — derived metric: `rate(gateway_generation_duration_seconds_count)` / `rate(gateway_generation_duration_seconds_sum)` gives average tokens per second throughput.
+5. **TTFT Heatmap** — histogram heatmap showing TTFT distribution density over time, revealing bimodal distributions (e.g., cold vs warm model loads).
+6. **ITL Heatmap** — histogram heatmap showing ITL distribution density, revealing generation stuttering patterns.
+
+### Key design decisions
+
+1. **SSE comment for TTFT, not an HTTP header.** In a streaming response, HTTP headers are sent before the body begins — by the time the first content token arrives, the header phase is long over. An HTTP response header cannot carry TTFT because the value is not known when headers are written. An SSE comment (line starting with `:`) is the correct mechanism: it is part of the event stream body, it is ignored by compliant SSE clients (per the W3C spec), and it can be emitted at exactly the right time — immediately after the first content token.
+
+2. **Labels `[model, backend]` only, not `[model, backend, tenant]`.** Adding `tenant` as a label would create a cardinality explosion: `N_tenants * N_models * N_backends` time series per histogram, each with 8-10 buckets. For 100 tenants, 5 models, and 3 backends, that is 1,500 time series per metric, times 10 buckets, times 3 metrics = 45,000 series. The `[model, backend]` labels keep cardinality at `5 * 3 = 15` series per metric — manageable by any Prometheus instance. Per-tenant streaming analytics can be derived from logs or a dedicated analytics pipeline.
+
+3. **Wrapper positioned between circuit breaker and latency tracker.** The analytics wrapper measures raw backend streaming performance. Placing it inside the circuit breaker wrapper means the CB has already started recording; placing it outside the latency wrapper means latency measurement includes the full pipeline. The analytics wrapper captures the timing that matters: when the backend actually produced content tokens, not when they were processed by outer layers.
+
+4. **AI-specific histogram bucket ranges.** Standard HTTP latency buckets (50ms-60s) are wrong for LLM streaming. TTFT needs sub-25ms buckets to distinguish fast GPU inference from slow CPU inference. ITL needs sub-10ms buckets because GPU-accelerated generation produces tokens at 5-50ms intervals. Generation duration needs buckets up to 120 seconds for long completions on slow hardware. The bucket choices were informed by observed latency distributions from Ollama (CPU), vLLM (GPU), and OpenAI API (cloud).
+
+5. **Single SSE comment, not per-token comments.** Emitting a comment for every ITL observation would add significant overhead to the response body (one extra line per token, potentially hundreds of extra lines). TTFT is the one metric that benefits from in-stream visibility (for client-side measurement and debugging). ITL is recorded server-side in Prometheus and does not need to be visible in the stream.
+
+### Alternatives considered
+
+1. **HTTP trailer headers.** HTTP trailers are sent after the response body completes — they could carry TTFT, ITL statistics, and generation duration. However, HTTP trailer support is inconsistent: many HTTP/1.1 clients ignore trailers, most proxy servers strip them, and the `fetch()` API in browsers does not expose them. Trailers would solve the "headers are sent too early" problem but introduce a "most clients cannot read trailers" problem.
+
+2. **Custom SSE event type (`event: metrics`).** A dedicated SSE event with a JSON payload containing all streaming metrics would be clean and structured. However, SSE clients that do not register a handler for the `metrics` event type will fire `onerror` in some implementations. This breaks the "transparent proxy" contract — clients expecting only OpenAI-format events would receive unexpected event types. An SSE comment is the safe choice: it is defined by the SSE spec as ignorable.
+
+3. **Response header with TTFT (set before body).** Impossible by definition. For streaming responses, headers are flushed before the first byte of the body. TTFT is not known until the first content token arrives, which is part of the body. This alternative is architecturally infeasible for SSE/chunked-transfer responses.
+
+4. **Separate metrics endpoint for streaming stats.** Recording metrics only in Prometheus (no in-stream signal) was considered. This works for server-side monitoring but provides no client-side visibility. The SSE comment is a low-cost addition that enables client-side TTFT measurement without modifying the data format.
+
+### Failure modes and edge cases
+
+- **No content tokens in the stream.** If the model returns only a role delta and a stop signal without any `content` in the delta, `first_content_time` remains `None` and no TTFT, ITL, or generation duration metrics are recorded. This is correct behavior — there is nothing to measure. This can happen with function-calling responses where the model returns a tool call instead of text content.
+
+- **Single content token.** TTFT is recorded. ITL is not recorded (there is no inter-token interval with only one token). Generation duration is recorded as 0 (or very near 0) because `first_content_time == last_content_time`. The `data: [DONE]` handler checks that both `first_content_time` and `last_content_time` are set, and since they are the same reference point, `gen_dur` is 0. This is technically correct but may skew generation duration histograms — a production system might skip recording duration for single-token responses.
+
+- **JSON parse failure on a chunk.** The `except (json.JSONDecodeError, IndexError, KeyError): pass` block ensures that a malformed chunk does not break the stream or the metrics. The chunk is yielded through unmodified. This means a corrupt chunk that actually contained content will not be counted in TTFT/ITL — an acceptable trade-off versus crashing the stream.
+
+- **Backend sends content in the role chunk.** Some backends (non-standard) might include `content` in the same delta as `role`. The wrapper treats this as the first content token, which is technically correct — it is the first chunk with content. The TTFT measurement starts from stream creation, so it captures the full prompt-processing time regardless of which delta field accompanies the content.
+
+- **Very fast generation (sub-millisecond ITL).** If the backend (or a mock in tests) produces tokens faster than `time.perf_counter()` resolution, ITL values may be 0.0. These are still valid histogram observations and accumulate in the lowest bucket. This is expected in test environments and with cached/mock responses.
+
+- **Stream error mid-generation.** If the backend stream errors after some content tokens have been produced, the circuit breaker wrapper (inner layer) records the failure. The analytics wrapper has already recorded TTFT and some ITL observations. Generation duration is not recorded because `data: [DONE]` is never received. This means partial generations produce partial metrics — TTFT and ITL reflect what actually happened, and the absence of a generation duration observation correctly indicates an incomplete generation.
+
+### Observability
+
+**Prometheus metrics (3 histograms):**
+- `gateway_ttft_seconds{model, backend}` — one observation per streaming request that produces at least one content token.
+- `gateway_itl_seconds{model, backend}` — N-1 observations per streaming request that produces N content tokens.
+- `gateway_generation_duration_seconds{model, backend}` — one observation per streaming request that produces at least two content tokens and completes with `[DONE]`.
+
+**SSE comment:**
+- `": ttft_ms=X"` appears in the event stream after the first content chunk. Visible in browser DevTools network tab, `curl` output, and test assertions. Value is in milliseconds (human-readable), rounded to 2 decimal places.
+
+**Grafana dashboard ("Streaming Analytics"):**
+- TTFT percentile trends (P50/P95/P99) — detect prompt processing regressions.
+- ITL percentile trends (P50/P95/P99) — detect generation stuttering.
+- Generation duration by model — compare generation speed across models.
+- Effective tokens/second — derived throughput metric for capacity planning.
+- TTFT and ITL heatmaps — reveal distribution shape (unimodal vs bimodal), which percentile charts obscure.
+
+### Testing
+
+**Unit tests (`tests/unit/test_streaming_analytics.py`, 7 tests):**
+- `test_ttft_metric_recorded` — verifies `gateway_ttft_seconds_count` is incremented after consuming a stream with content tokens.
+- `test_sse_comment_after_first_content` — verifies the SSE comment `": ttft_ms=X"` appears immediately after the first content chunk, with a valid non-negative float value.
+- `test_itl_between_content_tokens` — verifies `gateway_itl_seconds_count` has 2 observations for a stream with 3 content tokens (a->b and b->c intervals).
+- `test_generation_duration_at_done` — verifies `gateway_generation_duration_seconds_count` is incremented when `data: [DONE]` is received after content tokens.
+- `test_no_content_no_metrics` — verifies no TTFT metric is recorded when the stream contains only role and stop deltas with no content.
+- `test_original_chunks_preserved` — verifies all original SSE chunks pass through the wrapper unmodified, with exactly one additional SSE comment.
+- `test_single_content_token` — verifies TTFT is recorded but ITL is not when the stream contains only one content token.
+
+**Integration tests (`tests/integration/test_streaming.py`, 2 tests in `TestStreamingAnalytics`):**
+- `test_stream_contains_ttft_comment` — full-stack test through FastAPI with mocked backend translator, asserting the SSE comment is present in the response body with a valid TTFT value.
+- `test_ttft_comment_is_valid_sse` — verifies the TTFT comment is valid SSE syntax (starts with `:`) and that all original data lines are preserved alongside the comment.
+
+**E2E validation (Docker):**
+- `make test` runs all unit and integration tests inside Docker, including the streaming analytics tests.
+- Manual verification: `curl -N` to the streaming endpoint shows the `": ttft_ms=X"` comment in the SSE output, and the Prometheus `/metrics` endpoint shows populated `gateway_ttft_seconds`, `gateway_itl_seconds`, and `gateway_generation_duration_seconds` histograms.
+
+### Production gaps
+
+- **No per-tenant streaming analytics.** The `[model, backend]` label set excludes tenant identity. A production system with per-tenant SLAs on TTFT or ITL would need either higher-cardinality metrics (with careful label management) or a separate analytics pipeline that correlates streaming timing with tenant identity from logs.
+
+- **No client-side ITL measurement.** Only TTFT is exposed in the SSE stream. Clients that want to measure ITL must implement their own timing between received chunks, which includes network jitter and client-side buffering — not purely backend ITL. A production system might expose a post-request analytics endpoint where clients report their observed timing.
+
+- **No alerting rules.** The Grafana dashboard visualizes streaming metrics but no Prometheus alerting rules are defined for TTFT or ITL thresholds. A production system would alert on TTFT p95 exceeding an SLA threshold (e.g., 2 seconds) or ITL p95 exceeding a stuttering threshold (e.g., 200ms).
+
+- **No token counting in the analytics wrapper.** The wrapper measures timing between content deltas but does not count tokens. The "effective tokens/second" Grafana panel derives throughput from duration histogram rates, which is an approximation. Accurate tokens-per-second requires counting tokens in the analytics wrapper, which would duplicate logic already in the journal wrapper.
+
+- **No streaming analytics for cached responses.** When a cached response is streamed via `_stream_cached_response`, it bypasses the analytics wrapper. Cached streaming responses produce artificially fast TTFT/ITL that do not reflect real backend performance. This is correct for backend monitoring but means the dashboard underreports total streaming volume.
+
+### Interview talking points
+
+- TTFT and ITL are the two metrics that matter most for streaming LLM inference, yet most gateway implementations only measure total request duration. TTFT tells you if the model is slow to start (prompt processing, queue wait, cold start); ITL tells you if generation is consistent or stuttering (GPU contention, KV cache pressure, memory bandwidth). Separating these metrics enables targeted optimization — you fix TTFT problems differently than ITL problems.
+
+- The SSE comment mechanism (`": ttft_ms=X"`) demonstrates understanding of the SSE specification. Comments (lines starting with `:`) are defined by the W3C Server-Sent Events spec as lines that must be ignored by the client. This makes them a safe channel for out-of-band metadata in a streaming response without modifying the data format or breaking client parsers. The alternative (HTTP headers) is architecturally impossible for streaming responses because headers are committed before the body begins.
+
+- The histogram bucket ranges are intentionally tuned for LLM inference workloads, not generic HTTP traffic. TTFT buckets go down to 10ms (GPU inference can start producing tokens in under 25ms) and up to 10 seconds (CPU inference on large models). ITL buckets go down to 5ms (GPU token generation speed) and up to 1 second (severely degraded generation). Using default Prometheus buckets would put most observations in a single bucket, making percentile calculations meaningless.
+
+- The wrapper chain ordering (circuit breaker -> analytics -> latency -> cache -> slot release -> journal) is deliberate. Analytics sits just outside the circuit breaker because it needs to measure raw backend timing. Latency sits outside analytics because it measures the full request duration including analytics overhead. Cache sits outside latency because it needs to see the final stream. This layered composition of async generators is a practical application of the decorator pattern for streaming pipelines.
+
+### Likely interview questions
+
+**Q: "Why not use an HTTP trailer to send TTFT after the stream completes?"**
+**A:** HTTP trailers are sent after the response body ends, so they could theoretically carry TTFT. The problem is client support: most HTTP/1.1 clients ignore trailers, many proxies and CDNs strip them, and browser `fetch()` does not expose them. More fundamentally, the value of TTFT is as a real-time signal — knowing TTFT after the entire response has finished is less useful than knowing it at the moment the first token arrives. The SSE comment provides TTFT at exactly the right time in the stream, to any client that inspects the raw event stream.
+
+**Q: "Why not include tenant in the histogram labels?"**
+**A:** Prometheus histograms are expensive — each label combination creates a separate time series, and each time series has one counter per bucket. With `[model, backend, tenant]` labels and 100 tenants, 5 models, 3 backends, and 10 buckets per histogram, that is 45,000 time series for a single metric. Multiply by 3 metrics and the cardinality reaches 135,000 series — enough to cause memory pressure on a typical Prometheus instance. The `[model, backend]` labels give operational insight (which models are slow on which backends) without tenant-level granularity. Per-tenant analytics should use a sampling-based approach or a dedicated time-series database designed for high cardinality.
+
+**Q: "How would you detect if a model has bimodal TTFT — sometimes fast, sometimes slow?"**
+**A:** The TTFT heatmap panel in the Grafana dashboard reveals distribution shape directly. A unimodal distribution appears as a single horizontal band; a bimodal distribution appears as two bands. Percentile charts (P50/P95/P99) obscure bimodality because they reduce the distribution to point estimates. For example, if 80% of requests have 50ms TTFT and 20% have 5 seconds (cold start), the P50 is 50ms (looks fine) and the P95 is 5 seconds (looks bad), but neither tells you there are two distinct populations. The heatmap shows both clusters. This is why the dashboard includes both percentile lines and heatmaps — they answer different questions about the same data.
