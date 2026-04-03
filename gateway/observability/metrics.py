@@ -82,3 +82,26 @@ HEDGE_WIN_RATE = Counter(
     "Hedge wins per backend",
     ["backend", "model"],
 )
+
+# --- Streaming analytics metrics ---
+
+TTFT = Histogram(
+    "gateway_ttft_seconds",
+    "Time to first content token in seconds",
+    ["model", "backend"],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+
+ITL = Histogram(
+    "gateway_itl_seconds",
+    "Inter-token latency in seconds",
+    ["model", "backend"],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+)
+
+GENERATION_DURATION = Histogram(
+    "gateway_generation_duration_seconds",
+    "Duration from first token to last token in seconds",
+    ["model", "backend"],
+    buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
+)
