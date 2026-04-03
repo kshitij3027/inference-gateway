@@ -26,9 +26,12 @@ from gateway.models import (
 from gateway.observability.metrics import (
     ACTIVE_REQUESTS,
     CACHE_OPERATIONS,
+    GENERATION_DURATION,
+    ITL,
     QUEUE_DEPTH,
     RATE_LIMIT_REJECTIONS,
     TOKENS_CONSUMED,
+    TTFT,
 )
 
 router = APIRouter()
@@ -63,6 +66,57 @@ async def _wrap_stream_with_latency(gen, latency_tracker, backend_name, model, s
         if latency_tracker:
             duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
             latency_tracker.record(backend_name, model, duration_ms)
+
+
+async def _wrap_stream_with_analytics(gen, model, backend_name, start_time):
+    """Measure TTFT, ITL, and generation duration for streaming responses.
+
+    Emits an SSE comment (: ttft_ms=X) after the first content token.
+    Records gateway_ttft_seconds, gateway_itl_seconds, and
+    gateway_generation_duration_seconds Prometheus histograms.
+    """
+    first_content_time = None
+    last_content_time = None
+
+    async for chunk in gen:
+        if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+            try:
+                data = json.loads(chunk[6:])
+                choices = data.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if delta.get("content"):
+                        now = time.perf_counter()
+                        if first_content_time is None:
+                            first_content_time = now
+                            ttft = now - start_time
+                            TTFT.labels(
+                                model=model, backend=backend_name
+                            ).observe(ttft)
+                            yield chunk
+                            yield f": ttft_ms={round(ttft * 1000, 2)}\n\n"
+                            last_content_time = now
+                            continue
+                        else:
+                            itl = now - last_content_time
+                            ITL.labels(
+                                model=model, backend=backend_name
+                            ).observe(itl)
+                            last_content_time = now
+            except (json.JSONDecodeError, IndexError, KeyError):
+                pass
+
+        if (
+            chunk.strip() == "data: [DONE]"
+            and first_content_time is not None
+            and last_content_time is not None
+        ):
+            gen_dur = last_content_time - first_content_time
+            GENERATION_DURATION.labels(
+                model=model, backend=backend_name
+            ).observe(gen_dur)
+
+        yield chunk
 
 
 async def _tee_stream_for_cache(gen, semantic_cache, model, messages, tenant_id, cache_isolation):
