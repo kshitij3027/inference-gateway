@@ -563,6 +563,9 @@ async def chat_completions(
         )
 
         wrapped_gen = _wrap_stream_with_circuit_breaker(raw_gen, cb)
+        wrapped_gen = _wrap_stream_with_analytics(
+            wrapped_gen, chat_request.model, backend.name, time.perf_counter()
+        )
         latency_tracker = getattr(request.app.state, "latency_tracker", None)
         if latency_tracker:
             wrapped_gen = _wrap_stream_with_latency(
