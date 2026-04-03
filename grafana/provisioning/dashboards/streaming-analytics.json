@@ -170,66 +170,110 @@
     },
     {
       "id": 5,
-      "type": "heatmap",
-      "title": "TTFT Heatmap",
+      "type": "timeseries",
+      "title": "TTFT Distribution (Bucket Rates)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "options": {
-        "calculate": false,
-        "yAxis": {
-          "unit": "s"
-        },
-        "color": {
-          "scheme": "Oranges"
-        },
-        "cellGap": 1,
-        "tooltip": {
-          "show": true
-        }
-      },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": { "mode": "normal" },
+            "showPoints": "never"
+          }
+        },
         "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(gateway_ttft_seconds_bucket[1m])) by (le)",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
+          "expr": "sum(rate(gateway_ttft_seconds_bucket{le=\"0.01\"}[5m]))",
+          "legendFormat": "≤10ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(gateway_ttft_seconds_bucket{le=\"0.05\"}[5m])) - sum(rate(gateway_ttft_seconds_bucket{le=\"0.01\"}[5m]))",
+          "legendFormat": "10-50ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(gateway_ttft_seconds_bucket{le=\"0.25\"}[5m])) - sum(rate(gateway_ttft_seconds_bucket{le=\"0.05\"}[5m]))",
+          "legendFormat": "50-250ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(gateway_ttft_seconds_bucket{le=\"1.0\"}[5m])) - sum(rate(gateway_ttft_seconds_bucket{le=\"0.25\"}[5m]))",
+          "legendFormat": "250ms-1s",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(gateway_ttft_seconds_bucket{le=\"+Inf\"}[5m])) - sum(rate(gateway_ttft_seconds_bucket{le=\"1.0\"}[5m]))",
+          "legendFormat": ">1s",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
       ]
     },
     {
       "id": 6,
-      "type": "heatmap",
-      "title": "ITL Heatmap",
+      "type": "timeseries",
+      "title": "ITL Distribution (Bucket Rates)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "options": {
-        "calculate": false,
-        "yAxis": {
-          "unit": "s"
-        },
-        "color": {
-          "scheme": "Oranges"
-        },
-        "cellGap": 1,
-        "tooltip": {
-          "show": true
-        }
-      },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": { "mode": "normal" },
+            "showPoints": "never"
+          }
+        },
         "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(gateway_itl_seconds_bucket[1m])) by (le)",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
+          "expr": "sum(rate(gateway_itl_seconds_bucket{le=\"0.005\"}[5m]))",
+          "legendFormat": "≤5ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(gateway_itl_seconds_bucket{le=\"0.01\"}[5m])) - sum(rate(gateway_itl_seconds_bucket{le=\"0.005\"}[5m]))",
+          "legendFormat": "5-10ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(gateway_itl_seconds_bucket{le=\"0.05\"}[5m])) - sum(rate(gateway_itl_seconds_bucket{le=\"0.01\"}[5m]))",
+          "legendFormat": "10-50ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(gateway_itl_seconds_bucket{le=\"0.25\"}[5m])) - sum(rate(gateway_itl_seconds_bucket{le=\"0.05\"}[5m]))",
+          "legendFormat": "50-250ms",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(gateway_itl_seconds_bucket{le=\"+Inf\"}[5m])) - sum(rate(gateway_itl_seconds_bucket{le=\"0.25\"}[5m]))",
+          "legendFormat": ">250ms",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
       ]
