@@ -59,7 +59,7 @@ class TestDashboardJsonFiles:
 
         dashboards_dir = PROJECT_ROOT / "grafana" / "provisioning" / "dashboards"
         json_files = list(dashboards_dir.glob("*.json"))
-        assert len(json_files) == 3, f"Expected 3 dashboards, found {len(json_files)}"
+        assert len(json_files) == 4, f"Expected 4 dashboards, found {len(json_files)}"
         for json_file in json_files:
             data = json.loads(json_file.read_text())
             assert "uid" in data, f"{json_file.name} missing uid"
