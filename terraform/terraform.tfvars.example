@@ -1,0 +1,28 @@
+# AWS Region
+aws_region = "us-east-1"
+
+# Project identification
+project_name = "inference-gateway"
+environment  = "production"
+
+# Gateway sizing — adjust based on expected load
+# gateway_cpu           = 1024   # 1 vCPU
+# gateway_memory        = 2048   # 2 GB
+gateway_desired_count = 3
+# gateway_min_count     = 2
+# gateway_max_count     = 10
+
+# Redis — use cache.r7g.large or larger for production workloads
+redis_node_type          = "cache.t4g.micro"
+redis_num_cache_clusters = 2
+
+# ACM certificate ARN for HTTPS — leave empty to use HTTP only
+# certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/abc-def-ghi"
+certificate_arn = ""
+
+# NAT Gateway — set single_nat_gateway = false for HA in production
+# enable_nat_gateway = true
+# single_nat_gateway = true
+
+# Observability
+# log_retention_days = 30

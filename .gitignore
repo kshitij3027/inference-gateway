@@ -50,3 +50,10 @@ dump.rdb
 # Load test reports
 tests/load/report.html
 tests/load/results*.csv
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfplan
