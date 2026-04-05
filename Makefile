@@ -1,4 +1,4 @@
-.PHONY: up down test logs build seed status chaos chaos-down loadtest rolling-restart
+.PHONY: up down test logs build seed status chaos chaos-down loadtest rolling-restart terraform-validate
 
 up:
 	docker compose up --build -d
@@ -38,3 +38,6 @@ loadtest:
 
 rolling-restart:
 	@bash scripts/rolling-restart.sh --build
+
+terraform-validate:
+	@bash scripts/test-terraform.sh
