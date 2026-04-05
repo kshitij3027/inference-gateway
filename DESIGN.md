@@ -2755,3 +2755,150 @@ Six panels:
 
 **Q: "How would you detect if a model has bimodal TTFT — sometimes fast, sometimes slow?"**
 **A:** The TTFT heatmap panel in the Grafana dashboard reveals distribution shape directly. A unimodal distribution appears as a single horizontal band; a bimodal distribution appears as two bands. Percentile charts (P50/P95/P99) obscure bimodality because they reduce the distribution to point estimates. For example, if 80% of requests have 50ms TTFT and 20% have 5 seconds (cold start), the P50 is 50ms (looks fine) and the P95 is 5 seconds (looks bad), but neither tells you there are two distinct populations. The heatmap shows both clusters. This is why the dashboard includes both percentile lines and heatmaps — they answer different questions about the same data.
+
+---
+
+## Production Deployment Considerations
+
+### Why this exists
+
+The gateway runs locally via Docker Compose with 14 services: three gateway instances behind Nginx, Redis, Prometheus, Grafana, Ollama backends, and mock API servers. This works for development and testing, but production requires managed services with high availability, encryption, auto-scaling, and operational alerting. Without an explicit infrastructure-as-code definition, the gap between "works on my machine" and "runs in production" remains undocumented and non-reproducible.
+
+The Terraform definitions in `terraform/` map every local component to its AWS equivalent, making the production topology version-controlled, reviewable, and repeatable. `PRODUCTION.md` documents the operational differences, cost implications, and scaling strategy.
+
+### How it works
+
+The local-to-AWS mapping replaces each Docker Compose service with a managed AWS resource:
+
+1. **Nginx reverse proxy → Application Load Balancer (ALB):** The ALB sits in public subnets across two availability zones. It terminates TLS (via ACM certificate), performs active health checks against `/health` every 30 seconds, and distributes traffic to ECS tasks in private subnets. The `deregistration_delay` of 120 seconds matches the gateway's httpx timeout, ensuring in-flight LLM streaming responses complete during deployments.
+
+2. **3x gateway containers → ECS Fargate service:** Fargate runs the same Docker image on ARM64/Graviton processors (20% cost savings). The task definition mirrors the Docker Compose environment variables, with `REDIS_URL` pointing to the ElastiCache endpoint instead of `redis://redis:6379/0`. Auto-scaling tracks CPU utilization at 70% with a floor of 2 tasks and ceiling of 10.
+
+3. **Redis Alpine → ElastiCache Redis 7.1 replication group:** A primary node plus one replica across two AZs provides automatic failover in under 30 seconds. Encryption at rest and in transit (TLS) are enabled. The `allkeys-lru` eviction policy matches the caching workload — cache misses are non-fatal (just slower).
+
+4. **Docker bridge network → VPC with public/private subnets:** Two availability zones, each with a public subnet (ALB, NAT Gateway) and private subnet (ECS tasks, Redis). VPC endpoints for ECR, S3, and CloudWatch Logs reduce NAT Gateway data transfer costs. Security groups enforce the ALB → ECS → Redis traffic flow.
+
+5. **Prometheus + Grafana → CloudWatch logs + alarms:** Seven CloudWatch alarms cover the critical failure modes: ALB 5xx rate, P99 latency, unhealthy targets, ECS CPU/memory, and Redis CPU/memory. The gateway's `/metrics/` endpoint and existing Grafana dashboards can optionally be preserved by deploying Prometheus + Grafana as additional ECS tasks.
+
+6. **.env files → SSM Parameter Store:** API keys for OpenAI and Anthropic backends are stored in SSM Parameter Store and injected into ECS tasks via the execution role's `ssm:GetParameters` permission. No secrets in environment variables or task definitions.
+
+### Implementation
+
+All infrastructure is defined in `terraform/` using a flat file structure (no nested modules):
+
+| File | Purpose |
+|------|---------|
+| `versions.tf` | Terraform >= 1.5, AWS provider ~> 5.0 |
+| `variables.tf` | 25 input variables with defaults matching Docker Compose |
+| `vpc.tf` | VPC, 2 AZ subnets, IGW, NAT Gateway, VPC endpoints |
+| `security.tf` | Security groups (ALB/ECS/Redis), IAM roles (execution/task) |
+| `ecr.tf` | Container registry with scan-on-push and lifecycle policy |
+| `ecs.tf` | Fargate cluster, ARM64 task definition, service, auto-scaling |
+| `alb.tf` | Load balancer, target group, conditional HTTPS listener |
+| `redis.tf` | ElastiCache replication group with encryption |
+| `monitoring.tf` | CloudWatch log group, SNS topic, 7 metric alarms |
+| `outputs.tf` | ALB DNS, ECR URL, Redis endpoint, VPC/subnet IDs |
+| `terraform.tfvars.example` | Example configuration values |
+
+`PRODUCTION.md` at the project root documents the operational differences, cost estimates at 100 RPS (~$180/month) and 1000 RPS (~$978/month), Redis sizing guidance, scaling strategy, and monitoring tradeoffs.
+
+`scripts/test-terraform.sh` validates the Terraform configuration in Docker (no AWS credentials needed) and checks that PRODUCTION.md contains all required sections.
+
+### Key design decisions
+
+**Flat Terraform structure over modules.** This is a single-project portfolio repository, not a multi-team infrastructure library. A flat structure with one file per concern (vpc.tf, ecs.tf, etc.) is easier to read and navigate than nested module directories. Each file is self-contained and clearly named. If the project grew to manage multiple environments or services, extracting reusable modules would be the natural next step.
+
+**ARM64/Graviton for ECS Fargate.** The gateway is pure Python — no native C extensions that require x86 compilation. The base image (`python:3.12-slim`) and all pip dependencies (including `sentence-transformers`) provide ARM64 wheels. Graviton instances are 20% cheaper than x86 equivalents with comparable or better performance for Python workloads.
+
+**VPC endpoints for ECR, S3, and CloudWatch Logs.** At 1000 RPS, NAT Gateway data transfer costs become significant ($0.045/GB). VPC endpoints route traffic to these AWS services within the VPC, bypassing NAT entirely. The three Interface endpoints cost ~$22/month but save more than that in NAT transfer fees at scale.
+
+**Deployment circuit breaker with automatic rollback.** ECS natively supports deployment circuit breakers that detect failing tasks during a rolling update and automatically roll back to the previous stable version. This removes the need for external deployment tooling (CodeDeploy, custom scripts) for the common case of "new image doesn't start."
+
+**Deregistration delay of 120 seconds.** LLM inference requests — especially streaming responses — can take 10-60 seconds. The deregistration delay must exceed the longest expected request duration to prevent dropped connections during deployments. 120 seconds provides headroom above the 60-second typical maximum while not delaying deployments unnecessarily.
+
+**Conditional HTTPS listener.** The ALB supports both HTTP-only (for testing/dev) and HTTPS (for production) via the `certificate_arn` variable. When a certificate ARN is provided, the HTTP listener redirects to HTTPS. When omitted, HTTP forwards directly to the target group. This allows the Terraform to validate and apply in any environment without requiring a pre-existing ACM certificate.
+
+### Alternatives considered
+
+**EKS (Kubernetes) vs ECS Fargate.** Kubernetes provides richer orchestration (CronJobs, DaemonSets, custom operators, service mesh) and is the industry standard for complex microservice architectures. However, the inference gateway is a single service with a Redis dependency — not a microservice graph. ECS Fargate eliminates cluster management (no node groups, no control plane, no etcd), costs less for simple workloads, and integrates natively with ALB, CloudWatch, and IAM. For a single-service deployment, ECS is the simpler choice.
+
+**EC2 vs Fargate.** EC2 instances provide more control (SSH access, custom AMIs, GPU instances for local inference) and can be cheaper with Reserved Instances for steady-state workloads. Fargate eliminates instance management entirely — no patching, no capacity planning, no idle costs. For a proxy/gateway service that doesn't run inference locally, Fargate's serverless model is a better fit. If the gateway needed to run Ollama or vLLM locally (instead of proxying to external APIs), EC2 with GPU instances would be necessary.
+
+**Terraform modules vs flat structure.** Modules enable reuse across environments (dev/staging/prod) and teams. For a single-environment, single-operator project, modules add indirection without reuse benefits. The flat structure keeps all definitions visible in one directory, with `terraform.tfvars` providing the only customization layer. If the project expanded to multiple environments, the first refactoring step would be extracting modules and creating per-environment `tfvars` files.
+
+**CloudWatch-only vs hybrid monitoring.** Pure CloudWatch is zero-maintenance but lacks the rich dashboard experience built in previous phases (histogram heatmaps, per-backend drilldown, streaming analytics). Self-hosted Prometheus + Grafana preserves this investment but costs ~$40-60/month in additional ECS tasks. The Terraform defines CloudWatch alarms for operational alerting; the existing Prometheus metrics endpoint and Grafana dashboards can be layered on top as an optional enhancement.
+
+### Failure modes and edge cases
+
+**Single AZ failure.** The VPC spans two AZs. ALB, ECS service, and ElastiCache replication group all operate across both AZs. If one AZ goes down: ALB routes traffic to the surviving AZ's targets, ECS launches replacement tasks in the healthy AZ, and ElastiCache promotes the replica to primary (< 30 second failover). The `gateway_min_count = 2` ensures at least one task per AZ under normal conditions.
+
+**Redis failover.** ElastiCache automatic failover promotes the replica to primary and updates the DNS endpoint. The gateway's Redis client reconnects automatically. During the ~30-second failover window: cache lookups return misses (requests go directly to LLM backends), rate limiter checks fail open (requests are allowed), and priority queue operations fail gracefully. All of these are by design — the gateway treats Redis as best-effort.
+
+**NAT Gateway failure.** If the single NAT Gateway fails, ECS tasks in private subnets lose outbound internet access. This breaks calls to external LLM APIs (OpenAI, Anthropic). Mitigation: set `single_nat_gateway = false` in production to deploy one NAT per AZ. VPC endpoints for ECR/S3/CloudWatch ensure container operations continue even without NAT.
+
+**ACM certificate expiry.** ACM certificates auto-renew if validated via DNS (Route53 CNAME). If using email validation, expiry is a risk. The ALB health check continues to work (it checks the target, not the listener TLS), but clients receive TLS errors. CloudWatch does not alarm on certificate expiry by default — this requires a separate `aws_cloudwatch_metric_alarm` on `DaysToExpiry` in the ACM namespace.
+
+**ECS task OOM.** The gateway loads a sentence-transformers model (~100MB) on startup. If `gateway_memory` is set too low, the task OOM-kills during initialization. The `startPeriod = 60` prevents the health check from marking the task unhealthy during startup, but OOM kills happen at the Docker/Fargate level before the health check runs. The default 2048 MB provides ample headroom.
+
+**Image pull failure.** If the ECR image tag doesn't exist, ECS tasks fail to start. The deployment circuit breaker detects this and rolls back automatically. The `ecr_lifecycle_policy` keeps the last 10 tagged images, preventing accidental cleanup of the currently deployed version.
+
+### Observability
+
+**CloudWatch Logs.** All gateway stdout/stderr is captured via the `awslogs` driver into `/ecs/inference-gateway/gateway` with configurable retention (default 30 days). The gateway's structured JSON logging (via `structlog`) makes CloudWatch Logs Insights queries straightforward: filter by `request_id`, `tenant_id`, `backend`, or `status_code`.
+
+**CloudWatch Alarms (7 total):**
+
+| Alarm | Namespace | Metric | Condition | Action |
+|-------|-----------|--------|-----------|--------|
+| ALB 5xx rate | AWS/ApplicationELB | HTTPCode_Target_5XX_Count | > 10 in 1 min | SNS notification |
+| P99 latency | AWS/ApplicationELB | TargetResponseTime (p99) | > 10 seconds | SNS notification |
+| Unhealthy targets | AWS/ApplicationELB | UnHealthyHostCount | > 0 | SNS notification |
+| ECS CPU | AWS/ECS | CPUUtilization | > 85% for 3 min | SNS notification |
+| ECS memory | AWS/ECS | MemoryUtilization | > 85% for 3 min | SNS notification |
+| Redis CPU | AWS/ElastiCache | EngineCPUUtilization | > 75% for 3 min | SNS notification |
+| Redis memory | AWS/ElastiCache | DatabaseMemoryUsagePercentage | > 80% for 2 eval periods | SNS notification |
+
+**Container Insights.** Enabled on the ECS cluster for enhanced metrics: task-level CPU/memory, network I/O, and storage utilization. These feed into the auto-scaling decisions.
+
+**Prometheus metrics (optional).** The gateway continues to expose `/metrics/` in production. If Prometheus is deployed alongside, all existing dashboards (gateway overview, per-backend drilldown, per-tenant usage, streaming analytics) work without modification.
+
+### Testing
+
+**Terraform validation.** `scripts/test-terraform.sh` runs `terraform init -backend=false` and `terraform validate` inside the `hashicorp/terraform:latest` Docker container. This checks HCL syntax, provider schema compliance, and internal reference consistency — all without AWS credentials or API calls. The Makefile target `make terraform-validate` wraps this.
+
+**PRODUCTION.md validation.** The same script verifies that PRODUCTION.md exists and contains all five required section headers via `grep`.
+
+**No integration testing.** Terraform integration testing (actually applying infrastructure) is explicitly out of scope. The Phase 17 spec states "no `terraform apply`." Verifying that the infrastructure works correctly would require an AWS account and would incur costs. The `terraform validate` check ensures syntactic and structural correctness; semantic correctness (correct security group rules, correct IAM permissions) requires manual review or a dedicated testing tool like `terratest`.
+
+### Production gaps
+
+**No remote state backend.** The Terraform configuration uses local state by default. For team use, an S3 backend with DynamoDB state locking should be configured in a `backend.tf` file. Without remote state, concurrent `terraform apply` runs can corrupt state.
+
+**No CI/CD pipeline.** Deployments require manual `terraform apply` and `docker push`. A production setup would include a CI/CD pipeline (GitHub Actions, CodePipeline) that builds the Docker image, pushes to ECR, and triggers ECS deployment on merge to main.
+
+**No WAF.** The ALB has no Web Application Firewall. A production API gateway should have AWS WAF rules for rate limiting at the edge, IP allowlisting, and request size limits. The gateway's application-level rate limiter provides per-tenant controls but not DDoS protection.
+
+**No Route53.** The ALB is accessible only via its auto-generated DNS name (e.g., `inference-gateway-alb-123456.us-east-1.elb.amazonaws.com`). A production deployment would add a Route53 hosted zone with an alias record pointing to the ALB.
+
+**No multi-region.** All infrastructure is in a single AWS region. For global availability, the deployment would need to be replicated across regions with Route53 latency-based routing or Global Accelerator. Redis state would not replicate across regions — each region would have its own cache (cold start on failover).
+
+**No Secrets Manager rotation.** API keys are stored in SSM Parameter Store as static values. Production should use Secrets Manager with automatic rotation for any credentials that support it.
+
+### Interview talking points
+
+- **The local-to-production mapping demonstrates that application code should be environment-agnostic.** The gateway source code has zero changes between Docker Compose and AWS. Every difference — service discovery, TLS, credentials, scaling — is handled by infrastructure configuration. This separation means developers test locally with `docker compose up` and deploy to production with `terraform apply`, using the same Docker image.
+
+- **Cost-conscious infrastructure design is a first-class concern.** ARM64/Graviton (20% savings), conditional single NAT Gateway (vs per-AZ), VPC endpoints (NAT data transfer avoidance), and right-sized ElastiCache nodes demonstrate that production infrastructure is not just about correctness but about cost efficiency. The PRODUCTION.md cost tables at 100 RPS and 1000 RPS show that infrastructure costs scale sub-linearly with traffic.
+
+- **Terraform validates without AWS credentials by separating `init -backend=false` from `validate`.** This enables CI pipelines to catch Terraform syntax and structural errors on every PR without requiring AWS credentials in the CI environment — a security best practice that also reduces CI complexity.
+
+### Likely interview questions
+
+**Q: "Why ECS Fargate over Kubernetes for this gateway?"**
+**A:** The inference gateway is a single service with a Redis dependency — not a microservice graph requiring service mesh, custom operators, or complex scheduling. ECS Fargate eliminates cluster management (no node groups, no control plane, no etcd), integrates natively with ALB and CloudWatch, and costs less for simple workloads. Kubernetes would add operational complexity (cluster upgrades, RBAC policies, ingress controller configuration) without proportional benefit. The decision would change if the project grew to include multiple interdependent services, needed GPU scheduling for local inference, or required the portability of the Kubernetes API across cloud providers.
+
+**Q: "How would you handle a Redis failover without dropping requests?"**
+**A:** The gateway already treats Redis as best-effort — this was a deliberate design decision in earlier phases. During ElastiCache failover (~30 seconds): cache lookups return misses (requests bypass cache and go directly to LLM backends — slower but functional), rate limiter checks fail open (requests are allowed rather than rejected), and priority queue operations skip gracefully. The application continues serving requests with degraded performance, not errors. The ElastiCache replication group uses DNS-based failover — the primary endpoint DNS record updates to point to the new primary, and the gateway's Redis client library handles reconnection automatically. No application code change is needed.
+
+**Q: "What would you add first for a real production deployment?"**
+**A:** A CI/CD pipeline and remote state backend. Without CI/CD, deployments are manual and error-prone — a GitHub Actions workflow that builds the Docker image on merge to main, pushes to ECR, and triggers `terraform apply` with the new image tag would close the biggest operational gap. Without remote state (S3 + DynamoDB locking), Terraform state lives on a single developer's machine, making collaboration impossible and state corruption likely. These two additions convert the Terraform definitions from "validated configuration" to "operational infrastructure." After that, I would add WAF on the ALB for edge rate limiting, Route53 for a stable domain name, and Secrets Manager rotation for API keys.
