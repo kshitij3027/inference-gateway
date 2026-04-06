@@ -162,6 +162,17 @@ async def lifespan(app: FastAPI):
     # Event broadcaster for live dashboard
     app.state.event_broadcaster = EventBroadcaster()
 
+    # Wire circuit breaker state changes to dashboard events
+    def _on_cb_state_change(backend: str, old_state: str, new_state: str):
+        app.state.event_broadcaster.emit("circuit_state_change", {
+            "backend": backend,
+            "old_state": old_state,
+            "new_state": new_state,
+        })
+
+    for cb in app.state.circuit_breakers.breakers.values():
+        cb.on_state_change = _on_cb_state_change
+
     # Graceful shutdown state
     app.state.shutting_down = False
     app.state.inflight_count = 0

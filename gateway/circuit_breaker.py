@@ -44,6 +44,7 @@ class CircuitBreaker:
         self._opened_at: float | None = None
         self._requests: deque[tuple[float, bool]] = deque()
         self._half_open_probe_sent = False
+        self.on_state_change = None  # Optional callback: fn(backend, old_state, new_state)
 
     def allow_request(self) -> bool:
         """Check if a request should be allowed through this backend."""
@@ -123,6 +124,11 @@ class CircuitBreaker:
             )
         except ImportError:
             pass
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change(self.backend_name, old_state.value, new_state.value)
+            except Exception:
+                pass
 
     def snapshot(self) -> dict:
         """Return current state for admin endpoint."""

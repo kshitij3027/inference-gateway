@@ -257,6 +257,25 @@ async def _wrap_stream_with_journal(
                 pass
 
 
+async def _wrap_stream_with_events(gen, broadcaster, request_id, tenant_id, model, backend_name, start_time):
+    """Emit request_complete event when streaming response finishes."""
+    try:
+        async for chunk in gen:
+            yield chunk
+    finally:
+        if broadcaster:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            broadcaster.emit("request_complete", {
+                "request_id": request_id,
+                "tenant_id": tenant_id,
+                "model": model,
+                "backend": backend_name,
+                "duration_ms": duration_ms,
+                "status": 200,
+                "stream": True,
+            })
+
+
 async def _execute_hedge(http_client, backend1, backend2, chat_request, translator):
     """Race two backends, return the winner's result, cancel the loser.
 
@@ -320,6 +339,17 @@ async def chat_completions(
 
     # Rate limit check (after auth, before routing)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    # Dashboard event: new request
+    broadcaster = getattr(request.app.state, "event_broadcaster", None)
+    if broadcaster:
+        broadcaster.emit("new_request", {
+            "request_id": request_id,
+            "tenant_id": tenant.id,
+            "model": chat_request.model,
+            "stream": bool(chat_request.stream),
+        })
+
     rate_limiter = getattr(request.app.state, "rate_limiter", None)
     if rate_limiter is not None:
         try:
@@ -331,6 +361,12 @@ async def chat_completions(
                 RATE_LIMIT_REJECTIONS.labels(
                     tenant=tenant.id, limit_type=deny_info["limit_type"]
                 ).inc()
+                if broadcaster:
+                    broadcaster.emit("rate_limit_hit", {
+                        "request_id": request_id,
+                        "tenant_id": tenant.id,
+                        "limit_type": deny_info["limit_type"],
+                    })
                 raise HTTPException(
                     status_code=429,
                     detail={
@@ -352,6 +388,12 @@ async def chat_completions(
                 RATE_LIMIT_REJECTIONS.labels(
                     tenant=tenant.id, limit_type="token_budget_daily"
                 ).inc()
+                if broadcaster:
+                    broadcaster.emit("rate_limit_hit", {
+                        "request_id": request_id,
+                        "tenant_id": tenant.id,
+                        "limit_type": "token_budget_daily",
+                    })
                 raise HTTPException(
                     status_code=429,
                     detail={
@@ -406,6 +448,12 @@ async def chat_completions(
             )
             if cached_response is not None:
                 await semantic_cache.record_hit()
+                if broadcaster:
+                    broadcaster.emit("cache_hit", {
+                        "request_id": request_id,
+                        "model": chat_request.model,
+                        "tenant_id": tenant.id,
+                    })
                 CACHE_OPERATIONS.labels(model=chat_request.model, status="hit").inc()
                 request.state.cache_status = cache_tier or "L2_HIT"
                 request.state.cache_similarity = cache_similarity
@@ -436,6 +484,12 @@ async def chat_completions(
                 await semantic_cache.record_miss()
                 CACHE_OPERATIONS.labels(model=chat_request.model, status="miss").inc()
                 request.state.cache_status = "MISS"
+                if broadcaster:
+                    broadcaster.emit("cache_miss", {
+                        "request_id": request_id,
+                        "model": chat_request.model,
+                        "tenant_id": tenant.id,
+                    })
         except Exception as e:
             logger.warning("cache_lookup_failed", error=str(e))
             request.state.cache_status = "MISS"
@@ -588,6 +642,11 @@ async def chat_completions(
                 wrapped_gen, journal, request_id, tenant.id,
                 backend.name, chat_request.model, chat_request.messages,
                 request_start_time, rate_limiter, tenant.token_budget_daily,
+            )
+        if broadcaster:
+            wrapped_gen = _wrap_stream_with_events(
+                wrapped_gen, broadcaster, request_id, tenant.id,
+                chat_request.model, backend.name, request_start_time,
             )
         return StreamingResponse(wrapped_gen, media_type="text/event-stream")
 
@@ -874,6 +933,17 @@ async def chat_completions(
                     tokens_prompt=result.usage.prompt_tokens,
                     tokens_completion=result.usage.completion_tokens,
                 )
+
+            if broadcaster:
+                broadcaster.emit("request_complete", {
+                    "request_id": request_id,
+                    "tenant_id": tenant.id,
+                    "model": chat_request.model,
+                    "backend": backend.name,
+                    "duration_ms": duration_ms,
+                    "tokens": result.usage.total_tokens,
+                    "status": 200,
+                })
 
             return result
 
