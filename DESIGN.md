@@ -2902,3 +2902,163 @@ All infrastructure is defined in `terraform/` using a flat file structure (no ne
 
 **Q: "What would you add first for a real production deployment?"**
 **A:** A CI/CD pipeline and remote state backend. Without CI/CD, deployments are manual and error-prone — a GitHub Actions workflow that builds the Docker image on merge to main, pushes to ECR, and triggers `terraform apply` with the new image tag would close the biggest operational gap. Without remote state (S3 + DynamoDB locking), Terraform state lives on a single developer's machine, making collaboration impossible and state corruption likely. These two additions convert the Terraform definitions from "validated configuration" to "operational infrastructure." After that, I would add WAF on the ALB for edge rate limiting, Route53 for a stable domain name, and Secrets Manager rotation for API keys.
+
+---
+
+## Live Web Dashboard
+
+### Why this exists
+
+The gateway has rich admin API endpoints and Prometheus metrics, but both require specialized tools to consume — `curl` for the admin API, Grafana with PromQL for metrics. An operator who wants a quick visual status check must either run multiple curl commands and parse JSON or navigate Grafana dashboards with 15-second scrape delay. Neither approach provides immediate, live feedback.
+
+The web dashboard provides real-time visibility into the running gateway through a single browser tab. It shows backend health, hash ring topology, request flow, tenant usage, and cache performance — all updating live via WebSocket. For interviews and demos, it transforms "the system works, here's curl output" into "open this page and watch requests flow through the pipeline."
+
+### How it works
+
+The dashboard uses a push-based architecture with two data sources:
+
+**Initial state (HTTP):** When the dashboard loads, it fetches the current state from three admin API endpoints:
+1. `GET /admin/backends` — backend list with circuit breaker snapshots (state, error rate)
+2. `GET /admin/ring` — hash ring distribution per model (backend → vnode count)
+3. `GET /admin/cache/stats` — cumulative cache hits, misses, and hit rate
+
+This populates all five panels with the current system state before any new events arrive.
+
+**Real-time updates (WebSocket):** A persistent WebSocket connection to `/ws/dashboard` receives events as they happen in the request pipeline. The gateway pushes six event types:
+
+| Event | Trigger Point | Data |
+|-------|--------------|------|
+| `new_request` | After auth, before rate limiting | request_id, tenant_id, model, stream |
+| `request_complete` | After response sent (streaming or non-streaming) | request_id, tenant_id, model, backend, duration_ms, tokens, status |
+| `cache_hit` | After semantic cache returns a match | request_id, model, tenant_id |
+| `cache_miss` | After semantic cache returns no match | request_id, model, tenant_id |
+| `circuit_state_change` | When a circuit breaker transitions state | backend, old_state, new_state |
+| `rate_limit_hit` | When rate limiter rejects a request | request_id, tenant_id, limit_type |
+
+Each event is a JSON message: `{"type": "<event_type>", "data": {...}, "ts": <unix_timestamp>}`.
+
+**Auto-reconnect:** On WebSocket disconnect, the client retries with exponential backoff (1s → 2s → 4s → ... capped at 30s). On reconnection, it re-fetches initial state from the admin API to avoid stale data. The connection status indicator in the header shows green (connected), yellow (connecting), or red (disconnected).
+
+### Implementation
+
+**Backend (Python):**
+
+`gateway/events.py` — `EventBroadcaster` class. Maintains a `set[WebSocket]` of connected clients. `broadcast(event_type, data)` iterates the set and sends JSON to each client, pruning dead connections lazily on send failure. `emit(event_type, data)` is the primary API — a fire-and-forget wrapper that creates an `asyncio.create_task()` for the broadcast, ensuring the request pipeline is never blocked by WebSocket I/O. When no clients are connected, `emit()` is a no-op (doesn't create a task).
+
+`gateway/routes/dashboard.py` — WebSocket endpoint. Accepts the connection, registers with the broadcaster, and loops on `receive_text()` until disconnect. No authentication.
+
+`gateway/main.py` — Wires the broadcaster into the FastAPI lifespan. Creates `EventBroadcaster()` on startup, stores it on `app.state`. Mounts `StaticFiles` at `/dashboard` conditionally (only if the `gateway/dashboard/` directory exists). Wires circuit breaker `on_state_change` callbacks to emit `circuit_state_change` events.
+
+`gateway/routes/chat.py` — Six event emission points in the chat completion handler, each guarded with `getattr(request.app.state, "event_broadcaster", None)`. A `_wrap_stream_with_events()` async generator wraps the streaming response to emit `request_complete` when the stream finishes.
+
+`gateway/circuit_breaker.py` — Added `on_state_change` optional callback attribute to `CircuitBreaker`. Called in `_transition()` after the Prometheus metric update. The callback is set by the lifespan to emit dashboard events.
+
+**Frontend (Vanilla JS + Chart.js):**
+
+`gateway/dashboard/index.html` — Single-page HTML loading Chart.js from CDN. Five panel sections in a CSS grid layout.
+
+`gateway/dashboard/dashboard.js` — IIFE with WebSocket client, event dispatcher, and five rendering functions:
+- `renderBackendHealth()` — colored circles per backend (green=CLOSED, yellow=HALF_OPEN, red=OPEN) with error rate
+- `renderHashRing()` — SVG pie chart of vnode distribution using arc path calculations
+- Flow stats — counters for active, completed, and rate-limited requests with stage highlighting
+- `updateTenantChart()` — Chart.js horizontal bar chart, updated on each `new_request` event
+- `updateCacheGauge()` — Chart.js doughnut chart showing hit/miss ratio with percentage label
+
+`gateway/dashboard/dashboard.css` — Dark theme (#0a0a1a background, #141430 panels) with CSS Grid layout (3 columns, responsive breakpoints at 1024px and 640px), glow effects on health indicators, and pulse animation for connecting state.
+
+### Key design decisions
+
+**Same-port serving instead of a separate dashboard service.** The dashboard HTML, JS, and CSS are served by FastAPI's `StaticFiles` on the same port (8080) as the API. Docker Compose maps `3001:8080` on gateway-1 for external access. This avoids adding a separate container (nginx for static files, or a Node.js server), keeps the deployment topology simple, and ensures the WebSocket connects to the same gateway instance that serves the page — no CORS issues, no separate service to manage.
+
+**Fire-and-forget event emission via `asyncio.create_task()`.** The `emit()` method never blocks the request pipeline. If WebSocket sends are slow or a client is lagging, the chat handler continues without waiting. The task runs in the background and dead connections are pruned during the next broadcast. This ensures the dashboard adds zero latency to API requests.
+
+**Chart.js from CDN instead of bundled.** The spec requires no npm, no build step. Chart.js from `cdn.jsdelivr.net` is the simplest approach — one `<script>` tag. For fully offline environments, the minified JS (< 200KB) can be downloaded and placed in `gateway/dashboard/`. The CDN trade-off is acceptable because Docker containers have internet access during development, and production would serve from a CDN anyway.
+
+**In-process broadcaster instead of Redis pub/sub.** Each gateway instance has its own `EventBroadcaster`. Dashboard clients connect to one instance and see only that instance's events. Redis pub/sub would enable cross-instance event aggregation but adds complexity and a Redis dependency for a feature that's primarily for demos and debugging. The single-instance design matches the direct port mapping (`3001:gateway-1`) — the dashboard naturally shows one instance's view.
+
+**Lazy dead-connection pruning instead of periodic cleanup.** Dead WebSocket connections (client disconnected without close frame) are only detected when `broadcast()` tries to send and catches an exception. No background heartbeat or cleanup task. With 1-5 dashboard clients, the memory overhead of a few stale entries is negligible, and the next broadcast prunes them. This avoids adding a background task that would complicate testing and shutdown.
+
+**Circuit breaker callback instead of import cycle.** The circuit breaker module already uses lazy import for Prometheus metrics. Adding an `on_state_change` callback attribute (set by the lifespan) avoids the circular import that would result from `circuit_breaker.py` importing `events.py` which imports from FastAPI which eventually imports `circuit_breaker.py`. The callback pattern is also more testable — unit tests can verify the callback fires without needing a running EventBroadcaster.
+
+### Alternatives considered
+
+**Server-Sent Events (SSE) instead of WebSocket.** SSE is simpler (plain HTTP, automatic reconnection built into the `EventSource` API) and sufficient for unidirectional server-to-client push. WebSocket was chosen for consistency with the existing `websockets` dependency (already in `requirements.txt` for streaming support) and for future extensibility (bidirectional communication could enable dashboard → gateway commands like config reload or cache flush). In practice, the dashboard only uses server-to-client push, so SSE would have worked equally well.
+
+**Separate dashboard service (nginx + static files) instead of embedded serving.** A dedicated nginx container serving the dashboard would be more production-appropriate — proper caching headers, gzip compression, and separation of concerns. The embedded approach was chosen because: (1) it keeps the Docker Compose topology unchanged (no new service), (2) the WebSocket endpoint must be on the same origin as the HTML to avoid CORS, and (3) FastAPI's `StaticFiles` is adequate for development. In production, a CDN or nginx reverse proxy would serve the static files.
+
+**Polling admin endpoints instead of WebSocket push.** The admin API already exposes all the data the dashboard needs. Polling at 1-2 second intervals would have required zero backend changes. WebSocket push was chosen because: (1) it provides true real-time updates (sub-second, not poll-interval-bound), (2) it enables request flow animation (individual request events, not aggregated stats), and (3) it demonstrates a different integration pattern (event-driven rather than request-response).
+
+**React/Vue instead of vanilla JavaScript.** A framework would provide component structure, reactive data binding, and a richer development experience. Vanilla JS was chosen because: (1) the spec explicitly says "no build step, no npm, no framework," (2) the dashboard is < 300 lines of JS with no state management complexity, and (3) Chart.js handles the only rendering challenge (charts). At this scale, a framework adds build tooling overhead without proportional benefit.
+
+### Failure modes and edge cases
+
+**WebSocket disconnect (network interruption).** The client auto-reconnects with exponential backoff. On reconnection, `fetchInitialState()` re-fetches from admin API endpoints to rebuild accurate panel state. Events that occurred during disconnection are lost (no persistent event history — per spec). The dashboard shows slightly stale data until new events arrive.
+
+**Stale initial state.** The admin API data fetched on connect represents a snapshot. Between the fetch and the first WebSocket event, the state could change. This is a small window (< 1 second) and self-corrects as events arrive. Cache stats (hits/misses) are cumulative counters, so the initial values from the API are additive with subsequent WebSocket events. This can cause slight double-counting, but the gauge corrects as more events arrive.
+
+**Broadcaster memory with abandoned connections.** If a client disconnects without a close frame (browser crash, network cut), the WebSocket object remains in the broadcaster's `_connections` set until the next broadcast attempt fails. For a dashboard with few clients (1-5), this is negligible — each stale entry is a few hundred bytes. The lazy pruning during `broadcast()` clears them.
+
+**Gateway restart loses WebSocket connections.** When gateway-1 restarts, all dashboard WebSocket connections drop. The auto-reconnect logic handles this — the client reconnects and re-fetches initial state. Event counters (active requests, completed, cache stats) reset because they're in-process state, not persisted. This is by design.
+
+**Chart.js CDN unavailable.** If the CDN is unreachable (air-gapped environment, network issue), Chart.js fails to load and the tenant usage and cache gauge panels render as empty `<canvas>` elements. The rest of the dashboard (backend health, hash ring, request flow) works without Chart.js since they use DOM and SVG directly.
+
+### Observability
+
+**Structured logging.** The EventBroadcaster logs `dashboard_ws_connected` and `dashboard_ws_disconnected` events with `clients=N` count via structlog. These appear in the gateway's JSON log output and are captured by CloudWatch in production.
+
+**Client count.** The `EventBroadcaster.client_count` property exposes the number of connected dashboard clients. This could be added to a future `/admin/dashboard` endpoint or Prometheus gauge for monitoring dashboard usage.
+
+**No dedicated metrics.** The dashboard does not add Prometheus metrics for WebSocket connections or event throughput. The existing `gateway_request_total` and other metrics are sufficient for operational monitoring. Dashboard-specific metrics would be added if the feature moves beyond demo/debugging use.
+
+### Testing
+
+**Unit tests** (`tests/unit/test_events.py`, 9 tests):
+- EventBroadcaster lifecycle: connect/disconnect, count tracking, idempotent disconnect
+- Broadcast: sends to all clients, prunes dead connections, no-op when empty
+- Message format: JSON with type/data/ts keys
+- Fire-and-forget: `emit()` is a no-op when no clients connected
+
+**Unit tests** (`tests/unit/test_dashboard.py`, 4 tests):
+- Event serialization: all 6 event types produce valid JSON via parametrized test
+- Circuit breaker callback: fires on state transition, defaults to None, swallows exceptions
+
+**Integration tests** (`tests/integration/test_dashboard.py`, 4 tests):
+- Static file serving: HTML, JS, and CSS return 200 with correct content types
+- WebSocket endpoint: route is registered in the app
+
+**E2E verification** (manual via Docker Compose + Chrome browser):
+- `make up` → navigate to `http://localhost:3001/dashboard/`
+- All 5 panels render with initial state from admin API
+- WebSocket shows "Connected" status
+- `make seed` → dashboard updates live: cache stats change, request counters increment
+
+### Production gaps
+
+**No authentication.** The dashboard is accessible to anyone who can reach port 3001. In production, it should be behind authentication — either the gateway's existing Bearer token auth extended to the dashboard, or an nginx auth proxy. The spec explicitly skips authentication.
+
+**No persistent event history.** Events are only pushed to currently connected clients. If the dashboard disconnects and reconnects, events during the gap are lost. A production version could buffer recent events in a circular buffer (in-process) or Redis Stream and replay them on reconnection.
+
+**Single-instance view only.** The dashboard connects to one gateway instance and shows only that instance's events. With three gateway instances, the dashboard shows roughly one-third of total traffic. Cross-instance aggregation would require Redis pub/sub for event distribution or a separate aggregation service.
+
+**CDN dependency for Chart.js.** The dashboard loads Chart.js from `cdn.jsdelivr.net`. In a production deployment behind a firewall, this should be replaced with a locally bundled copy or served via the organization's CDN.
+
+**No request flow tracking per-stage.** The request flow animation highlights stages (Auth, Cache, Backend, Response) when events arrive, but doesn't track individual requests through stages. A true flow visualization would require per-request stage events (entering/leaving each stage), which would add significant event volume.
+
+### Interview talking points
+
+- **The WebSocket push architecture demonstrates understanding of when to use push vs poll.** The admin API already exposes all dashboard data — polling every second would work. WebSocket push was chosen because it enables true real-time updates (individual request events, not aggregated snapshots) and demonstrates event-driven architecture. The fire-and-forget `emit()` pattern shows how to integrate real-time features without adding latency to the critical request path.
+
+- **The dashboard serves as a live integration test visible to non-technical stakeholders.** During an interview demo, opening the dashboard and running `make seed` immediately shows requests flowing through the pipeline, cache hits accumulating, and backend health status. This is more convincing than log output or curl commands because it demonstrates the system working end-to-end in real time.
+
+- **The vanilla JS decision reflects pragmatic technology selection.** The dashboard is < 300 lines of JavaScript with 5 rendering functions. At this scale, React/Vue would add a build step, a `node_modules` directory, and framework boilerplate without improving the code. Chart.js handles the only complex rendering (charts). The IIFE pattern with explicit DOM manipulation is sufficient and keeps the deployment zero-dependency (no npm, no bundler, no build pipeline).
+
+### Likely interview questions
+
+**Q: "Why not use Grafana instead of building a custom dashboard?"**
+**A:** Grafana excels at time-series visualization with PromQL queries, and the gateway already has 4 Grafana dashboards built in earlier phases. The custom dashboard serves a different purpose: real-time operational visibility without requiring Grafana expertise. It shows the current system state (which backends are healthy, what the hash ring looks like, how requests flow through the pipeline) rather than historical trends. The WebSocket push provides sub-second updates versus Grafana's 15-second scrape interval. It's also a single HTML page that loads instantly, versus Grafana which requires its own service, authentication, and dashboard navigation. For interviews, "open localhost:3001 and watch" is more immediate than "open Grafana, navigate to the dashboard, set the time range."
+
+**Q: "How would you make the dashboard work across all gateway instances?"**
+**A:** Currently, the dashboard connects to gateway-1 via the `3001:8080` port mapping and sees only that instance's events. To aggregate events from all instances, I would add a Redis pub/sub channel. Each gateway's `EventBroadcaster.broadcast()` would also publish to a shared Redis channel. A new `_subscribe_to_cluster_events()` background task in the lifespan would listen on that channel and re-broadcast received events to local WebSocket clients. This way, a dashboard connected to any gateway instance receives events from all instances. The Redis pub/sub overhead is minimal — events are small JSON messages and the event rate is proportional to request rate, which Redis handles easily. The dashboard JS would need no changes since it already handles all event types.
+
+**Q: "What happens if a dashboard client is slow and can't keep up with the event rate?"**
+**A:** The `broadcast()` method iterates all connected WebSocket clients and calls `send_text()` for each. If a client's TCP buffer fills up because it's processing events slowly, the `send_text()` call will eventually raise an exception (connection timeout or broken pipe), and the lazy pruning logic removes that client from the set. There's no per-client buffering or backpressure — slow clients are disconnected. This is intentional: the dashboard is a best-effort visualization tool, not a reliable event delivery system. If backpressure were needed (for a production monitoring use case), I would add a per-client asyncio.Queue with a bounded size, dropping oldest events when the queue is full, and a dedicated sender task per client that drains the queue.
