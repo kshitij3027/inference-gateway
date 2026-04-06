@@ -21,6 +21,8 @@ from gateway.observability.logging import setup_logging
 from gateway.routes.admin import router as admin_router
 from gateway.routes.chat import router as chat_router
 from gateway.routes.health import router as health_router
+from gateway.events import EventBroadcaster
+from gateway.routes.dashboard import router as dashboard_router
 
 setup_logging(log_level=os.getenv("LOG_LEVEL", "info"))
 logger = structlog.get_logger()
@@ -157,6 +159,9 @@ async def lifespan(app: FastAPI):
     # Instance identification
     app.state.instance_id = os.getenv("INSTANCE_ID", socket.gethostname())
 
+    # Event broadcaster for live dashboard
+    app.state.event_broadcaster = EventBroadcaster()
+
     # Graceful shutdown state
     app.state.shutting_down = False
     app.state.inflight_count = 0
@@ -205,6 +210,15 @@ app = FastAPI(title="Inference Gateway", lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(admin_router)
+app.include_router(dashboard_router)
+
+# Dashboard static files (served if directory exists)
+import os as _os
+from starlette.staticfiles import StaticFiles as _StaticFiles
+
+_dashboard_dir = _os.path.join(_os.path.dirname(__file__), "dashboard")
+if _os.path.isdir(_dashboard_dir):
+    app.mount("/dashboard", _StaticFiles(directory=_dashboard_dir, html=True), name="dashboard")
 
 # Prometheus metrics endpoint
 from prometheus_client import make_asgi_app
@@ -217,7 +231,7 @@ app.mount("/metrics", metrics_app)
 async def request_id_middleware(request: Request, call_next):
     # Reject new requests during shutdown (allow health/ready/metrics)
     if getattr(request.app.state, "shutting_down", False):
-        if request.url.path not in ("/health", "/ready", "/metrics", "/metrics/"):
+        if request.url.path not in ("/health", "/ready", "/metrics", "/metrics/") and not request.url.path.startswith("/dashboard"):
             return JSONResponse(
                 status_code=503,
                 content={"error": "shutting_down", "detail": "Server is shutting down"},
