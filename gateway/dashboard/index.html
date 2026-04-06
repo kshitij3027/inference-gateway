@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inference Gateway Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+    <header>
+        <h1>Inference Gateway</h1>
+        <div id="connection-status">
+            <span id="status-dot" class="connecting"></span>
+            <span id="status-text">Connecting...</span>
+        </div>
+    </header>
+    <main>
+        <section id="backend-health" class="panel">
+            <h2>Backend Health</h2>
+            <div id="health-grid"></div>
+        </section>
+
+        <section id="hash-ring-panel" class="panel">
+            <h2>Hash Ring</h2>
+            <div id="ring-container">
+                <svg id="ring-svg" viewBox="0 0 300 300"></svg>
+                <div id="ring-legend"></div>
+            </div>
+        </section>
+
+        <section id="request-flow-panel" class="panel wide">
+            <h2>Request Flow</h2>
+            <div id="flow-pipeline">
+                <div class="flow-stage" data-stage="auth">Auth</div>
+                <div class="flow-arrow">&rarr;</div>
+                <div class="flow-stage" data-stage="rate-limit">Rate Limit</div>
+                <div class="flow-arrow">&rarr;</div>
+                <div class="flow-stage" data-stage="cache">Cache</div>
+                <div class="flow-arrow">&rarr;</div>
+                <div class="flow-stage" data-stage="queue">Queue</div>
+                <div class="flow-arrow">&rarr;</div>
+                <div class="flow-stage" data-stage="backend">Backend</div>
+                <div class="flow-arrow">&rarr;</div>
+                <div class="flow-stage" data-stage="response">Response</div>
+            </div>
+            <div id="flow-stats">
+                <span>Active: <strong id="active-count">0</strong></span>
+                <span>Completed: <strong id="completed-count">0</strong></span>
+                <span>Rate Limited: <strong id="ratelimited-count">0</strong></span>
+            </div>
+        </section>
+
+        <section id="tenant-usage-panel" class="panel">
+            <h2>Tenant Usage</h2>
+            <canvas id="tenant-chart"></canvas>
+        </section>
+
+        <section id="cache-panel" class="panel">
+            <h2>Cache Hit Ratio</h2>
+            <canvas id="cache-gauge"></canvas>
+            <div id="cache-stats-text"></div>
+        </section>
+    </main>
+    <script src="dashboard.js"></script>
+</body>
+</html>
