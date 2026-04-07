@@ -3062,3 +3062,141 @@ Each event is a JSON message: `{"type": "<event_type>", "data": {...}, "ts": <un
 
 **Q: "What happens if a dashboard client is slow and can't keep up with the event rate?"**
 **A:** The `broadcast()` method iterates all connected WebSocket clients and calls `send_text()` for each. If a client's TCP buffer fills up because it's processing events slowly, the `send_text()` call will eventually raise an exception (connection timeout or broken pipe), and the lazy pruning logic removes that client from the set. There's no per-client buffering or backpressure — slow clients are disconnected. This is intentional: the dashboard is a best-effort visualization tool, not a reliable event delivery system. If backpressure were needed (for a production monitoring use case), I would add a per-client asyncio.Queue with a bounded size, dropping oldest events when the queue is full, and a dedicated sender task per client that drains the queue.
+
+## Admin CLI & Cost Tracking
+
+### Why this exists
+
+Operators need two things to manage the gateway in production: a terminal-based admin tool for quick status checks and troubleshooting, and cost visibility for budget planning and chargeback. The admin API endpoints (built in earlier phases) expose all operational data as JSON, but parsing JSON from curl is tedious for routine tasks. The `igw` CLI wraps these endpoints with rich terminal tables, making operational workflows fast and ergonomic. Cost tracking provides per-request cost estimation accumulated daily per tenant, answering "how much did this tenant cost today?" without integrating with a billing system.
+
+### How it works
+
+**Cost Tracking Flow:**
+
+1. Client sends a chat completion request (streaming or non-streaming).
+2. After the LLM backend returns a response, the gateway reads `prompt_tokens` and `completion_tokens` from the response usage.
+3. `CostTracker.calculate_cost()` multiplies tokens by the backend's configured price. It checks `input_cost_per_1k_tokens` first (for input), falling back to `cost_per_1k_tokens`. Same for output with `output_cost_per_1k_tokens`. If no pricing is configured, cost is 0.
+4. `CostTracker.record_cost()` atomically increments the Redis key `cost:{tenant_id}:{YYYY-MM-DD}` via `INCRBYFLOAT`, sets a 25-hour TTL, and increments the `gateway_estimated_cost_dollars` Prometheus counter.
+5. For non-streaming responses, `request.state.estimated_cost` is set, and the middleware adds `X-Estimated-Cost: 0.059650` to the response headers. For streaming responses, headers are already sent when the cost is known, so the header is omitted but the cost is still recorded in Redis and Prometheus.
+
+**CLI Architecture:**
+
+The `igw` CLI is a thin HTTP client using `click` for command routing, `httpx` for HTTP requests, and `rich` for terminal formatting. Each command maps directly to one admin API endpoint:
+
+| Command | Endpoint | Output |
+|---------|----------|--------|
+| `igw status` | GET /health + /ready | Rich Panel with health status |
+| `igw backends` | GET /admin/backends | Rich Table: name, provider, models, health, error rate |
+| `igw tenants` | GET /admin/tenants | Rich Table: id, models, priority, rate limits |
+| `igw cache stats` | GET /admin/cache/stats | Rich Panel: hit rate, hits, misses, entries |
+| `igw cache flush` | DELETE /admin/cache | Confirmation prompt + flush result |
+| `igw ring` | GET /admin/ring | Rich Table per model: backend, vnodes, share % |
+| `igw journal` | GET /admin/journal | Rich Table: time, request ID, tenant, model, backend, status |
+| `igw cost` | GET /admin/cost | Rich Table: tenant, today cost, 7-day total |
+
+The `--gateway` / `-g` option (default `http://localhost:8080`, overridable via `IGW_GATEWAY_URL` env var) points the CLI at any gateway instance.
+
+### Implementation
+
+**`gateway/cost_tracker.py`** — `CostTracker` class with four methods:
+- `calculate_cost(backend, prompt_tokens, completion_tokens)` — static, pure function. Resolves input/output prices with fallback chain: `input_cost_per_1k_tokens` -> `cost_per_1k_tokens` -> 0. Formula: `(prompt * input_price + completion * output_price) / 1000`.
+- `record_cost(tenant_id, model, cost)` — Redis `INCRBYFLOAT` at key `cost:{tenant}:{date}` with 25-hour TTL. Increments `ESTIMATED_COST` Prometheus counter.
+- `get_daily_cost(tenant_id, date_str)` — Redis `GET` returning float.
+- `get_cost_summary(tenant_id, days)` — queries last N days, returns `{tenant_id, today, costs_by_date}`.
+
+**`gateway/config.py`** — Added `input_cost_per_1k_tokens` and `output_cost_per_1k_tokens` optional fields to `BackendConfig`, alongside the existing `cost_per_1k_tokens` (preserved for backward compatibility and routing strategy use).
+
+**`gateway/observability/metrics.py`** — Added `ESTIMATED_COST` Prometheus Counter with `[tenant, model]` labels.
+
+**`gateway/routes/chat.py`** — Three cost recording points: non-streaming path (after token budget recording), hedge path (after winner determination), and streaming path (in `_wrap_stream_with_journal` finally block). Each guarded with `getattr(request.app.state, "cost_tracker", None)`.
+
+**`gateway/routes/admin.py`** — Two new endpoints: `GET /admin/cost` (cost summary per tenant with `?tenant=` and `?days=` filters) and `GET /admin/tenants` (tenant list without API keys).
+
+**`gateway/main.py`** — Initializes `CostTracker` in lifespan (requires Redis, None otherwise). Adds `X-Estimated-Cost` response header in middleware from `request.state.estimated_cost`.
+
+**`cli/main.py`** — Click-based CLI with 8 commands. Uses `httpx.get()` / `httpx.delete()` for API calls and `rich.table.Table` / `rich.panel.Panel` for output formatting. Error handling wraps connection errors with user-friendly messages.
+
+### Key design decisions
+
+**Thin CLI over admin API, not embedded management commands.** The CLI makes HTTP requests to the gateway's admin endpoints rather than importing gateway code directly. This means the CLI can run from any machine (laptop, CI runner, jump box) that can reach the gateway, and it works identically against local Docker Compose and production AWS deployments. The trade-off is an extra network hop, but admin operations are infrequent and latency-insensitive.
+
+**Input/output cost fallback to single cost_per_1k_tokens.** The spec requires separate input and output pricing, but the existing `cost_per_1k_tokens` field is used by the `CostAwareStrategy` for routing. Rather than breaking backward compatibility, both new fields are optional and fall back to `cost_per_1k_tokens`. This means existing configs work unchanged, and operators can gradually add granular pricing. The routing strategy continues to use `cost_per_1k_tokens` for simplicity — it needs relative cheapness, not exact billing.
+
+**Redis INCRBYFLOAT instead of sorted sets or streams.** Daily cost accumulation needs only a running total per tenant per day. `INCRBYFLOAT` is atomic, lock-free, and O(1). A sorted set or stream would enable per-request cost history, but the spec explicitly says "no actual billing integration." The simple counter is the right abstraction for cost estimation — it answers "how much today?" without the overhead of storing every transaction. The 25-hour TTL auto-expires old keys.
+
+**No X-Estimated-Cost header for streaming responses.** HTTP response headers are sent before the first byte of body data. For streaming responses, the cost is only known after the stream completes (when all tokens are counted). This is a fundamental HTTP limitation, not a design choice. The cost is still recorded in Redis and Prometheus — only the response header is missing. This is documented and acceptable for an estimation feature.
+
+**click + rich instead of typer.** The spec explicitly names `click` + `rich`. Typer wraps click with type annotations, but adds a dependency layer. Using click directly keeps the dependency chain shorter and gives explicit control over command definitions. Rich provides the table/panel formatting that makes the CLI output readable.
+
+### Alternatives considered
+
+**Embedded CLI (import gateway modules directly) vs HTTP CLI.** An embedded CLI could access the registry, circuit breakers, and Redis directly without HTTP overhead. However, this couples the CLI to the gateway's runtime environment (Redis connection, config path, Python packages). The HTTP approach decouples the CLI from the gateway — it works against any instance, local or remote, and the CLI can be distributed as a standalone pip package. The admin API is the contract; the CLI is just a consumer.
+
+**Provider-reported cost vs gateway-estimated cost.** OpenAI and Anthropic return usage information in their responses, but the actual billing depends on the provider's pricing tiers, discounts, and rate card versions. The gateway's cost estimation uses a static price table in `backends.yaml`, which is always an approximation. A production system would query the provider's billing API for actual costs. The estimation approach is chosen because it's self-contained (no provider API calls), immediate (available at response time), and sufficient for budget monitoring (order-of-magnitude accuracy).
+
+**Monthly accumulation vs daily.** Daily Redis keys (`cost:{tenant}:{date}`) are simpler than monthly because they auto-expire individually. Monthly totals can be derived by summing the last 30 daily keys. A dedicated monthly key would require more complex TTL management (some months are 28 days, some 31) and an additional Redis operation per request. The daily approach also naturally supports cost-per-day trending in the CLI output.
+
+**Typer vs click.** Typer adds type-annotation-based CLI definition, which is more Pythonic for new projects. However, the spec names `click` explicitly, and typer is a wrapper around click that adds another dependency without significant benefit for 8 simple commands. Click's decorator-based approach is well-understood, stable, and sufficient.
+
+### Failure modes and edge cases
+
+**Redis unavailable.** When Redis is down, `cost_tracker` is `None` on `app.state`. All cost recording is silently skipped. The `/admin/cost` endpoint returns `{"enabled": false}`. The `igw cost` command shows "Cost tracking is disabled." This matches the gateway's existing graceful degradation pattern — Redis is best-effort for all features (cache, rate limiter, journal, queue).
+
+**Stale price configuration.** If a provider changes their pricing and the gateway's `backends.yaml` is not updated, cost estimates will be inaccurate. There is no automatic price synchronization. This is acceptable because cost tracking is explicitly labeled as "estimated" (not "billed"), and the `X-Estimated-Cost` header name reflects this. A production system would integrate with the provider's pricing API.
+
+**Token count approximation.** The gateway uses `tiktoken` for token counting, which is accurate for OpenAI models but approximate for Anthropic and Ollama models. For streaming responses, token counts are estimated from the buffered content, not from the provider's response metadata. Costs based on approximate token counts are correspondingly approximate.
+
+**Daily key boundary.** If a request starts at 23:59:59 and completes at 00:00:01, the cost is recorded against the completion date (the new day). This is a minor inaccuracy that doesn't affect daily totals meaningfully. The 25-hour TTL (not 24-hour) ensures keys don't expire prematurely for requests near midnight.
+
+**CLI connection failure.** If the gateway is unreachable, all CLI commands print a user-friendly error ("Cannot connect to gateway at ...") and exit with code 1. No stack trace. The `--gateway` option allows pointing at a different endpoint.
+
+### Observability
+
+**Prometheus metric:** `gateway_estimated_cost_dollars` Counter with labels `[tenant, model]`. Enables Grafana dashboards for cost-over-time, cost-by-tenant, and cost-by-model visualizations. The counter is cumulative — rate queries like `rate(gateway_estimated_cost_dollars[1h])` give hourly cost velocity.
+
+**Response header:** `X-Estimated-Cost: 0.059650` on every non-streaming response. Allows clients and load balancers to monitor per-request costs without parsing the response body. Useful for cost-aware routing at the client level.
+
+**Redis keys:** `cost:{tenant_id}:{YYYY-MM-DD}` keys are inspectable via `redis-cli GET cost:tenant-alpha:2025-01-15`. Useful for debugging cost accumulation without the admin API.
+
+**Structured logs:** `cost_recording_failed` warning log with tenant ID and error message when Redis operations fail. Enables alerting on cost tracking failures.
+
+### Testing
+
+**Unit tests** (`tests/unit/test_cost_tracker.py`, 12 tests): Cost calculation with input/output prices, single-price fallback, no-price zero return, zero tokens, Redis increment, TTL setting, zero-cost skip, Redis error handling, daily cost retrieval, and multi-day summary.
+
+**Unit tests** (`tests/unit/test_cli.py`, 8 tests): Each CLI command with mocked httpx responses, connection error handling, and custom gateway URL option. Uses `click.testing.CliRunner` for invocation.
+
+**Unit tests** (`tests/unit/test_admin.py`, 3 new tests): Admin cost endpoint with and without Redis, and tenant list endpoint.
+
+**E2E Docker tests** (`scripts/test-cli-e2e.sh`, 12 checks): Generates 13 real requests (5 beta/openai, 5 beta/anthropic, 3 duplicates for cache hits) against the live Docker Compose stack, then verifies all CLI commands return meaningful data: backends show real names and CLOSED state, tenants show alpha and beta, cache stats show hits, journal shows real entries, cost shows non-zero dollar values, and X-Estimated-Cost header is present on requests. Runs via `make test-cli`.
+
+### Production gaps
+
+**No real billing integration.** Cost tracking is estimation-only. A production system would record costs in a billing database, integrate with provider pricing APIs for accurate rates, and generate invoices. The Redis daily accumulator is a prototype for cost visibility, not a billing system.
+
+**Static price table.** Prices are hardcoded in `backends.yaml`. Provider pricing changes require a config update and gateway reload. A production system would fetch current pricing from provider APIs or a central pricing service.
+
+**No cost alerts.** There are no alarms when a tenant's daily cost exceeds a threshold. The Prometheus metric enables Grafana alerts, but no default alerting rules are configured. A production system would add CloudWatch or Prometheus alerts for cost budget overruns.
+
+**No multi-currency support.** All costs are in US dollars. International deployments may need currency conversion.
+
+**CLI has no authentication.** The admin API endpoints have no authentication. In production, the CLI would need a `--token` option for Bearer auth, and the admin endpoints would require admin credentials.
+
+### Interview talking points
+
+- **The cost tracking architecture demonstrates understanding of accuracy vs complexity tradeoffs.** The gateway estimates costs from a static price table rather than querying provider billing APIs. This is explicitly labeled "estimated" (X-Estimated-Cost, not X-Cost) because token counts may be approximate (tiktoken vs provider counting), prices may be stale, and streaming responses can't report costs in headers. The design acknowledges these limitations upfront rather than pretending to be a billing system.
+
+- **The CLI-over-API pattern shows clean separation of concerns.** The `igw` CLI has zero knowledge of Redis, circuit breakers, or the gateway internals. It's a pure HTTP client that formats JSON responses as tables. This means it works against any gateway instance (local, staging, production) without environment-specific configuration beyond the URL. If the admin API changes, the CLI updates independently of the gateway — they communicate through the HTTP contract, not shared code.
+
+- **The Redis INCRBYFLOAT pattern for daily cost accumulation is the simplest correct solution.** Compared to sorted sets (which enable per-request history) or streams (which enable event replay), a simple atomic counter answers the primary question — "how much today?" — with O(1) time and space. The 25-hour TTL auto-cleans old data. This is a deliberate choice to match the feature's scope: cost estimation for visibility, not billing for invoicing.
+
+### Likely interview questions
+
+**Q: "Why not use the provider's billing API for accurate cost tracking?"**
+**A:** Provider billing APIs report actual charges after the fact, with varying delays (minutes to hours). The gateway's cost estimation is immediate — available at response time — because it uses a local price table. The trade-off is accuracy: the estimation may differ from the actual bill due to stale prices, token count approximations, and provider-specific discounts. For the use case of "approximate cost visibility for budget monitoring," immediate estimation is more useful than delayed accuracy. A production system would reconcile estimated costs against actual provider invoices periodically.
+
+**Q: "How would you handle cost tracking across multiple gateway instances?"**
+**A:** Redis handles this automatically. All three gateway instances in Docker Compose (and all N ECS tasks in production) use the same Redis instance. `INCRBYFLOAT` is atomic — concurrent increments from multiple instances produce a correct total without distributed locking. The `cost:{tenant}:{date}` key accumulates costs from all instances. The Prometheus metric also aggregates correctly because Prometheus scrapes all instances and sums the counters. The CLI's `igw cost` command queries a single gateway instance, which reads from shared Redis, so it shows the global total regardless of which instance it connects to.
+
+**Q: "What would you change to turn this into a real billing system?"**
+**A:** Three major additions. First, replace the static price table with a pricing service that tracks provider rate changes and per-customer discounts — costs would be calculated at billing time, not request time, using the price that was effective when the request was made. Second, replace Redis daily counters with a durable transaction log (PostgreSQL or a dedicated billing database) that records every request with its cost, tokens, model, and timestamp — this enables detailed invoicing, dispute resolution, and audit trails. Third, add a reconciliation pipeline that compares estimated costs against actual provider invoices and flags discrepancies. The current Redis-based estimation would remain as a real-time cost dashboard, with the billing database as the source of truth for actual charges.
