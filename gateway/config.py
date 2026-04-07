@@ -35,6 +35,8 @@ class BackendConfig(BaseModel):
     max_concurrent: int = 10
     timeout_ms: int = 120000
     cost_per_1k_tokens: float | None = None
+    input_cost_per_1k_tokens: float | None = None
+    output_cost_per_1k_tokens: float | None = None
 
 
 class TenantConfig(BaseModel):

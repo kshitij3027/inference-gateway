@@ -61,6 +61,12 @@ TOKENS_CONSUMED = Counter(
     ["tenant", "model", "type"],  # type: "prompt" or "completion"
 )
 
+ESTIMATED_COST = Counter(
+    "gateway_estimated_cost_dollars",
+    "Estimated cost in dollars",
+    ["tenant", "model"],
+)
+
 # --- Concurrency metrics ---
 
 ACTIVE_REQUESTS = Gauge(
