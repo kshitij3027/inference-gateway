@@ -34,3 +34,7 @@ python-dotenv>=1.0.0
 
 # WebSocket support for dashboard
 websockets>=14.0
+
+# CLI tool
+click>=8.1.0
+rich>=13.0.0

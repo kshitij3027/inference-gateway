@@ -17,6 +17,8 @@ dependencies = [
     "tiktoken>=0.8.0",
     "python-dotenv>=1.0.0",
     "websockets>=14.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +29,12 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.13.0",
 ]
+
+[project.scripts]
+igw = "cli.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["gateway*", "cli*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

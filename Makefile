@@ -1,4 +1,4 @@
-.PHONY: up down test logs build seed status chaos chaos-down loadtest rolling-restart terraform-validate
+.PHONY: up down test logs build seed status chaos chaos-down loadtest rolling-restart terraform-validate test-cli
 
 up:
 	docker compose up --build -d
@@ -41,3 +41,14 @@ rolling-restart:
 
 terraform-validate:
 	@bash scripts/test-terraform.sh
+
+test-cli:
+	docker compose up --build -d
+	@echo "Waiting for services to be ready..."
+	@sleep 20
+	docker build --target cli-test -t inference-gateway:cli-test .
+	docker run --rm --network inference-gateway_default \
+	  -e IGW_GATEWAY_URL=http://nginx:80 \
+	  -e TENANT_ALPHA_KEY=test-alpha-key \
+	  -e TENANT_BETA_KEY=test-beta-key \
+	  inference-gateway:cli-test
