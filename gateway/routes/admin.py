@@ -241,3 +241,49 @@ async def warm_cache(request: Request, body: CacheWarmRequest):
 
     logger.info("cache_warm_completed", warmed=warmed, errors=errors)
     return {"status": "completed", "warmed": warmed, "errors": errors}
+
+
+@router.get("/tenants")
+async def list_tenants(request: Request):
+    """List configured tenants (without exposing API keys)."""
+    registry = request.app.state.registry
+    seen = set()
+    tenants = []
+    for tenant in registry.api_key_to_tenant.values():
+        if tenant.id in seen:
+            continue
+        seen.add(tenant.id)
+        tenants.append({
+            "id": tenant.id,
+            "allowed_models": tenant.allowed_models,
+            "priority": tenant.priority,
+            "rate_limit_rps": tenant.rate_limit_rps,
+            "rate_limit_rpm": tenant.rate_limit_rpm,
+            "token_budget_daily": tenant.token_budget_daily,
+        })
+    return tenants
+
+
+@router.get("/cost")
+async def cost_summary(request: Request, tenant: str | None = None, days: int = 7):
+    """Return estimated cost summary per tenant."""
+    cost_tracker = getattr(request.app.state, "cost_tracker", None)
+    if cost_tracker is None:
+        return {"enabled": False, "message": "Cost tracking requires Redis"}
+
+    registry = request.app.state.registry
+    days = min(days, 30)
+
+    if tenant:
+        summary = await cost_tracker.get_cost_summary(tenant, days=days)
+        return {"enabled": True, **summary}
+
+    # All tenants
+    seen = set()
+    tenant_ids = []
+    for t in registry.api_key_to_tenant.values():
+        if t.id not in seen:
+            seen.add(t.id)
+            tenant_ids.append(t.id)
+    summaries = await cost_tracker.get_all_tenants_cost(tenant_ids, days=days)
+    return {"enabled": True, "tenants": summaries}

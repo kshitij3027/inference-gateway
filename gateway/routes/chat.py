@@ -199,6 +199,8 @@ async def _wrap_stream_with_journal(
     start_time,
     rate_limiter,
     token_budget_daily,
+    cost_tracker=None,
+    backend=None,
 ):
     """Record journal completion and token metrics after streaming finishes."""
     buffered_content = []
@@ -253,6 +255,15 @@ async def _wrap_stream_with_journal(
                 await rate_limiter.record_tokens(
                     tenant_id, tokens_prompt + tokens_completion
                 )
+            except Exception:
+                pass
+
+        # Record cost for streaming
+        if cost_tracker and backend:
+            try:
+                cost = cost_tracker.calculate_cost(backend, tokens_prompt, tokens_completion)
+                if cost > 0:
+                    await cost_tracker.record_cost(tenant_id, model, cost)
             except Exception:
                 pass
 
@@ -642,6 +653,8 @@ async def chat_completions(
                 wrapped_gen, journal, request_id, tenant.id,
                 backend.name, chat_request.model, chat_request.messages,
                 request_start_time, rate_limiter, tenant.token_budget_daily,
+                cost_tracker=getattr(request.app.state, "cost_tracker", None),
+                backend=backend,
             )
         if broadcaster:
             wrapped_gen = _wrap_stream_with_events(
@@ -737,6 +750,19 @@ async def chat_completions(
                                 logger.warning(
                                     "token_recording_failed", error=str(e)
                                 )
+
+                        # Record cost estimate (hedge)
+                        cost_tracker = getattr(request.app.state, "cost_tracker", None)
+                        if cost_tracker:
+                            try:
+                                cost = cost_tracker.calculate_cost(
+                                    winner, result.usage.prompt_tokens, result.usage.completion_tokens
+                                )
+                                if cost > 0:
+                                    await cost_tracker.record_cost(tenant.id, chat_request.model, cost)
+                                    request.state.estimated_cost = cost
+                            except Exception as e:
+                                logger.warning("cost_recording_failed", error=str(e))
 
                         # Cache store
                         if semantic_cache is not None:
@@ -902,6 +928,19 @@ async def chat_completions(
                     await rate_limiter.record_tokens(tenant.id, result.usage.total_tokens)
                 except Exception as e:
                     logger.warning("token_recording_failed", error=str(e))
+
+            # Record cost estimate
+            cost_tracker = getattr(request.app.state, "cost_tracker", None)
+            if cost_tracker:
+                try:
+                    cost = cost_tracker.calculate_cost(
+                        backend, result.usage.prompt_tokens, result.usage.completion_tokens
+                    )
+                    if cost > 0:
+                        await cost_tracker.record_cost(tenant.id, chat_request.model, cost)
+                        request.state.estimated_cost = cost
+                except Exception as e:
+                    logger.warning("cost_recording_failed", error=str(e))
 
             # Store in cache on miss
             if semantic_cache is not None:

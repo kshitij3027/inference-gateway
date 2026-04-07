@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -335,3 +335,43 @@ class TestCacheWarm:
         assert resp.status_code == 200
         assert resp.json()["errors"] == 1
         assert resp.json()["warmed"] == 0
+
+
+class TestListTenants:
+    async def test_returns_tenants(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/tenants")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) >= 1
+        assert "id" in data[0]
+        assert "allowed_models" in data[0]
+
+
+class TestCostSummary:
+    async def test_cost_disabled_without_redis(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/cost")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is False
+
+    async def test_cost_with_tracker(self, monkeypatch):
+        registry = _make_registry(monkeypatch)
+        app = _make_test_app(registry)
+        # Add mock cost tracker
+        mock_tracker = AsyncMock()
+        mock_tracker.get_all_tenants_cost = AsyncMock(return_value=[
+            {"tenant_id": "t1", "today": 0.05, "costs_by_date": {"2025-01-15": 0.05}}
+        ])
+        app.state.cost_tracker = mock_tracker
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.get("/admin/cost")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["enabled"] is True
+        assert "tenants" in data

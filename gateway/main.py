@@ -75,11 +75,15 @@ async def lifespan(app: FastAPI):
         app.state.redis = aioredis.from_url(redis_url, decode_responses=True)
         await app.state.redis.ping()
         app.state.rate_limiter = RateLimiter(app.state.redis)
+        from gateway.cost_tracker import CostTracker
+        app.state.cost_tracker = CostTracker(app.state.redis)
         logger.info("redis_connected", url=redis_url)
+        logger.info("cost_tracker_initialized")
     except Exception as e:
         logger.warning("redis_unavailable", error=str(e))
         app.state.redis = None
         app.state.rate_limiter = None
+        app.state.cost_tracker = None
 
     # Semantic cache (requires Redis)
     if app.state.redis is not None:
@@ -293,6 +297,10 @@ async def request_id_middleware(request: Request, call_next):
         hedge_loser = getattr(request.state, "hedge_loser", None)
         if hedge_loser:
             response.headers["X-Hedge-Loser"] = hedge_loser
+
+        estimated_cost = getattr(request.state, "estimated_cost", None)
+        if estimated_cost is not None:
+            response.headers["X-Estimated-Cost"] = f"{estimated_cost:.6f}"
 
         # Prometheus metrics
         from gateway.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY

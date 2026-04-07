@@ -27,6 +27,8 @@ backends:
     max_concurrent: 10
     timeout_ms: 30000
     cost_per_1k_tokens: 0.03
+    input_cost_per_1k_tokens: 0.01
+    output_cost_per_1k_tokens: 0.03
 
   - name: mock-openai-2
     provider: openai
@@ -82,6 +84,8 @@ backends:
     max_concurrent: 10
     timeout_ms: 30000
     cost_per_1k_tokens: 0.01
+    input_cost_per_1k_tokens: 0.005
+    output_cost_per_1k_tokens: 0.015
 
   - name: mock-anthropic-2
     provider: anthropic
