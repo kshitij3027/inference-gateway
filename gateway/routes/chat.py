@@ -17,6 +17,7 @@ from gateway.backends import anthropic as anthropic_backend
 from gateway.backends import ollama
 from gateway.backends import openai as openai_backend
 from gateway.config import TenantConfig
+from gateway.observability.tracing import get_tracer
 from gateway.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -364,71 +365,77 @@ async def chat_completions(
             "stream": bool(chat_request.stream),
         })
 
-    rate_limiter = getattr(request.app.state, "rate_limiter", None)
-    if rate_limiter is not None:
-        try:
-            allowed, deny_info = await rate_limiter.check_rate_limit(
-                tenant.id, request_id, tenant.rate_limit_rps, tenant.rate_limit_rpm
-            )
-            if not allowed:
-                logger.warning("rate_limit_exceeded", tenant_id=tenant.id, **deny_info)
-                RATE_LIMIT_REJECTIONS.labels(
-                    tenant=tenant.id, limit_type=deny_info["limit_type"]
-                ).inc()
-                if broadcaster:
-                    broadcaster.emit("rate_limit_hit", {
-                        "request_id": request_id,
-                        "tenant_id": tenant.id,
-                        "limit_type": deny_info["limit_type"],
-                    })
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "error": "rate_limit_exceeded",
-                        "type": deny_info["limit_type"],
-                        "limit": deny_info["limit"],
-                        "current": deny_info["current"],
-                        "retry_after": deny_info["retry_after"],
-                    },
-                    headers={"Retry-After": str(int(deny_info["retry_after"]))},
+    tracer = get_tracer()
+    with tracer.start_as_current_span("gateway.rate_limit") as span:
+        span.set_attribute("tenant.id", tenant.id)
+        rate_limiter = getattr(request.app.state, "rate_limiter", None)
+        if rate_limiter is not None:
+            try:
+                allowed, deny_info = await rate_limiter.check_rate_limit(
+                    tenant.id, request_id, tenant.rate_limit_rps, tenant.rate_limit_rpm
                 )
+                if not allowed:
+                    logger.warning("rate_limit_exceeded", tenant_id=tenant.id, **deny_info)
+                    RATE_LIMIT_REJECTIONS.labels(
+                        tenant=tenant.id, limit_type=deny_info["limit_type"]
+                    ).inc()
+                    if broadcaster:
+                        broadcaster.emit("rate_limit_hit", {
+                            "request_id": request_id,
+                            "tenant_id": tenant.id,
+                            "limit_type": deny_info["limit_type"],
+                        })
+                    span.set_attribute("rate_limit.allowed", False)
+                    span.set_attribute("rate_limit.limit_type", deny_info["limit_type"])
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "error": "rate_limit_exceeded",
+                            "type": deny_info["limit_type"],
+                            "limit": deny_info["limit"],
+                            "current": deny_info["current"],
+                            "retry_after": deny_info["retry_after"],
+                        },
+                        headers={"Retry-After": str(int(deny_info["retry_after"]))},
+                    )
 
-            # Token budget pre-check
-            budget_ok, budget_info = await rate_limiter.check_token_budget(
-                tenant.id, tenant.token_budget_daily
-            )
-            if not budget_ok:
-                logger.warning("token_budget_exceeded", tenant_id=tenant.id, **budget_info)
-                RATE_LIMIT_REJECTIONS.labels(
-                    tenant=tenant.id, limit_type="token_budget_daily"
-                ).inc()
-                if broadcaster:
-                    broadcaster.emit("rate_limit_hit", {
-                        "request_id": request_id,
-                        "tenant_id": tenant.id,
-                        "limit_type": "token_budget_daily",
-                    })
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "error": "token_budget_exceeded",
-                        "type": "token_budget_daily",
-                        "limit": budget_info["limit"],
-                        "current": budget_info["current"],
-                        "retry_after": budget_info["retry_after"],
-                    },
-                    headers={"Retry-After": str(int(budget_info["retry_after"]))},
+                # Token budget pre-check
+                budget_ok, budget_info = await rate_limiter.check_token_budget(
+                    tenant.id, tenant.token_budget_daily
                 )
+                if not budget_ok:
+                    logger.warning("token_budget_exceeded", tenant_id=tenant.id, **budget_info)
+                    RATE_LIMIT_REJECTIONS.labels(
+                        tenant=tenant.id, limit_type="token_budget_daily"
+                    ).inc()
+                    if broadcaster:
+                        broadcaster.emit("rate_limit_hit", {
+                            "request_id": request_id,
+                            "tenant_id": tenant.id,
+                            "limit_type": "token_budget_daily",
+                        })
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "error": "token_budget_exceeded",
+                            "type": "token_budget_daily",
+                            "limit": budget_info["limit"],
+                            "current": budget_info["current"],
+                            "retry_after": budget_info["retry_after"],
+                        },
+                        headers={"Retry-After": str(int(budget_info["retry_after"]))},
+                    )
 
-            # Store remaining counts for response headers
-            request.state.rate_limit_remaining = await rate_limiter.get_remaining(
-                tenant.id, tenant.rate_limit_rps, tenant.rate_limit_rpm
-            )
-        except HTTPException:
-            raise  # Re-raise 429s
-        except Exception as e:
-            logger.warning("rate_limit_check_failed", error=str(e))
-            # Graceful degradation: allow request if Redis fails
+                # Store remaining counts for response headers
+                request.state.rate_limit_remaining = await rate_limiter.get_remaining(
+                    tenant.id, tenant.rate_limit_rps, tenant.rate_limit_rpm
+                )
+            except HTTPException:
+                raise  # Re-raise 429s
+            except Exception as e:
+                logger.warning("rate_limit_check_failed", error=str(e))
+                # Graceful degradation: allow request if Redis fails
+        span.set_attribute("rate_limit.allowed", True)
 
     # Check model access
     if "*" not in tenant.allowed_models and chat_request.model not in tenant.allowed_models:
@@ -438,75 +445,88 @@ async def chat_completions(
         )
 
     # Record journal entry
-    if journal is not None:
-        prompt_hash = RequestJournal.compute_prompt_hash(chat_request.messages)
-        await journal.record_request(
-            request_id=request_id,
-            tenant_id=tenant.id,
-            model=chat_request.model,
-            prompt_hash=prompt_hash,
-            timestamp=time.time(),
-        )
+    with tracer.start_as_current_span("gateway.journal.write") as span:
+        span.set_attribute("request.id", request_id)
+        span.set_attribute("tenant.id", tenant.id)
+        span.set_attribute("journal.phase", "request")
+        if journal is not None:
+            prompt_hash = RequestJournal.compute_prompt_hash(chat_request.messages)
+            await journal.record_request(
+                request_id=request_id,
+                tenant_id=tenant.id,
+                model=chat_request.model,
+                prompt_hash=prompt_hash,
+                timestamp=time.time(),
+            )
 
     # Semantic cache check (after auth + rate-limit, before routing)
-    semantic_cache = getattr(request.app.state, "semantic_cache", None)
-    cache_isolation = getattr(tenant, "cache_isolation", "shared")
+    with tracer.start_as_current_span("gateway.cache.lookup") as cache_span:
+        cache_span.set_attribute("tenant.id", tenant.id)
+        cache_span.set_attribute("cache.model", chat_request.model)
+        semantic_cache = getattr(request.app.state, "semantic_cache", None)
+        cache_isolation = getattr(tenant, "cache_isolation", "shared")
 
-    if semantic_cache is not None:
-        try:
-            cached_response, cache_similarity, cache_tier = await semantic_cache.lookup(
-                model=chat_request.model,
-                messages=chat_request.messages,
-                tenant_id=tenant.id,
-                cache_isolation=cache_isolation,
-            )
-            if cached_response is not None:
-                await semantic_cache.record_hit()
-                if broadcaster:
-                    broadcaster.emit("cache_hit", {
-                        "request_id": request_id,
-                        "model": chat_request.model,
-                        "tenant_id": tenant.id,
-                    })
-                CACHE_OPERATIONS.labels(model=chat_request.model, status="hit").inc()
-                request.state.cache_status = cache_tier or "L2_HIT"
-                request.state.cache_similarity = cache_similarity
-                logger.info(
-                    "cache_hit",
+        if semantic_cache is not None:
+            try:
+                cached_response, cache_similarity, cache_tier = await semantic_cache.lookup(
                     model=chat_request.model,
+                    messages=chat_request.messages,
                     tenant_id=tenant.id,
-                    similarity=cache_similarity,
-                    streaming=chat_request.stream,
+                    cache_isolation=cache_isolation,
                 )
-                if journal is not None:
-                    await journal.record_completion(
-                        request_id=request_id,
-                        status=200,
-                        latency_ms=round((time.perf_counter() - request_start_time) * 1000, 2),
-                        backend="cache",
-                        cache_hit=True,
-                        tokens_prompt=cached_response.usage.prompt_tokens,
-                        tokens_completion=cached_response.usage.completion_tokens,
+                if cached_response is not None:
+                    cache_span.set_attribute("cache.hit", True)
+                    cache_span.set_attribute("cache.tier", cache_tier or "L2_HIT")
+                    cache_span.set_attribute("cache.similarity", cache_similarity)
+                    await semantic_cache.record_hit()
+                    if broadcaster:
+                        broadcaster.emit("cache_hit", {
+                            "request_id": request_id,
+                            "model": chat_request.model,
+                            "tenant_id": tenant.id,
+                        })
+                    CACHE_OPERATIONS.labels(model=chat_request.model, status="hit").inc()
+                    request.state.cache_status = cache_tier or "L2_HIT"
+                    request.state.cache_similarity = cache_similarity
+                    logger.info(
+                        "cache_hit",
+                        model=chat_request.model,
+                        tenant_id=tenant.id,
+                        similarity=cache_similarity,
+                        streaming=chat_request.stream,
                     )
-                if chat_request.stream:
-                    return StreamingResponse(
-                        _stream_cached_response(cached_response),
-                        media_type="text/event-stream",
-                    )
-                return cached_response
-            else:
-                await semantic_cache.record_miss()
-                CACHE_OPERATIONS.labels(model=chat_request.model, status="miss").inc()
+                    if journal is not None:
+                        await journal.record_completion(
+                            request_id=request_id,
+                            status=200,
+                            latency_ms=round((time.perf_counter() - request_start_time) * 1000, 2),
+                            backend="cache",
+                            cache_hit=True,
+                            tokens_prompt=cached_response.usage.prompt_tokens,
+                            tokens_completion=cached_response.usage.completion_tokens,
+                        )
+                    if chat_request.stream:
+                        return StreamingResponse(
+                            _stream_cached_response(cached_response),
+                            media_type="text/event-stream",
+                        )
+                    return cached_response
+                else:
+                    cache_span.set_attribute("cache.hit", False)
+                    await semantic_cache.record_miss()
+                    CACHE_OPERATIONS.labels(model=chat_request.model, status="miss").inc()
+                    request.state.cache_status = "MISS"
+                    if broadcaster:
+                        broadcaster.emit("cache_miss", {
+                            "request_id": request_id,
+                            "model": chat_request.model,
+                            "tenant_id": tenant.id,
+                        })
+            except Exception as e:
+                logger.warning("cache_lookup_failed", error=str(e))
                 request.state.cache_status = "MISS"
-                if broadcaster:
-                    broadcaster.emit("cache_miss", {
-                        "request_id": request_id,
-                        "model": chat_request.model,
-                        "tenant_id": tenant.id,
-                    })
-        except Exception as e:
-            logger.warning("cache_lookup_failed", error=str(e))
-            request.state.cache_status = "MISS"
+        else:
+            cache_span.set_attribute("cache.hit", False)
 
     # Stampede guard (non-streaming only)
     lock_acquired = False
