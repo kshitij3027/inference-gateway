@@ -40,12 +40,32 @@ def translate_request(
     messages = []
     for msg in request.messages:
         if msg.role == "system":
-            system_parts.append(msg.content)
+            system_parts.append(msg.content or "")
+        elif msg.role == "tool":
+            # Tool result messages → Anthropic tool_result content block in user message
+            messages.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": msg.tool_call_id or "", "content": msg.content or ""}],
+            })
+        elif msg.role == "assistant" and msg.tool_calls:
+            # Assistant messages with tool_use calls
+            content_blocks: list[dict] = []
+            if msg.content:
+                content_blocks.append({"type": "text", "text": msg.content})
+            for tc in msg.tool_calls:
+                if isinstance(tc, dict):
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "input": json.loads(tc.get("function", {}).get("arguments", "{}")) if isinstance(tc.get("function", {}).get("arguments"), str) else tc.get("function", {}).get("arguments", {}),
+                    })
+            messages.append({"role": "assistant", "content": content_blocks})
         else:
             messages.append(
                 AnthropicMessage(
                     role=msg.role,
-                    content=[AnthropicContentBlock(text=msg.content)],
+                    content=[AnthropicContentBlock(text=msg.content or "")],
                 ).model_dump()
             )
 
@@ -69,6 +89,28 @@ def translate_request(
         else:
             body["stop_sequences"] = request.stop
 
+    # Function calling: translate tools from OpenAI to Anthropic format
+    tools = request.model_extra.get("tools") if request.model_extra else None
+    if tools:
+        anthropic_tools = []
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("type") == "function":
+                fn = tool["function"]
+                anthropic_tools.append({
+                    "name": fn["name"],
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                })
+        if anthropic_tools:
+            body["tools"] = anthropic_tools
+
+        tool_choice = request.model_extra.get("tool_choice") if request.model_extra else None
+        if tool_choice:
+            if isinstance(tool_choice, str):
+                body["tool_choice"] = {"type": tool_choice}
+            elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+                body["tool_choice"] = {"type": "tool", "name": tool_choice["function"]["name"]}
+
     # Build headers
     api_key = os.environ.get(backend.api_key_env or "", "")
     headers = {
@@ -84,12 +126,23 @@ def translate_response(data: dict, model: str) -> ChatCompletionResponse:
     """Convert Anthropic Messages response to OpenAI chat completion format."""
     anthropic_resp = AnthropicResponse.model_validate(data)
 
-    # Extract text from content blocks
+    # Extract text and tool_use from content blocks
     text_parts = []
+    tool_calls = []
     for block in anthropic_resp.content:
-        if block.type == "text":
+        if block.type == "text" and block.text:
             text_parts.append(block.text)
-    content = "".join(text_parts)
+        elif block.type == "tool_use":
+            tool_calls.append({
+                "id": block.id or "",
+                "type": "function",
+                "function": {
+                    "name": block.name or "",
+                    "arguments": json.dumps(block.input) if isinstance(block.input, dict) else str(block.input or ""),
+                },
+            })
+
+    content = "".join(text_parts) if text_parts else None
 
     # Map stop_reason to finish_reason
     finish_reason = STOP_REASON_MAP.get(anthropic_resp.stop_reason or "", "stop")
@@ -98,7 +151,10 @@ def translate_response(data: dict, model: str) -> ChatCompletionResponse:
         model=model,
         choices=[
             Choice(
-                message=ChatMessageResponse(content=content),
+                message=ChatMessageResponse(
+                    content=content,
+                    tool_calls=tool_calls if tool_calls else None,
+                ),
                 finish_reason=finish_reason,
             ),
         ],

@@ -26,7 +26,7 @@ class RequestJournal:
     @staticmethod
     def compute_prompt_hash(messages: list) -> str:
         """SHA256 hash of concatenated user messages (privacy: never log full prompts)."""
-        user_text = "\n".join(m.content for m in messages if m.role == "user")
+        user_text = "\n".join(m.content or "" for m in messages if m.role == "user")
         return hashlib.sha256(user_text.encode()).hexdigest()[:16]
 
     async def record_request(

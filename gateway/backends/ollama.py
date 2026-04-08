@@ -29,7 +29,7 @@ logger = structlog.get_logger()
 def translate_request(request: ChatCompletionRequest) -> OllamaRequest:
     """Convert OpenAI chat completion request to Ollama format."""
     messages = [
-        OllamaMessage(role=msg.role, content=msg.content) for msg in request.messages
+        OllamaMessage(role=msg.role, content=msg.content or "") for msg in request.messages
     ]
 
     options = {}
@@ -76,6 +76,12 @@ async def chat_completion(
     request: ChatCompletionRequest,
 ) -> ChatCompletionResponse:
     """Send a chat completion request to Ollama and return OpenAI-format response."""
+    # Ollama does not support function calling
+    if request.model_extra and request.model_extra.get("tools"):
+        raise HTTPException(
+            status_code=400,
+            detail="Function calling (tools) is not supported for Ollama backends",
+        )
     ollama_request = translate_request(request)
 
     start = time.perf_counter()
@@ -127,6 +133,12 @@ async def stream_chat_completion(
     request: ChatCompletionRequest,
 ) -> AsyncGenerator[str, None]:
     """Stream chat completion from Ollama, translating NDJSON to OpenAI SSE format."""
+    # Ollama does not support function calling
+    if request.model_extra and request.model_extra.get("tools"):
+        raise HTTPException(
+            status_code=400,
+            detail="Function calling (tools) is not supported for Ollama backends",
+        )
     ollama_request = translate_request(request)
     ollama_request.stream = True
 

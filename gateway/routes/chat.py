@@ -228,7 +228,7 @@ async def _wrap_stream_with_journal(
     finally:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         full_content = "".join(buffered_content)
-        prompt_text = "\n".join(m.content for m in messages)
+        prompt_text = "\n".join(m.content or "" for m in messages)
         tokens_prompt = count_tokens(prompt_text, model)
         tokens_completion = count_tokens(full_content, model) if full_content else 0
 

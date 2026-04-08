@@ -74,12 +74,12 @@ class SemanticCache:
     @staticmethod
     def _extract_user_text(messages: list) -> str:
         """Concatenate all user-role message contents."""
-        return "\n".join(m.content for m in messages if m.role == "user")
+        return "\n".join(m.content or "" for m in messages if m.role == "user")
 
     @staticmethod
     def _extract_system_hash(messages: list) -> str:
         """SHA256 hash of concatenated system-role message contents."""
-        system_text = "\n".join(m.content for m in messages if m.role == "system")
+        system_text = "\n".join(m.content or "" for m in messages if m.role == "system")
         return hashlib.sha256(system_text.encode()).hexdigest()[:16]
 
     def compute_system_embedding(self, messages: list) -> tuple[str, list[float]]:
@@ -88,7 +88,7 @@ class SemanticCache:
         Returns (sys_hash, embedding). The embedding is cached by sys_hash
         so repeated system prompts avoid redundant embedding computation.
         """
-        system_text = "\n".join(m.content for m in messages if m.role == "system")
+        system_text = "\n".join(m.content or "" for m in messages if m.role == "system")
         sys_hash = self._extract_system_hash(messages)
 
         if sys_hash not in self._prefix_cache and system_text:

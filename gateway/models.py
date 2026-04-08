@@ -9,8 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    model_config = ConfigDict(extra="allow")
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict] | None = None
+    name: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -28,7 +32,8 @@ class ChatCompletionRequest(BaseModel):
 
 class ChatMessageResponse(BaseModel):
     role: str = "assistant"
-    content: str
+    content: str | None = None
+    tool_calls: list[dict] | None = None
 
 
 class Choice(BaseModel):
@@ -57,7 +62,7 @@ class ChatCompletionResponse(BaseModel):
 
 class OllamaMessage(BaseModel):
     role: str
-    content: str
+    content: str | None = None
 
 
 class OllamaRequest(BaseModel):
@@ -84,8 +89,12 @@ class OllamaResponse(BaseModel):
 
 
 class AnthropicContentBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
     type: str = "text"
-    text: str
+    text: str | None = None
+    id: str | None = None
+    name: str | None = None
+    input: dict | None = None
 
 
 class AnthropicMessage(BaseModel):

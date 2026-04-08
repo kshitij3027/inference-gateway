@@ -46,8 +46,9 @@ def translate_response(data: dict, model: str) -> ChatCompletionResponse:
         choices = data["choices"]
         first_choice = choices[0]
         message = first_choice["message"]
-        content = message.get("content", "")
+        content = message.get("content")
         finish_reason = first_choice.get("finish_reason", "stop")
+        tool_calls = message.get("tool_calls")
     except (KeyError, IndexError) as e:
         raise ValueError(f"Invalid OpenAI response structure: {e}")
 
@@ -61,7 +62,7 @@ def translate_response(data: dict, model: str) -> ChatCompletionResponse:
         model=model,
         choices=[
             Choice(
-                message=ChatMessageResponse(content=content),
+                message=ChatMessageResponse(content=content, tool_calls=tool_calls),
                 finish_reason=finish_reason,
             ),
         ],
