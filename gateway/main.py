@@ -170,6 +170,10 @@ async def lifespan(app: FastAPI):
     from gateway.coalescing import RequestCoalescer
     app.state.coalescer = RequestCoalescer()
 
+    # OpenTelemetry tracing (optional — requires OTEL_EXPORTER_OTLP_ENDPOINT)
+    from gateway.observability.tracing import init_tracing
+    app.state.tracer_provider = init_tracing(app)
+
     # Wire circuit breaker state changes to dashboard events
     def _on_cb_state_change(backend: str, old_state: str, new_state: str):
         app.state.event_broadcaster.emit("circuit_state_change", {
@@ -218,6 +222,9 @@ async def lifespan(app: FastAPI):
             logger.warning(
                 "drain_timeout", remaining=app.state.inflight_count
             )
+
+    from gateway.observability.tracing import shutdown_tracing
+    shutdown_tracing(getattr(app.state, "tracer_provider", None))
 
     if getattr(app.state, "redis", None):
         await app.state.redis.aclose()
@@ -308,6 +315,15 @@ async def request_id_middleware(request: Request, call_next):
 
         if getattr(request.state, "coalesced", False):
             response.headers["X-Coalesced"] = "true"
+
+        try:
+            from opentelemetry import trace as _trace
+            _span = _trace.get_current_span()
+            _ctx = _span.get_span_context()
+            if _ctx and _ctx.trace_id:
+                response.headers["X-Trace-ID"] = format(_ctx.trace_id, "032x")
+        except Exception:
+            pass
 
         estimated_cost = getattr(request.state, "estimated_cost", None)
         if estimated_cost is not None:

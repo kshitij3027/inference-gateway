@@ -103,6 +103,59 @@ The main agent thread is an **orchestrator, not an implementer**. Protect its co
 - **Subagent prompts must be self-contained**: Include the project path, which files to read first, what to create/modify, expected interfaces, and testing expectations. Never assume a subagent has prior context.
 - See `.claude/skills/orchestration/SKILL.md` for the detailed delegation pattern.
 
+### 9. DESIGN.md Is a Living Document
+
+DESIGN.md is the project's architecture journal. It is updated **once per phase** — not per commit, not retroactively after all phases.
+
+- The phased breakdown file (`InferenceGateway_Breakdown.md`) specifies a **section name** and **content guidance** for each phase. Writing that section is **mandatory output**, equal in importance to code and tests. A phase is not complete until its DESIGN.md section is written.
+- If DESIGN.md doesn't exist, create it with a project title (`# InferenceGateway — Design Document`) and the first section.
+- Write the section **during the phase** as you learn from implementing — don't defer it to the end.
+- The final commit of a phase must include the DESIGN.md update: `[docs] DESIGN.md — <section name>`.
+- **Never rewrite or restructure previous phases' sections** — only append new sections.
+- Content covers architecture decisions, tradeoffs, and "why" — not just implementation details.
+
+**Use this exact section template:**
+
+```markdown
+## <Feature Name>
+
+### Why this exists
+<Problem being solved — what breaks or is missing without this component>
+
+### How it works
+<Step-by-step request/data flow through this component>
+
+### Implementation
+<Key modules, classes, functions, storage mechanisms, algorithms used>
+
+### Key design decisions
+<Why this specific approach was chosen>
+
+### Alternatives considered
+<Option A vs Option B — what was rejected and why>
+
+### Failure modes and edge cases
+<Timeouts, partial failures, race conditions, stale state, split-brain, etc.>
+
+### Observability
+<Logs, metrics, admin/debug endpoints related to this component>
+
+### Testing
+<Unit tests, integration tests, load tests — what is covered and how>
+
+### Production gaps
+<What is simplified for local dev vs what a real deployment would need>
+
+### Interview talking points
+- <Point 1>
+- <Point 2>
+- <Point 3>
+
+### Likely interview questions
+**Q:** ...
+**A:** ...
+```
+
 ---
 
 ## Development Conventions
@@ -154,3 +207,12 @@ The project README should include:
 
 - **Skills** (`.claude/skills/`) cover workflows: commit flow, Docker testing, orchestration, UI testing.
 - **Rules** (`.claude/rules/`) cover coding conventions: language-specific patterns, linting/formatting preferences, tooling instructions. Check these before writing code.
+
+## Plugins
+
+Two plugins are installed locally (see `.claude/settings.local.json`). Always use their skills and agents during implementation.
+
+- **python-development** — Python 3.12+ conventions, async patterns, FastAPI, testing, tooling (ruff, mypy, uv, pytest)
+- **backend-development** — API design, architecture patterns, resilience, observability, microservices, test strategy
+
+See `.claude/rules/plugins.md` for usage directives and `.claude/rules/project.md` for project-specific context.
