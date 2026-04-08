@@ -13,6 +13,9 @@ x-gateway-env: &gateway-env
   L1_MAX_ENTRIES: "500"
   L1_TTL: "3600"
   CHAOS_ENABLED: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+  OTEL_SERVICE_NAME: "inference-gateway"
+  OTEL_SAMPLING_RATE: "1.0"
 
 x-gateway-common: &gateway-common
   build:
@@ -35,6 +38,8 @@ x-gateway-common: &gateway-common
     mock-openai-1:
       condition: service_started
     mock-anthropic-1:
+      condition: service_started
+    jaeger:
       condition: service_started
   restart: unless-stopped
 
@@ -167,6 +172,15 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
     restart: unless-stopped
 
 volumes:

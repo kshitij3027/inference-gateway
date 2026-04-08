@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 FROM base AS test
-RUN pip install --no-cache-dir pytest pytest-asyncio pytest-httpx pyyaml click rich
+RUN pip install --no-cache-dir pytest pytest-asyncio pytest-httpx pyyaml click rich opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp-proto-http opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx
 COPY pyproject.toml .
 COPY gateway/ gateway/
 COPY cli/ cli/
