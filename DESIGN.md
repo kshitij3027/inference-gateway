@@ -3345,3 +3345,265 @@ The gateway's original retry loop did immediate failover to a different backend 
 
 **Q: "How would you extend function calling to support streaming tool calls?"**
 **A:** Streaming tool calls require incremental assembly of the tool call structure across multiple chunks. OpenAI's streaming format sends tool call deltas: `{delta: {tool_calls: [{index: 0, function: {arguments: "chunk"}}]}}`. The gateway would need to: (1) extend `ChunkDelta` to include `tool_calls` deltas, (2) update the OpenAI streaming translator to pass through tool call chunks, (3) update the Anthropic streaming translator to convert `content_block_start`/`content_block_delta` events for `tool_use` blocks into OpenAI-format tool call deltas, and (4) buffer tool call arguments across chunks for the Anthropic translator (since Anthropic sends the input as a sequence of JSON string fragments). The OpenAI case is straightforward passthrough; the Anthropic case requires stateful streaming translation. This is a natural next step but was scoped out of this phase to keep the implementation focused.
+
+## Distributed Tracing
+
+### Why this exists
+
+Without tracing, debugging latency issues requires correlating scattered logs across pipeline stages. A single slow request could be caused by auth delay, cache miss, queue wait, slow backend, or circuit breaker state — but logs alone don't show the time breakdown. You might see "request took 3.2 seconds" in a log line, but have no way to know whether 2.8 seconds were spent waiting in the priority queue or whether the backend itself was slow. Distributed tracing provides visual waterfall views of each request's journey through all pipeline stages, making latency attribution immediate and precise.
+
+### How it works
+
+Every incoming request is automatically wrapped in a root span by FastAPI's OpenTelemetry auto-instrumentation. Within that root span, the gateway creates child spans for each pipeline stage:
+
+```
+gateway.request (auto — FastAPI)
+  ├── gateway.auth
+  ├── gateway.rate_limit
+  ├── gateway.cache.lookup
+  ├── gateway.router
+  ├── gateway.queue.wait
+  ├── gateway.translator.request
+  │     └── HTTP call (auto — httpx)
+  ├── gateway.circuit_breaker
+  ├── gateway.cache.store
+  └── gateway.journal.write
+```
+
+1. **Request arrives** — FastAPI auto-instrumentation creates the root span and injects trace context.
+2. **Authentication** (`gateway.auth`) — Validates the API key, records `tenant.id` as a span attribute.
+3. **Rate limiting** (`gateway.rate_limit`) — Checks token budget and rate limits. Records `rate_limit.allowed` (bool).
+4. **Cache lookup** (`gateway.cache.lookup`) — Queries the semantic cache. Records `cache.hit`, `cache.tier`, `cache.similarity`.
+5. **Routing** (`gateway.router`) — Selects a backend. Records `route.backend`, `route.provider`.
+6. **Queue wait** (`gateway.queue.wait`) — Acquires a concurrency slot. Span duration directly shows queue wait time.
+7. **Backend call** (`gateway.translator.request`) — Calls the selected backend. httpx auto-instrumentation creates a nested child span, propagating trace context via W3C traceparent headers.
+8. **Post-call stages** (non-streaming only) — Circuit breaker outcome (`gateway.circuit_breaker`), cache storage (`gateway.cache.store`), and journal completion (`gateway.journal.write`).
+
+The trace ID is returned via the `X-Trace-ID` response header.
+
+### Implementation
+
+**`gateway/observability/tracing.py`** — Central tracing setup:
+- `init_tracing()` — Configures OTLP HTTP exporter, `BatchSpanProcessor`, and `TraceIdRatioBasedSampler` via `OTEL_SAMPLING_RATE`. Called once during FastAPI lifespan startup.
+- `shutdown_tracing()` — Flushes pending spans and shuts down the tracer provider.
+- `get_tracer()` — Returns a tracer from the current provider. Called inside functions (not module level) for test isolation.
+
+**`gateway/auth.py`** — Wraps API key validation in a `gateway.auth` span with `tenant.id` attribute.
+
+**`gateway/routes/chat.py`** — All pipeline spans. Each stage wrapped with `tracer.start_as_current_span()`. Spans exist in both streaming and non-streaming paths for pre-call stages; post-call spans are non-streaming only.
+
+**Auto-instrumentation** — FastAPI and httpx instrumentors activated during `init_tracing()`.
+
+**Infrastructure** — Jaeger all-in-one container in docker-compose (OTLP on 4318, UI on 16686).
+
+### Key design decisions
+
+**Inline spans with `tracer.start_as_current_span()` instead of decorators or middleware** — Keeps span creation, attribute setting, and business logic co-located. A decorator pattern would separate span configuration from runtime values (e.g., setting `cache.hit=True` after the lookup). Middleware would be too coarse — one span per request reveals nothing about pipeline breakdown.
+
+**`get_tracer()` called inside functions, not cached at module level** — Module-level caching captures the tracer at import time, before `init_tracing()` runs and before tests can inject a mock provider. Calling inside functions ensures the current provider is always used.
+
+**No-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset** — The OTel API returns a no-op tracer by default, so all `start_as_current_span()` calls become zero-cost no-ops. No feature flags or conditional imports needed.
+
+**Dot-notation span attribute namespaces** — `tenant.id`, `cache.hit`, `route.backend` follow OTel semantic conventions for custom namespaces, making spans filterable in Jaeger without conflicting with standard attribute names.
+
+**`BatchSpanProcessor` for async export** — Spans are batched and exported in a background thread, keeping the request hot path free of export latency.
+
+### Alternatives considered
+
+**Middleware-based spans** — A single span per request captures total latency but provides no visibility into which pipeline stage is slow. Equivalent to a log line saying "request took X ms" — useful but not actionable. Rejected.
+
+**Decorator pattern** — `@traced("gateway.auth")` reduces boilerplate but prevents dynamic attribute setting based on function results, requires understanding which exceptions are "expected" vs "errors," and adds an abstraction layer. Rejected.
+
+**Custom span context propagation for streaming** — Would require passing span objects through nested async generator chains. Fragile, complex, and couples streaming abstractions to the tracing system. Deferred as a production gap.
+
+**Zipkin instead of Jaeger** — Jaeger's all-in-one Docker image is simpler, its UI has better trace comparison, and it natively supports OTLP without an intermediary collector.
+
+### Failure modes and edge cases
+
+**Jaeger unavailable** — OTLP exporter silently drops spans. `BatchSpanProcessor` buffers and retries, then discards. Tracing must never block or fail requests.
+
+**High sampling in production** — At 100% sampling, every request generates 8-10 spans. Set `OTEL_SAMPLING_RATE` to 0.01-0.1 for production.
+
+**Provider shutdown timeout** — `TracerProvider.shutdown()` blocks up to 5 seconds flushing the batch processor.
+
+**Streaming path gaps** — Post-call spans missing in streaming path — traces show pre-routing stages but not post-call processing.
+
+**Attribute truncation** — OTel default attribute value limit (1024 chars) may silently truncate long values.
+
+### Observability
+
+**Jaeger UI** — `http://localhost:16686`. Search by service name, operation, tags (`tenant.id=acme`), duration. Waterfall view shows span hierarchy and timing.
+
+**X-Trace-ID header** — Every response includes the trace ID for lookup in Jaeger.
+
+**OTEL_SAMPLING_RATE** — Environment variable (0.0-1.0, default 1.0) controlling sampling ratio.
+
+### Testing
+
+**Unit tests** (`tests/unit/test_tracing.py`) — 14 tests covering `init_tracing`/`shutdown_tracing` behavior, auth span creation, and all pipeline spans using `InMemorySpanExporter` with `SimpleSpanProcessor`.
+
+**Integration tests** (`tests/integration/test_tracing_e2e.py`) — Full span tree verification: asserts all expected span names are present, validates key attributes (`tenant.id`, `cache.hit`, `route.backend`, `cb.outcome`), and verifies journal spans cover both request and completion phases.
+
+**E2E script** (`scripts/test-tracing-e2e.sh`) — Sends a request via curl, captures `X-Trace-ID`, queries Jaeger API, and asserts all expected spans appear in the trace.
+
+### Production gaps
+
+- **Streaming post-call spans missing** — `gateway.circuit_breaker`, `gateway.cache.store`, and `gateway.journal.write` not created in streaming path. Requires trace context propagation through async generator chains.
+- **No trace-log correlation** — Structlog does not include `trace_id`/`span_id` in log entries. Would need a structlog processor to inject these.
+- **No tail-based sampling** — Head-based sampling may miss interesting traces. Tail-based requires an OTel Collector intermediary.
+- **No span-level error recording** — Exceptions within spans are not recorded via `span.set_status(ERROR)` or `span.record_exception()`.
+- **No span-derived metrics** — RED metrics per pipeline stage could be derived via OTel Collector span-to-metrics connector.
+
+### Interview talking points
+
+- **The no-op pattern demonstrates zero-cost abstraction.** When tracing infrastructure is absent, OTel returns a no-op tracer. All span creation calls become no-ops — no feature flags, no conditional imports, no "is tracing enabled?" checks. The instrumented code reads identically whether tracing is on or off.
+
+- **Per-stage spans vs middleware illustrates granularity tradeoffs.** A middleware-only approach gives total latency but no breakdown. Per-stage spans let you see that a 3-second request spent 2.5 seconds in `gateway.queue.wait` and 0.4 seconds in `gateway.translator.request`. This changes debugging from guesswork to precision.
+
+- **Streaming context propagation reveals a real async Python limitation.** Async generators don't automatically inherit parent span context across `yield` boundaries. Solving this requires explicit context passing, which couples the streaming abstraction to the tracing system — a genuine engineering tradeoff between clean code and complete observability.
+
+### Likely interview questions
+
+**Q: "Why not just use logs for debugging latency issues?"**
+**A:** Logs capture discrete events but don't connect them into a causal chain or show timing relationships. To debug a slow request with logs, you manually compute durations between timestamps and mentally reconstruct the execution flow. Tracing does this automatically — the waterfall view shows parent-child relationships, precise start/end timestamps, and immediately reveals which stage dominated latency. Logs and traces are complementary: logs provide detail about what happened, traces show timing and structure of how it happened.
+
+**Q: "How do you handle the performance overhead of tracing?"**
+**A:** Three mechanisms: (1) no-op tracer when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset — zero cost, (2) `BatchSpanProcessor` exports asynchronously in a background thread — request path never blocks on export, (3) `TraceIdRatioBasedSampler` via `OTEL_SAMPLING_RATE` — at 1% sampling, 99% of requests skip span creation entirely. Start with 1-5% in production, increase temporarily for debugging.
+
+**Q: "How would you add tracing to the streaming response path?"**
+**A:** Capture the span context before entering the generator, re-attach it inside using `opentelemetry.context.attach()` before creating child spans, and create post-call spans in a `finally` block. The complexity is that error handling, generator cleanup, and async cancellation all need to interact correctly with the attached context. Solvable but requires careful edge case testing (client disconnect mid-stream, generator exhaustion, exception propagation).
+
+## Distributed Tracing
+
+### Why this exists
+
+Without tracing, debugging latency issues requires correlating scattered logs across pipeline stages. A single slow request could be caused by auth delay, cache miss, queue wait, slow backend, or circuit breaker state — but logs alone don't show the time breakdown. When a user reports "the API is slow," the team must manually grep through logs, mentally reconstruct the request timeline, and guess which stage consumed the most time.
+
+Distributed tracing provides visual waterfall views of each request's journey through all pipeline stages. A single trace shows exactly how long auth took, whether the cache hit or missed, how long the request waited in the priority queue, and how long the backend LLM call took — all in a single Jaeger UI view. This turns latency debugging from a multi-hour log correlation exercise into a 30-second visual inspection.
+
+### How it works
+
+1. When a request arrives, FastAPI auto-instrumentation (via `opentelemetry-instrumentation-fastapi`) creates a root span `gateway.request` covering the entire HTTP request lifecycle.
+2. Each pipeline stage creates a child span using `tracer.start_as_current_span()`, forming this hierarchy:
+
+```
+gateway.request (auto — FastAPI)
+  ├── gateway.auth
+  ├── gateway.rate_limit
+  ├── gateway.cache.lookup
+  ├── gateway.router
+  ├── gateway.queue.wait
+  ├── gateway.translator.request
+  │     └── HTTP call (auto — httpx)
+  ├── gateway.circuit_breaker
+  ├── gateway.cache.store
+  └── gateway.journal.write
+```
+
+3. Each span records stage-specific attributes using dot-notation namespaces (e.g., `tenant.id`, `cache.hit`, `route.backend`, `cb.outcome`).
+4. The `gateway.translator.request` span wraps the backend LLM call. Inside it, httpx auto-instrumentation creates a nested span for the actual HTTP request, showing network-level timing separately from gateway-level orchestration.
+5. Post-call spans (`gateway.circuit_breaker`, `gateway.cache.store`, `gateway.journal.write` with `journal.phase=completion`) execute after the backend response in the non-streaming path.
+6. The `BatchSpanProcessor` batches completed spans and exports them to Jaeger via the OTLP HTTP protocol (`/v1/traces` endpoint).
+7. The request ID middleware in `gateway/main.py` extracts the active trace context and sets an `X-Trace-ID` response header, allowing clients to look up their request's trace in Jaeger directly.
+
+### Implementation
+
+**Tracing bootstrap** (`gateway/observability/tracing.py`):
+- `init_tracing(app)` — Initializes the `TracerProvider` with a `Resource` (service name from `OTEL_SERVICE_NAME`), configures `TraceIdRatioBased` sampling when `OTEL_SAMPLING_RATE < 1.0`, creates an `OTLPSpanExporter` pointing at `OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces`, wires up `BatchSpanProcessor`, and auto-instruments FastAPI (per-app) and httpx (global). Returns the provider for lifecycle management, or `None` if no endpoint is configured.
+- `shutdown_tracing(provider)` — Calls `provider.shutdown()` to flush pending spans. Called during app lifespan teardown.
+- `get_tracer(name)` — Returns a tracer from the global provider via `trace.get_tracer()`. When no provider is configured, OpenTelemetry's API returns a no-op tracer that accepts all calls but does nothing.
+
+**Auth span** (`gateway/auth.py`):
+- Wraps tenant authentication in a `gateway.auth` span. Sets `tenant.id` on success, records auth failures.
+
+**Pipeline spans** (`gateway/routes/chat.py`):
+- `gateway.rate_limit` — Wraps rate limit and token budget check. Attributes: `tenant.id`, `rate_limit.allowed`.
+- `gateway.journal.write` — Wraps journal entry creation for both request and completion phases. Attributes: `journal.phase` ("request" or "completion"), `journal.status`.
+- `gateway.cache.lookup` — Wraps semantic cache lookup. Attributes: `cache.hit`.
+- `gateway.router` — Wraps backend selection. Attributes: `route.backend`.
+- `gateway.queue.wait` — Wraps priority queue slot acquisition. Records queue wait time.
+- `gateway.translator.request` — Wraps the backend API call. Attributes: `translator.streaming`.
+- `gateway.circuit_breaker` — Wraps circuit breaker outcome recording. Attributes: `cb.outcome` ("success" or "failure").
+- `gateway.cache.store` — Wraps cache storage after a successful response.
+
+**Infrastructure** (`docker-compose.yaml`):
+- Jaeger all-in-one container (`jaegertracing/all-in-one:1.62`) provides collector, storage, and UI.
+- Gateway environment: `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318`, `OTEL_SERVICE_NAME=inference-gateway`, `OTEL_SAMPLING_RATE=1.0`.
+- Jaeger UI accessible on port 16686 for trace visualization.
+
+### Key design decisions
+
+1. **Inline spans with `tracer.start_as_current_span()` instead of decorators or middleware.** Each span is a `with` block wrapping the exact code it measures. This makes the span boundaries explicit in the code, allows setting attributes mid-execution based on results (e.g., `cache.hit` after the lookup), and avoids abstraction layers that obscure what is being traced.
+
+2. **`get_tracer()` called inside functions, not cached at module level.** This allows tests to inject an `InMemorySpanExporter` via a test `TracerProvider` after import time. If tracers were cached at module level, test provider injection would not take effect.
+
+3. **No-op when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset.** When `init_tracing()` detects no endpoint, it returns `None` and does not configure a provider. The OpenTelemetry API's default no-op tracer handles all `start_as_current_span()` calls as zero-cost no-ops. This means tracing code is always present but has no overhead when disabled — no feature flags, no conditional span creation, no `if tracing_enabled:` guards.
+
+4. **Span attributes use dot-notation namespaces** (`tenant.id`, `cache.hit`, `route.backend`, `cb.outcome`). This follows OpenTelemetry semantic conventions and enables structured querying in Jaeger (e.g., find all traces where `cache.hit=false` and `route.backend=ollama-1`).
+
+5. **`X-Trace-ID` response header.** The middleware extracts the trace ID from the active span context and returns it as a response header. This lets API consumers jump directly to their trace in Jaeger without searching by time range.
+
+6. **`TraceIdRatioBased` sampling controlled by `OTEL_SAMPLING_RATE`.** Head-based sampling at the gateway level, defaulting to 1.0 (sample everything) for development. In production, lowering to 0.1 or 0.01 reduces export overhead while still capturing representative traces.
+
+### Alternatives considered
+
+1. **Middleware-based spans (single span per request).** Rejected because a single middleware span covers the entire request but does not show the internal breakdown. The whole point of tracing in this gateway is to see which pipeline stage is slow — auth, cache, queue, or backend. Middleware gives one span; per-stage instrumentation gives ten.
+
+2. **Decorator pattern (`@traced("gateway.auth")`).** Rejected because it adds complexity without benefit for this codebase. Decorators obscure span boundaries in the code, make it harder to set attributes mid-execution (you'd need to pass the span through function parameters), and add an abstraction layer that makes debugging the tracing itself harder. The inline `with` pattern is explicit and readable.
+
+3. **Custom span context propagation for streaming responses.** Deferred because streaming responses use async generators, and propagating OTel context across `yield` boundaries in nested async generators is complex and fragile. The current implementation traces the streaming path through the pre-call stages (auth, rate limit, cache, router, queue) but skips post-call spans (circuit breaker, cache store, journal completion) in the streaming path. This is documented as a production gap.
+
+4. **Zipkin instead of Jaeger.** Both support OTLP, but Jaeger's all-in-one image provides a simpler local setup with built-in UI, collector, and in-memory storage. Switching backends is a one-line endpoint change since the gateway exports via standard OTLP.
+
+### Failure modes and edge cases
+
+- **Jaeger unavailable:** Spans are silently dropped by the OTLP exporter. The `BatchSpanProcessor` buffers spans in memory and attempts export; on connection failure, spans are discarded. No impact on request processing — tracing is fully fire-and-forget.
+- **High sampling rate in production:** Sampling at 1.0 means every request generates a full trace. Under high throughput, this creates significant export overhead and Jaeger storage pressure. Use `OTEL_SAMPLING_RATE < 1.0` (e.g., 0.1 for 10% of requests) to reduce overhead.
+- **Provider shutdown timeout:** `BatchSpanProcessor` has a 5-second default shutdown timeout. During graceful shutdown, the provider attempts to flush buffered spans within this window. If the exporter is slow or Jaeger is unreachable, some spans may be lost on shutdown.
+- **Span context not propagated to streaming post-call stages:** In the streaming path, post-call spans (circuit breaker, cache store, journal completion) are not created because the response has already been sent to the client and trace context is not propagated through the streaming wrapper. These operations still execute but are invisible to tracing.
+- **Test provider reset:** Tests must reset the global `TracerProvider` (via `trace._TRACER_PROVIDER_SET_ONCE._done = False`) to inject in-memory exporters. This uses private OTel API internals and may break on SDK upgrades.
+
+### Observability
+
+- **Jaeger UI** (port 16686): Visual trace timeline showing span hierarchy, durations, and attributes for each request.
+- **X-Trace-ID response header:** Every response includes the trace ID, enabling direct lookup in Jaeger.
+- **Span attributes for filtering:** Jaeger queries can filter by `tenant.id`, `cache.hit`, `route.backend`, `cb.outcome`, `rate_limit.allowed`, and `journal.phase` to find specific request patterns.
+- **Structlog integration:** Request logs include `request_id` for correlation, though trace ID is not yet injected into log records (documented as a production gap).
+
+### Testing
+
+**Unit tests** (`tests/unit/test_tracing.py`):
+- `TestInitTracing` — Verifies `init_tracing()` returns `None` when no endpoint is configured, returns a `TracerProvider` when endpoint is set, and `get_tracer()` returns a tracer instance. Tests `shutdown_tracing()` with `None` to confirm no-op safety.
+- `TestAuthSpan` — Uses `InMemorySpanExporter` with `SimpleSpanProcessor` to capture spans in-process. Verifies `gateway.auth` span is created on both successful and failed authentication, and that `tenant.id` is set correctly on success.
+- `TestPreRoutingSpans` — Verifies each pipeline span is created with correct attributes: `gateway.rate_limit` (with `tenant.id`, `rate_limit.allowed`), `gateway.cache.lookup` (with `cache.hit`), `gateway.journal.write` (with `journal.phase`), `gateway.router` (with `route.backend`), `gateway.translator.request` (with `translator.streaming`), `gateway.circuit_breaker` (with `cb.outcome`), `gateway.cache.store`, and journal completion phase (with `journal.status`).
+
+**Integration tests** (`tests/integration/test_tracing_e2e.py`):
+- `TestTracingSpanTree` — Sends a full chat completion request through the app with a mocked translator and verifies the complete span tree. `test_all_pipeline_spans_present` asserts all nine expected span names exist. `test_span_attributes_correct` verifies attribute values across all span types. `test_journal_has_both_phases` confirms both request and completion journal phases are traced.
+
+**E2E script** (`scripts/test-tracing-e2e.sh`):
+- Sends a real request to the deployed gateway and queries the Jaeger API to verify spans reached the collector. Validates the span hierarchy in a running Docker Compose environment.
+
+### Production gaps
+
+- **Streaming post-call spans missing.** In the streaming path, `gateway.circuit_breaker`, `gateway.cache.store`, and `gateway.journal.write` (completion phase) are not traced. The streaming response wrapper does not carry trace context, so these operations happen outside the request's trace tree. Fixing this requires propagating the span context through the async generator chain.
+- **No trace-log correlation.** Structlog does not include `trace_id` or `span_id` in log records. In production, correlating a log line to its trace requires matching by `request_id` and timestamp. Adding trace context to structlog's processor chain would enable direct log-to-trace linkage.
+- **No tail-based sampling.** The current head-based sampling (`TraceIdRatioBased`) decides whether to sample at trace creation time. Tail-based sampling (deciding after the trace is complete) would allow always capturing error traces or high-latency traces regardless of sampling rate, but requires an intermediate collector (e.g., OpenTelemetry Collector with tail-sampling processor).
+- **No span-level error recording on exceptions.** When a pipeline stage raises an exception, the span ends but does not record the exception via `span.record_exception()` or set `span.set_status(StatusCode.ERROR)`. This means error traces in Jaeger show the span duration but not the error details.
+- **In-memory Jaeger storage.** The all-in-one Jaeger image uses in-memory storage, so traces are lost on container restart. Production would use Elasticsearch, Cassandra, or ClickHouse as a persistent backend.
+
+### Interview talking points
+
+- **The no-op pattern:** When `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, `init_tracing()` returns `None` and never configures a provider. All `tracer.start_as_current_span()` calls still execute but against the OTel API's default no-op tracer, which is essentially zero-cost. This means tracing code is unconditional — no feature flags, no `if` guards — yet has zero overhead when disabled. This is the same pattern OpenTelemetry recommends for library instrumentation.
+- **Why per-stage spans instead of middleware:** A middleware span gives you one rectangle in Jaeger covering the full request. Per-stage spans give you ten nested rectangles showing exactly where time was spent. When a request takes 3 seconds, you can instantly see if it was 2.5 seconds in `gateway.queue.wait` (queue backpressure) or 2.5 seconds in `gateway.translator.request` (slow LLM backend). This breakdown is the entire value proposition of tracing in a multi-stage pipeline.
+- **Streaming context propagation challenges:** Python async generators don't automatically propagate OTel context across `yield` boundaries. When a streaming response yields chunks, the trace context is lost after the first `yield`. Fixing this requires manually attaching context to each chunk or wrapping the generator in a context-preserving adapter. This is a known gap in the OTel Python SDK's async generator support and a genuine production engineering challenge.
+
+### Likely interview questions
+
+**Q: "Why not just use logs for debugging latency issues? What does tracing give you that structured logging doesn't?"**
+**A:** Structured logs can tell you that a request was slow and which stages it passed through, but they can't show you the time breakdown visually. With logs, you'd need to grep for a request ID, find the timestamp of each stage's entry and exit, calculate durations manually, and mentally reconstruct the sequence. With tracing, you open Jaeger, search by trace ID (returned in the `X-Trace-ID` header), and immediately see a waterfall diagram showing that auth took 2ms, cache lookup took 5ms, queue wait took 200ms, and the backend call took 2.8 seconds. Tracing also captures parent-child relationships — you can see that the HTTP call span is nested inside `gateway.translator.request`, separating network time from gateway orchestration time. Logs are flat; traces are hierarchical.
+
+**Q: "How do you handle the performance overhead of tracing in production?"**
+**A:** Three mechanisms. First, the no-op pattern: when `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, all tracing calls go through the OTel no-op tracer, which is essentially free. Second, `TraceIdRatioBased` sampling via `OTEL_SAMPLING_RATE`: setting this to 0.1 means only 10% of traces are captured, reducing export volume by 90% while still providing representative data. Third, `BatchSpanProcessor` batches span exports rather than sending each span individually, amortizing the network overhead. The sampling decision is made at trace creation time (head-based), so child spans inherit the parent's sampling decision — you either get a complete trace or no trace, never a partial one.
+
+**Q: "How would you add tracing to the streaming path?"**
+**A:** The challenge is that streaming responses use async generators, and Python's OTel context propagation doesn't survive `yield` boundaries. The approach would be to capture the span context before entering the generator, then manually reattach it inside the generator using `context.attach(ctx)` around each post-call operation (circuit breaker recording, cache storage, journal completion). Alternatively, you could use a background task that runs after the streaming response completes, passing the captured context to it. The key constraint is that the response is already being sent to the client during streaming, so the post-call spans would appear as siblings of the streaming span rather than children, which is semantically accurate — they happen after the response, not during it.
