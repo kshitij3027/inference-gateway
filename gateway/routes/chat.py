@@ -566,61 +566,74 @@ async def chat_completions(
     if chat_request.stream:
         cb_registry = request.app.state.circuit_breakers
         exclude = cb_registry.get_open_backends()
-        backend = registry.find_backend_for_model(
-            chat_request.model, routing_key=routing_key, exclude=exclude
-        )
-        if backend is None:
-            raise HTTPException(
-                status_code=503,
-                detail="All backends unavailable for this model",
+        with tracer.start_as_current_span("gateway.router") as router_span:
+            router_span.set_attribute("tenant.id", tenant.id)
+            router_span.set_attribute("route.model", chat_request.model)
+            backend = registry.find_backend_for_model(
+                chat_request.model, routing_key=routing_key, exclude=exclude
             )
-
-        # Queue: acquire concurrency slot
-        queue_manager = getattr(request.app.state, "queue_manager", None)
-        slot_backend = None
-        if queue_manager is not None:
-            slot_acquired = await queue_manager.acquire_slot(
-                backend.name, backend.max_concurrent
-            )
-            if not slot_acquired:
-                try:
-                    await queue_manager.enqueue(
-                        chat_request.model, request_id, tenant.priority
-                    )
-                    QUEUE_DEPTH.labels(model=chat_request.model).inc()
-                except QueueFullError:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Queue full",
-                        headers={"Retry-After": "5"},
-                    )
-                try:
-                    queue_wait_ms = await queue_manager.wait_for_slot(request_id)
-                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
-                    request.state.queue_wait_ms = queue_wait_ms
-                except QueueTimeoutError:
-                    await queue_manager.remove_from_queue(
-                        chat_request.model, request_id
-                    )
-                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
-                    raise HTTPException(
-                        status_code=504, detail="Queue timeout"
-                    )
-                # Re-check circuit breaker after dequeue
-                exclude = cb_registry.get_open_backends()
-                backend = registry.find_backend_for_model(
-                    chat_request.model, routing_key=routing_key, exclude=exclude
+            if backend is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="All backends unavailable for this model",
                 )
-                if backend is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="All backends unavailable after dequeue",
-                    )
-                await queue_manager.acquire_slot(
+            router_span.set_attribute("route.backend", backend.name)
+            router_span.set_attribute("route.provider", backend.provider)
+
+        with tracer.start_as_current_span("gateway.queue.wait") as queue_span:
+            queue_span.set_attribute("tenant.id", tenant.id)
+            queue_span.set_attribute("queue.model", chat_request.model)
+            queue_span.set_attribute("queue.backend", backend.name)
+            # Queue: acquire concurrency slot
+            queue_manager = getattr(request.app.state, "queue_manager", None)
+            slot_backend = None
+            if queue_manager is not None:
+                slot_acquired = await queue_manager.acquire_slot(
                     backend.name, backend.max_concurrent
                 )
-            slot_backend = backend.name
-            ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
+                if not slot_acquired:
+                    try:
+                        await queue_manager.enqueue(
+                            chat_request.model, request_id, tenant.priority
+                        )
+                        QUEUE_DEPTH.labels(model=chat_request.model).inc()
+                    except QueueFullError:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Queue full",
+                            headers={"Retry-After": "5"},
+                        )
+                    try:
+                        queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                        QUEUE_DEPTH.labels(model=chat_request.model).dec()
+                        request.state.queue_wait_ms = queue_wait_ms
+                    except QueueTimeoutError:
+                        await queue_manager.remove_from_queue(
+                            chat_request.model, request_id
+                        )
+                        QUEUE_DEPTH.labels(model=chat_request.model).dec()
+                        raise HTTPException(
+                            status_code=504, detail="Queue timeout"
+                        )
+                    # Re-check circuit breaker after dequeue
+                    exclude = cb_registry.get_open_backends()
+                    backend = registry.find_backend_for_model(
+                        chat_request.model, routing_key=routing_key, exclude=exclude
+                    )
+                    if backend is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="All backends unavailable after dequeue",
+                        )
+                    await queue_manager.acquire_slot(
+                        backend.name, backend.max_concurrent
+                    )
+                slot_backend = backend.name
+                ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
+            # Record queue wait time if applicable
+            queue_wait_ms = getattr(request.state, "queue_wait_ms", None)
+            if queue_wait_ms is not None:
+                queue_span.set_attribute("queue.wait_ms", queue_wait_ms)
 
         request.state.backend_name = backend.name
 
@@ -643,12 +656,18 @@ async def chat_completions(
             message_count=len(chat_request.messages),
         )
 
-        cb = cb_registry.get(backend.name)
-        raw_gen = stream_translator(
-            client=request.app.state.http_client,
-            backend=backend,
-            request=chat_request,
-        )
+        with tracer.start_as_current_span("gateway.translator.request") as trans_span:
+            trans_span.set_attribute("tenant.id", tenant.id)
+            trans_span.set_attribute("translator.model", chat_request.model)
+            trans_span.set_attribute("translator.backend", backend.name)
+            trans_span.set_attribute("translator.provider", backend.provider)
+            trans_span.set_attribute("translator.streaming", True)
+            cb = cb_registry.get(backend.name)
+            raw_gen = stream_translator(
+                client=request.app.state.http_client,
+                backend=backend,
+                request=chat_request,
+            )
 
         wrapped_gen = _wrap_stream_with_circuit_breaker(raw_gen, cb)
         wrapped_gen = _wrap_stream_with_analytics(
@@ -858,61 +877,74 @@ async def chat_completions(
     retry_count = 0
 
     for attempt in range(3):
-        backend = registry.find_backend_for_model(
-            chat_request.model, routing_key=routing_key, exclude=exclude
-        )
-        if backend is None:
-            break
+        with tracer.start_as_current_span("gateway.router") as router_span:
+            router_span.set_attribute("tenant.id", tenant.id)
+            router_span.set_attribute("route.model", chat_request.model)
+            backend = registry.find_backend_for_model(
+                chat_request.model, routing_key=routing_key, exclude=exclude
+            )
+            if backend is None:
+                break
+            router_span.set_attribute("route.backend", backend.name)
+            router_span.set_attribute("route.provider", backend.provider)
 
         request.state.backend_name = backend.name
 
-        # Queue: acquire concurrency slot
-        slot_backend = None
-        if queue_manager is not None:
-            slot_acquired = await queue_manager.acquire_slot(
-                backend.name, backend.max_concurrent
-            )
-            if not slot_acquired:
-                # At capacity — enqueue for the model
-                try:
-                    await queue_manager.enqueue(
-                        chat_request.model, request_id, tenant.priority
-                    )
-                    QUEUE_DEPTH.labels(model=chat_request.model).inc()
-                except QueueFullError:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Queue full",
-                        headers={"Retry-After": "5"},
-                    )
-                try:
-                    queue_wait_ms = await queue_manager.wait_for_slot(request_id)
-                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
-                    request.state.queue_wait_ms = queue_wait_ms
-                except QueueTimeoutError:
-                    await queue_manager.remove_from_queue(
-                        chat_request.model, request_id
-                    )
-                    QUEUE_DEPTH.labels(model=chat_request.model).dec()
-                    raise HTTPException(
-                        status_code=504, detail="Queue timeout"
-                    )
-                # Re-check circuit breaker and re-route after dequeue
-                exclude = cb_registry.get_open_backends()
-                backend = registry.find_backend_for_model(
-                    chat_request.model, routing_key=routing_key, exclude=exclude
-                )
-                if backend is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="All backends unavailable after dequeue",
-                    )
-                request.state.backend_name = backend.name
-                await queue_manager.acquire_slot(
+        with tracer.start_as_current_span("gateway.queue.wait") as queue_span:
+            queue_span.set_attribute("tenant.id", tenant.id)
+            queue_span.set_attribute("queue.model", chat_request.model)
+            queue_span.set_attribute("queue.backend", backend.name)
+            # Queue: acquire concurrency slot
+            slot_backend = None
+            if queue_manager is not None:
+                slot_acquired = await queue_manager.acquire_slot(
                     backend.name, backend.max_concurrent
                 )
-            slot_backend = backend.name
-            ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
+                if not slot_acquired:
+                    # At capacity — enqueue for the model
+                    try:
+                        await queue_manager.enqueue(
+                            chat_request.model, request_id, tenant.priority
+                        )
+                        QUEUE_DEPTH.labels(model=chat_request.model).inc()
+                    except QueueFullError:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Queue full",
+                            headers={"Retry-After": "5"},
+                        )
+                    try:
+                        queue_wait_ms = await queue_manager.wait_for_slot(request_id)
+                        QUEUE_DEPTH.labels(model=chat_request.model).dec()
+                        request.state.queue_wait_ms = queue_wait_ms
+                    except QueueTimeoutError:
+                        await queue_manager.remove_from_queue(
+                            chat_request.model, request_id
+                        )
+                        QUEUE_DEPTH.labels(model=chat_request.model).dec()
+                        raise HTTPException(
+                            status_code=504, detail="Queue timeout"
+                        )
+                    # Re-check circuit breaker and re-route after dequeue
+                    exclude = cb_registry.get_open_backends()
+                    backend = registry.find_backend_for_model(
+                        chat_request.model, routing_key=routing_key, exclude=exclude
+                    )
+                    if backend is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="All backends unavailable after dequeue",
+                        )
+                    request.state.backend_name = backend.name
+                    await queue_manager.acquire_slot(
+                        backend.name, backend.max_concurrent
+                    )
+                slot_backend = backend.name
+                ACTIVE_REQUESTS.labels(backend=slot_backend).inc()
+            # Record queue wait time if applicable
+            queue_wait_ms = getattr(request.state, "queue_wait_ms", None)
+            if queue_wait_ms is not None:
+                queue_span.set_attribute("queue.wait_ms", queue_wait_ms)
 
         translator = TRANSLATORS.get(backend.provider)
         if translator is None:
@@ -933,13 +965,19 @@ async def chat_completions(
         )
 
         try:
-            start = time.perf_counter()
-            result = await translator(
-                client=request.app.state.http_client,
-                backend=backend,
-                request=chat_request,
-            )
-            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            with tracer.start_as_current_span("gateway.translator.request") as trans_span:
+                trans_span.set_attribute("tenant.id", tenant.id)
+                trans_span.set_attribute("translator.model", chat_request.model)
+                trans_span.set_attribute("translator.backend", backend.name)
+                trans_span.set_attribute("translator.provider", backend.provider)
+                trans_span.set_attribute("translator.streaming", False)
+                start = time.perf_counter()
+                result = await translator(
+                    client=request.app.state.http_client,
+                    backend=backend,
+                    request=chat_request,
+                )
+                duration_ms = round((time.perf_counter() - start) * 1000, 2)
 
             # Record latency for routing strategies
             latency_tracker = getattr(request.app.state, "latency_tracker", None)
