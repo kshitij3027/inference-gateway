@@ -3200,3 +3200,148 @@ The `--gateway` / `-g` option (default `http://localhost:8080`, overridable via 
 
 **Q: "What would you change to turn this into a real billing system?"**
 **A:** Three major additions. First, replace the static price table with a pricing service that tracks provider rate changes and per-customer discounts — costs would be calculated at billing time, not request time, using the price that was effective when the request was made. Second, replace Redis daily counters with a durable transaction log (PostgreSQL or a dedicated billing database) that records every request with its cost, tokens, model, and timestamp — this enables detailed invoicing, dispute resolution, and audit trails. Third, add a reconciliation pipeline that compares estimated costs against actual provider invoices and flags discrepancies. The current Redis-based estimation would remain as a real-time cost dashboard, with the billing database as the source of truth for actual charges.
+
+
+## Retries, Coalescing & Function Calling
+
+### Why this exists
+
+The gateway's original retry loop did immediate failover to a different backend on 5xx errors — no delay, no jitter, no handling of 429 rate limits. Under load, all clients retrying simultaneously creates a thundering herd that overwhelms the recovering backend. Request coalescing addresses a different waste: when multiple clients send identical prompts within milliseconds (common in batch processing and UI double-clicks), each triggers a separate backend call. Function calling (tool use) is now standard across LLM providers — OpenAI, Anthropic, and Google all support it — but each uses a different wire format. Without translation, clients must know which provider their request will route to, breaking the gateway's provider-agnostic promise.
+
+### How it works
+
+**Jittered Backoff Retries:**
+
+1. Client sends a chat completion request.
+2. Backend returns an error (429, 500, 502, 503) or connection fails.
+3. The retry loop increments `retry_count` and classifies the error:
+   - **429 (rate limited)**: Do NOT record circuit breaker failure. Do NOT exclude the backend. The backend is healthy but temporarily overloaded. Retry the same backend after backoff.
+   - **5xx (server error)**: Record circuit breaker failure. Exclude the backend. Failover to a different backend after backoff.
+   - **ConnectError**: Record circuit breaker failure. Exclude. Failover after backoff.
+4. Jittered exponential backoff delay: `delay = 0.5 * (2 ^ attempt) * (0.5 + random())`. This yields:
+   - Retry 1: 0.25s to 1.0s (average 0.5s)
+   - Retry 2: 0.5s to 2.0s (average 1.0s)
+5. Maximum 2 retries (3 total attempts). No sleep after the last attempt.
+6. On success after retries: `X-Retry-Count` response header reports the retry count.
+7. `gateway_retry_total` Prometheus counter increments per retry with `[backend, status_code]` labels.
+
+**Request Coalescing:**
+
+1. Non-streaming request arrives. The handler hashes the serialized request body (SHA-256).
+2. `RequestCoalescer.check(hash)` looks up the in-flight dict. If a matching hash exists within the 100ms window and its Future is not yet resolved, the request becomes a **waiter** — it awaits the existing Future.
+3. If no match (or window expired), the request becomes the **leader** — it registers a new Future and proceeds to the backend.
+4. When the leader completes: `resolve(hash, result)` delivers the result to all waiting Futures.
+5. If the leader fails: `reject(hash, error)` propagates the error. Waiters fall through to make their own request.
+6. Coalesced responses get `X-Coalesced: true` header and increment `gateway_coalesced_total` counter.
+7. Only applies to non-streaming requests. Streaming generators cannot be meaningfully shared.
+
+**Function Calling Passthrough:**
+
+1. Client sends a request with `tools` and/or `tool_choice` fields (OpenAI format).
+2. The gateway routes to a backend based on the model.
+3. Translation depends on the provider:
+   - **OpenAI**: `tools` and `tool_choice` pass through directly (ChatCompletionRequest has `extra="allow"`). Response parsing extracts `tool_calls` from the message.
+   - **Anthropic**: Request translation converts OpenAI tools (`[{type: "function", function: {name, description, parameters}}]`) to Anthropic format (`[{name, description, input_schema}]`). `tool_choice` is mapped: string → `{type: string}`, function-specific → `{type: "tool", name: "..."}`. Response translation converts `tool_use` content blocks to OpenAI `tool_calls` format. Multi-turn tool conversations translate `role: "tool"` messages to Anthropic `tool_result` content blocks.
+   - **Ollama**: Returns 400 "Function calling (tools) is not supported for Ollama backends" before any backend call.
+4. Response includes `tool_calls` in `ChatMessageResponse` (list of dicts with `{id, type, function: {name, arguments}}`). `finish_reason` is "tool_calls" when tool use is requested.
+
+### Implementation
+
+**`gateway/routes/chat.py`** — The retry loop (line ~815) now classifies errors into 429 (same-backend retry) vs 5xx (failover retry). Both paths apply jittered sleep via `asyncio.sleep(0.5 * 2^attempt * (0.5 + random()))`. `retry_count` is tracked and set on `request.state` for the middleware to add the header. Coalescing wraps the entire non-streaming path: hash → check → leader/waiter → resolve/reject.
+
+**`gateway/coalescing.py`** — `RequestCoalescer` class. In-memory dict of `{hash: (asyncio.Future, timestamp)}`. `check()` returns the Future if within window, `register()` creates a new one, `resolve()`/`reject()` complete it. No background cleanup — entries are cleaned lazily on access.
+
+**`gateway/models.py`** — `ChatMessage` now accepts `role: "tool"` with `tool_call_id`, optional `content` (None for assistant messages with tool_calls), and `tool_calls: list[dict]` for assistant messages. `ChatMessageResponse` gains `tool_calls: list[dict] | None`. `AnthropicContentBlock` gains `id`, `name`, `input` fields for tool_use blocks. `OllamaMessage.content` is now optional.
+
+**`gateway/backends/openai.py`** — `translate_response` extracts `tool_calls` from the response message and passes them to `ChatMessageResponse`.
+
+**`gateway/backends/anthropic.py`** — `translate_request` converts OpenAI tools to Anthropic format, translates `tool_choice`, handles `role: "tool"` messages (→ `tool_result` content blocks) and assistant messages with `tool_calls` (→ `tool_use` content blocks). `translate_response` extracts `tool_use` content blocks and maps them to OpenAI `tool_calls` format with JSON-serialized arguments.
+
+**`gateway/backends/ollama.py`** — Both `chat_completion` and `stream_chat_completion` check `request.model_extra` for `tools` at the start and raise `HTTPException(400)` if present.
+
+**Null-safety fixes** — `ChatMessage.content` becoming optional required guards in `_wrap_stream_with_journal` (chat.py), `_extract_user_text`/`_extract_system_hash` (semantic_cache.py), and `compute_prompt_hash` (journal.py) — all use `m.content or ""` pattern.
+
+### Key design decisions
+
+**429 retries the same backend, 5xx fails over.** A 429 response means the backend is rate-limiting the gateway — it's healthy but temporarily at capacity. Excluding it from routing and failing over to another backend wastes the retry: the other backend may be equally loaded. Backing off and retrying the same backend respects the rate limit signal. A 5xx response means the backend is unhealthy — continuing to send requests increases the probability of cascading failure. Excluding it and failing over is the correct response.
+
+**Jitter prevents thundering herd.** Without jitter, all clients whose requests fail at the same time would retry at the same time (e.g., all at exactly 500ms), creating a synchronized burst. The multiplicative jitter `(0.5 + random())` spreads retries across a 2x range, smoothing the retry load on the backend. This is more effective than additive jitter because it scales with the backoff interval.
+
+**Coalescing uses in-process Futures, not Redis pub/sub.** Each gateway instance coalesces independently. Cross-instance coalescing would require Redis pub/sub, adding latency (Redis round-trip) and complexity (subscription management, serialization). Since nginx round-robins to 3 instances, identical requests from the same client typically hit the same instance (TCP connection reuse), making per-instance coalescing effective. The 100ms window limits memory growth — entries expire quickly.
+
+**tool_calls as `list[dict]` instead of typed Pydantic models.** The OpenAI tool call format is complex and varies across model versions (function calling, parallel tool use, required/auto/none choices). Using `list[dict]` provides maximum passthrough compatibility — the gateway doesn't validate tool call structure, it just shuttles it between client and backend. This matches the `extra="allow"` pattern used for the request body. Typed models would require constant updates as providers evolve their tool APIs.
+
+**Coalescing only for non-streaming.** Streaming responses are async generators that yield chunks incrementally. Sharing a generator across multiple waiters would require either buffering (memory overhead, latency for late joiners) or multicast (complex backpressure management). Since streaming is typically used for interactive UI (where deduplication is less useful), restricting coalescing to non-streaming is a pragmatic simplification.
+
+### Alternatives considered
+
+**Tenacity library vs manual retry loop.** The project includes `tenacity>=9.0.0` in requirements but uses a manual retry loop. Tenacity provides decorators for retry with backoff, but the gateway's retry logic is tightly coupled to circuit breaker state, backend selection, concurrency slot management, and multiple error classification paths. Wrapping this in a tenacity decorator would require extracting the "attempt one backend call" logic into a separate function and managing shared state (exclude set, retry_count) via closures or mutable containers. The manual loop is more readable for this level of complexity.
+
+**Redis pub/sub for cross-instance coalescing.** Redis pub/sub would enable all 3 gateway instances to share a single backend call for identical requests. The implementation: leader publishes the result to a Redis channel, waiters subscribe. The added complexity (subscription lifecycle, serialization overhead, failure modes when Redis is down) outweighs the benefit for a 3-instance deployment where each instance sees roughly 1/3 of traffic. Per-instance coalescing catches the common case (client retries, batch duplicates) without the distributed coordination overhead.
+
+**Typed tool models (ToolCall, ToolFunction Pydantic classes) vs dict passthrough.** Typed models provide validation and IDE autocompletion but require updating whenever providers change their tool format. OpenAI has already iterated on tool calling (from `function_call` to `tool_calls` with parallel support), and Anthropic's format differs significantly. Using `list[dict]` with passthrough means the gateway works with any tool format without code changes. The translation layer in the Anthropic backend handles the structural differences without needing shared typed models.
+
+### Failure modes and edge cases
+
+**Retry storm on 429.** If a backend is rate-limiting all requests, retries with backoff still add load. Mitigation: maximum 2 retries caps the amplification at 3x. The jitter spreads retry timing. A production system would add a retry budget (e.g., max 10% of requests can be retries) to bound the amplification globally.
+
+**Coalescing future leak.** If the leader request is cancelled (e.g., client disconnects during processing) before resolving/rejecting the future, waiters hang indefinitely. Mitigation: the reject call is in the error handling path of the retry loop. If the entire handler crashes (framework-level error), the Future is garbage-collected and waiters get `InvalidStateError`. A production system would add a timeout to waiter Futures.
+
+**Anthropic tool format evolution.** The Anthropic Messages API's tool format has evolved (e.g., adding `cache_control` fields). The translation layer maps the core fields (`name`, `description`, `input_schema`) and ignores extras via `ConfigDict(extra="allow")` on models. New fields that don't map to OpenAI format are silently dropped. This is acceptable for passthrough but means some provider-specific features are inaccessible.
+
+**Null content in existing tests.** Making `ChatMessage.content` optional could break tests that create messages without explicit content. The Pydantic default is `None`, so `ChatMessage(role="user")` now succeeds where it previously required `content`. All existing tests were audited and the `or ""` guards prevent runtime errors.
+
+**Coalescing hash collision.** SHA-256 collision probability is negligible (~1 in 2^128 for random inputs). However, requests that are semantically different but serialize identically (e.g., same model, same messages, different system prompts that are stripped during serialization) would be incorrectly coalesced. The hash covers the full `model_dump_json()` output, which includes all fields, so this is only a concern for truly identical payloads — which is the desired behavior.
+
+### Observability
+
+**Prometheus metrics:**
+- `gateway_retry_total` Counter `[backend, status_code]` — tracks retry volume. High retry rates indicate backend instability (5xx) or rate limiting (429). A Grafana panel showing `rate(gateway_retry_total[5m])` by status_code reveals whether retries are health-related or rate-related.
+- `gateway_coalesced_total` Counter — tracks deduplication savings. The ratio `coalesced / (coalesced + total_requests)` shows what fraction of backend calls are saved.
+
+**Response headers:**
+- `X-Retry-Count: N` — present when N > 0. Clients can log this to understand retry amplification.
+- `X-Coalesced: true` — present on coalesced responses. Clients can detect shared responses.
+
+**Structured logs:**
+- `backend_failed_retrying` with `status_code`, `attempt`, `retryable=True` — logged on each retry.
+- `request_coalesced` with `model`, `tenant_id` — logged when a request is coalesced.
+
+### Testing
+
+**Unit tests** (`tests/unit/test_retries.py`, 9 tests): Status code classification (429 retryable, 400 not), jitter range validation (attempt 0: 0.25-1.0s, attempt 1: 0.5-2.0s), jitter randomness, retry count tracking, circuit breaker interaction.
+
+**Unit tests** (`tests/unit/test_coalescing.py`, 11 tests): Hash determinism, duplicate detection, Future resolution/rejection, window expiry, cleanup after resolve, idempotent resolve/reject.
+
+**Unit tests** (`tests/unit/test_function_calling.py`, 11 tests): ChatMessage tool role, optional content, OpenAI tool_calls extraction, Anthropic bidirectional tools translation (request + response), Ollama rejection (streaming + non-streaming).
+
+### Production gaps
+
+**No retry budget.** There is no global limit on retry volume. Under sustained 5xx errors, retry amplification is 3x (3 attempts per request). A production system would add a circuit-breaker-like mechanism for retries: if more than N% of requests are retrying, stop retrying and fail fast.
+
+**No per-tenant retry configuration.** All tenants share the same retry behavior (500ms base, 2x multiplier, max 2). High-priority tenants might warrant more retries; low-priority tenants might warrant fewer. The current implementation is a reasonable default.
+
+**No streaming coalescing.** Streaming requests cannot be coalesced. For batch workloads that use streaming, this means duplicate suppression doesn't apply. A production system could buffer and multicast stream chunks, but the complexity is high for marginal benefit.
+
+**No tool call validation.** The gateway passes tool calls through without validating their structure. A malformed tool call from the backend (e.g., invalid JSON in `arguments`) is passed to the client as-is. The gateway trusts the backend to produce valid tool calls.
+
+**No cross-instance coalescing.** Each gateway instance coalesces independently. Requests load-balanced to different instances are not coalesced. Per-instance coalescing catches the common case but not all duplicates.
+
+### Interview talking points
+
+- **The 429 vs 5xx retry distinction demonstrates understanding of error classification.** Not all errors are equal — 429 means "slow down" (the backend is healthy but busy), while 5xx means "something is broken." The retry strategy adapts: 429 backs off and retries the same backend (respecting the rate limit), while 5xx fails over to a different backend (avoiding the broken one). This distinction is critical in distributed systems where treating all errors identically leads to either under-retrying (missing transient failures) or over-retrying (hammering broken backends).
+
+- **The coalescing pattern shows how to eliminate redundant work without distributed coordination.** Using `asyncio.Future` for in-process deduplication is simpler and faster than Redis pub/sub. The 100ms window is a deliberate trade-off: long enough to catch concurrent duplicates (batch jobs, UI double-clicks), short enough to not add perceived latency. The leader-waiter pattern ensures exactly one backend call per unique request, and the Future abstraction cleanly handles both success and failure propagation.
+
+- **The function calling translation layer demonstrates the value of a protocol-agnostic gateway.** Clients send OpenAI-format tool definitions. The gateway translates to Anthropic format when routing to Claude, passes through to OpenAI, and rejects for Ollama. The client doesn't need to know which provider handles the request. Using `list[dict]` instead of typed models for tool_calls is a deliberate choice for forward compatibility — as providers evolve their tool APIs, the gateway adapts without code changes for the passthrough case.
+
+### Likely interview questions
+
+**Q: "Why not use the tenacity library for retries since it's already in your dependencies?"**
+**A:** Tenacity excels at wrapping a single function with retry logic — you decorate a function and tenacity handles backoff and retry conditions. The gateway's retry loop is more complex: each attempt involves selecting a backend (from a shrinking pool of non-excluded backends), acquiring a concurrency slot, recording circuit breaker outcomes, and classifying errors differently (429 vs 5xx vs ConnectError). The shared mutable state (exclude set, retry count, slot management) doesn't map cleanly to tenacity's decorator pattern. The manual loop keeps all this logic visible in one place, making it easier to reason about the retry semantics. If the retry logic were simpler (retry a single HTTP call with backoff), tenacity would be the right choice.
+
+**Q: "How would you prevent request coalescing from causing a single slow request to block multiple clients?"**
+**A:** The 100ms window naturally limits exposure — requests that arrive more than 100ms after the leader are not coalesced, so they proceed independently. For the coalesced waiters, they're waiting for a response that would have taken the same time if they'd made their own backend call. The risk is if the leader's request is slow (e.g., 10 seconds for a complex prompt) — but those 10 seconds would have been spent per-waiter anyway. The actual risk is leader failure: if the leader crashes, waiters need to fall through and retry. The implementation handles this via the `reject()` path — on any error, the future is rejected and waiters fall through to make their own request. A production enhancement would add a timeout to the waiter's `await` so it doesn't wait indefinitely.
+
+**Q: "How would you extend function calling to support streaming tool calls?"**
+**A:** Streaming tool calls require incremental assembly of the tool call structure across multiple chunks. OpenAI's streaming format sends tool call deltas: `{delta: {tool_calls: [{index: 0, function: {arguments: "chunk"}}]}}`. The gateway would need to: (1) extend `ChunkDelta` to include `tool_calls` deltas, (2) update the OpenAI streaming translator to pass through tool call chunks, (3) update the Anthropic streaming translator to convert `content_block_start`/`content_block_delta` events for `tool_use` blocks into OpenAI-format tool call deltas, and (4) buffer tool call arguments across chunks for the Anthropic translator (since Anthropic sends the input as a sequence of JSON string fragments). The OpenAI case is straightforward passthrough; the Anthropic case requires stateful streaming translation. This is a natural next step but was scoped out of this phase to keep the implementation focused.
