@@ -67,6 +67,12 @@ ESTIMATED_COST = Counter(
     ["tenant", "model"],
 )
 
+RETRY_TOTAL = Counter(
+    "gateway_retry_total",
+    "Total retry attempts",
+    ["backend", "status_code"],
+)
+
 # --- Concurrency metrics ---
 
 ACTIVE_REQUESTS = Gauge(

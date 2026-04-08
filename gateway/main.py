@@ -298,6 +298,10 @@ async def request_id_middleware(request: Request, call_next):
         if hedge_loser:
             response.headers["X-Hedge-Loser"] = hedge_loser
 
+        retry_count = getattr(request.state, "retry_count", None)
+        if retry_count and retry_count > 0:
+            response.headers["X-Retry-Count"] = str(retry_count)
+
         estimated_cost = getattr(request.state, "estimated_cost", None)
         if estimated_cost is not None:
             response.headers["X-Estimated-Cost"] = f"{estimated_cost:.6f}"

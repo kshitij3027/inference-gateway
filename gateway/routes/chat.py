@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 import uuid
 
@@ -30,6 +31,7 @@ from gateway.observability.metrics import (
     ITL,
     QUEUE_DEPTH,
     RATE_LIMIT_REJECTIONS,
+    RETRY_TOTAL,
     TOKENS_CONSUMED,
     TTFT,
 )
@@ -811,6 +813,7 @@ async def chat_completions(
 
     last_error: HTTPException | None = None
     queue_manager = getattr(request.app.state, "queue_manager", None)
+    retry_count = 0
 
     for attempt in range(3):
         backend = registry.find_backend_for_model(
@@ -984,25 +987,39 @@ async def chat_completions(
                     "status": 200,
                 })
 
+            request.state.retry_count = retry_count
             return result
 
         except HTTPException as e:
-            if e.status_code >= 500:
-                cb = cb_registry.get(backend.name)
-                if cb:
-                    cb.record_failure()
-                exclude = exclude | {backend.name}
+            if e.status_code == 429 or e.status_code >= 500:
+                retry_count += 1
+                RETRY_TOTAL.labels(
+                    backend=backend.name, status_code=str(e.status_code)
+                ).inc()
+                if e.status_code >= 500:
+                    # 5xx: backend is unhealthy — record failure, exclude
+                    cb = cb_registry.get(backend.name)
+                    if cb:
+                        cb.record_failure()
+                    exclude = exclude | {backend.name}
+                # 429: rate limited — don't record CB failure, don't exclude
                 last_error = e
                 logger.warning(
-                    "backend_failed_trying_next",
+                    "backend_failed_retrying",
                     backend=backend.name,
                     status_code=e.status_code,
                     attempt=attempt + 1,
+                    retryable=True,
                 )
+                # Jittered exponential backoff before retry
+                if attempt < 2:  # Don't sleep after last attempt
+                    delay = 0.5 * (2 ** attempt) * (0.5 + random.random())
+                    await asyncio.sleep(delay)
                 continue
-            raise  # 4xx errors are not backend failures
+            raise  # 4xx errors (except 429) are not retryable
 
         except httpx.ConnectError:
+            retry_count += 1
             cb = cb_registry.get(backend.name)
             if cb:
                 cb.record_failure()
@@ -1011,11 +1028,17 @@ async def chat_completions(
                 status_code=502,
                 detail=f"Backend {backend.name} connection refused",
             )
+            RETRY_TOTAL.labels(
+                backend=backend.name, status_code="502"
+            ).inc()
             logger.warning(
                 "backend_connect_failed",
                 backend=backend.name,
                 attempt=attempt + 1,
             )
+            if attempt < 2:
+                delay = 0.5 * (2 ** attempt) * (0.5 + random.random())
+                await asyncio.sleep(delay)
             continue
 
         finally:
