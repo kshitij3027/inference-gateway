@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -9,6 +11,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from gateway import auth as _auth_module
 from gateway.auth import get_current_tenant
 from gateway.config import GatewayConfig, Registry, TenantConfig
+from gateway.models import ChatCompletionResponse, ChatMessageResponse, Choice, Usage
 from gateway.observability.tracing import get_tracer, init_tracing, shutdown_tracing
 
 
@@ -133,3 +136,96 @@ class TestAuthSpan:
         spans = self.exporter.get_finished_spans()
         auth_spans = [s for s in spans if s.name == "gateway.auth"]
         assert len(auth_spans) == 1
+
+
+# ── pre-routing span tests ────────────────────────────────────────────
+
+
+def _mock_response():
+    return ChatCompletionResponse(
+        model="tinyllama",
+        choices=[Choice(message=ChatMessageResponse(content="Hello!"))],
+        usage=Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+    )
+
+
+class TestPreRoutingSpans:
+    @pytest.fixture(autouse=True)
+    def _setup_tracing(self):
+        """Set up an in-memory TracerProvider for span capture."""
+        self.exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+        _reset_tracer_provider()
+        trace.set_tracer_provider(provider)
+        yield
+        provider.shutdown()
+        _reset_tracer_provider()
+
+    async def test_rate_limit_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        rate_limit_spans = [s for s in spans if s.name == "gateway.rate_limit"]
+        assert len(rate_limit_spans) == 1
+        assert rate_limit_spans[0].attributes.get("tenant.id") == "tenant-alpha"
+        assert rate_limit_spans[0].attributes.get("rate_limit.allowed") is True
+
+    async def test_cache_lookup_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        cache_spans = [s for s in spans if s.name == "gateway.cache.lookup"]
+        assert len(cache_spans) == 1
+        assert cache_spans[0].attributes.get("cache.hit") is False
+
+    async def test_journal_write_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        journal_spans = [s for s in spans if s.name == "gateway.journal.write"]
+        assert len(journal_spans) >= 1
+        request_spans = [s for s in journal_spans if s.attributes.get("journal.phase") == "request"]
+        assert len(request_spans) >= 1
