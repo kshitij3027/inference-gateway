@@ -984,9 +984,12 @@ async def chat_completions(
             if latency_tracker:
                 latency_tracker.record(backend.name, chat_request.model, duration_ms)
 
-            cb = cb_registry.get(backend.name)
-            if cb:
-                cb.record_success()
+            with tracer.start_as_current_span("gateway.circuit_breaker") as cb_span:
+                cb_span.set_attribute("cb.backend", backend.name)
+                cb = cb_registry.get(backend.name)
+                if cb:
+                    cb.record_success()
+                cb_span.set_attribute("cb.outcome", "success")
 
             logger.info(
                 "chat_request_completed",
@@ -1026,17 +1029,20 @@ async def chat_completions(
                     logger.warning("cost_recording_failed", error=str(e))
 
             # Store in cache on miss
-            if semantic_cache is not None:
-                try:
-                    await semantic_cache.store(
-                        model=chat_request.model,
-                        messages=chat_request.messages,
-                        response=result,
-                        tenant_id=tenant.id,
-                        cache_isolation=cache_isolation,
-                    )
-                except Exception as e:
-                    logger.warning("cache_store_failed", error=str(e))
+            with tracer.start_as_current_span("gateway.cache.store") as store_span:
+                store_span.set_attribute("tenant.id", tenant.id)
+                store_span.set_attribute("cache.model", chat_request.model)
+                if semantic_cache is not None:
+                    try:
+                        await semantic_cache.store(
+                            model=chat_request.model,
+                            messages=chat_request.messages,
+                            response=result,
+                            tenant_id=tenant.id,
+                            cache_isolation=cache_isolation,
+                        )
+                    except Exception as e:
+                        logger.warning("cache_store_failed", error=str(e))
 
             # Release stampede lock after cache store
             if lock_acquired and lock_key:
@@ -1045,16 +1051,22 @@ async def chat_completions(
                 except Exception:
                     pass
 
-            if journal is not None:
-                await journal.record_completion(
-                    request_id=request_id,
-                    status=200,
-                    latency_ms=duration_ms,
-                    backend=backend.name,
-                    cache_hit=False,
-                    tokens_prompt=result.usage.prompt_tokens,
-                    tokens_completion=result.usage.completion_tokens,
-                )
+            with tracer.start_as_current_span("gateway.journal.write") as j_span:
+                j_span.set_attribute("request.id", request_id)
+                j_span.set_attribute("tenant.id", tenant.id)
+                j_span.set_attribute("journal.phase", "completion")
+                j_span.set_attribute("journal.status", 200)
+                j_span.set_attribute("journal.latency_ms", duration_ms)
+                if journal is not None:
+                    await journal.record_completion(
+                        request_id=request_id,
+                        status=200,
+                        latency_ms=duration_ms,
+                        backend=backend.name,
+                        cache_hit=False,
+                        tokens_prompt=result.usage.prompt_tokens,
+                        tokens_completion=result.usage.completion_tokens,
+                    )
 
             if broadcaster:
                 broadcaster.emit("request_complete", {
@@ -1080,9 +1092,12 @@ async def chat_completions(
                 ).inc()
                 if e.status_code >= 500:
                     # 5xx: backend is unhealthy — record failure, exclude
-                    cb = cb_registry.get(backend.name)
-                    if cb:
-                        cb.record_failure()
+                    with tracer.start_as_current_span("gateway.circuit_breaker") as cb_span:
+                        cb_span.set_attribute("cb.backend", backend.name)
+                        cb = cb_registry.get(backend.name)
+                        if cb:
+                            cb.record_failure()
+                        cb_span.set_attribute("cb.outcome", "failure")
                     exclude = exclude | {backend.name}
                 # 429: rate limited — don't record CB failure, don't exclude
                 last_error = e
@@ -1102,9 +1117,12 @@ async def chat_completions(
 
         except httpx.ConnectError:
             retry_count += 1
-            cb = cb_registry.get(backend.name)
-            if cb:
-                cb.record_failure()
+            with tracer.start_as_current_span("gateway.circuit_breaker") as cb_span:
+                cb_span.set_attribute("cb.backend", backend.name)
+                cb = cb_registry.get(backend.name)
+                if cb:
+                    cb.record_failure()
+                cb_span.set_attribute("cb.outcome", "failure")
             exclude = exclude | {backend.name}
             last_error = HTTPException(
                 status_code=502,

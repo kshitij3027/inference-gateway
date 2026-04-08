@@ -273,3 +273,69 @@ class TestPreRoutingSpans:
         translator_spans = [s for s in spans if s.name == "gateway.translator.request"]
         assert len(translator_spans) >= 1
         assert translator_spans[0].attributes.get("translator.streaming") is False
+
+    async def test_circuit_breaker_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        cb_spans = [s for s in spans if s.name == "gateway.circuit_breaker"]
+        assert len(cb_spans) >= 1
+        assert cb_spans[0].attributes.get("cb.outcome") == "success"
+
+    async def test_cache_store_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        store_spans = [s for s in spans if s.name == "gateway.cache.store"]
+        assert len(store_spans) >= 1
+
+    async def test_journal_completion_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        journal_spans = [s for s in spans if s.name == "gateway.journal.write"]
+        completion_spans = [s for s in journal_spans if s.attributes.get("journal.phase") == "completion"]
+        assert len(completion_spans) >= 1
+        assert completion_spans[0].attributes.get("journal.status") == 200
