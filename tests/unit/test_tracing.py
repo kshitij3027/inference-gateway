@@ -229,3 +229,47 @@ class TestPreRoutingSpans:
         assert len(journal_spans) >= 1
         request_spans = [s for s in journal_spans if s.attributes.get("journal.phase") == "request"]
         assert len(request_spans) >= 1
+
+    async def test_router_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        router_spans = [s for s in spans if s.name == "gateway.router"]
+        assert len(router_spans) >= 1
+        assert router_spans[0].attributes.get("route.backend") is not None
+
+    async def test_translator_span_created(self, monkeypatch, test_env):
+        from gateway.main import app
+
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                with patch.dict(
+                    "gateway.routes.chat.TRANSLATORS",
+                    {"ollama": AsyncMock(return_value=_mock_response())},
+                ):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"model": "tinyllama", "messages": [{"role": "user", "content": "Hi"}]},
+                        headers={"Authorization": "Bearer test-alpha-key"},
+                    )
+        assert resp.status_code == 200
+        spans = self.exporter.get_finished_spans()
+        translator_spans = [s for s in spans if s.name == "gateway.translator.request"]
+        assert len(translator_spans) >= 1
+        assert translator_spans[0].attributes.get("translator.streaming") is False
