@@ -166,6 +166,10 @@ async def lifespan(app: FastAPI):
     # Event broadcaster for live dashboard
     app.state.event_broadcaster = EventBroadcaster()
 
+    # Request coalescer for deduplicating identical in-flight requests
+    from gateway.coalescing import RequestCoalescer
+    app.state.coalescer = RequestCoalescer()
+
     # Wire circuit breaker state changes to dashboard events
     def _on_cb_state_change(backend: str, old_state: str, new_state: str):
         app.state.event_broadcaster.emit("circuit_state_change", {
@@ -301,6 +305,9 @@ async def request_id_middleware(request: Request, call_next):
         retry_count = getattr(request.state, "retry_count", None)
         if retry_count and retry_count > 0:
             response.headers["X-Retry-Count"] = str(retry_count)
+
+        if getattr(request.state, "coalesced", False):
+            response.headers["X-Coalesced"] = "true"
 
         estimated_cost = getattr(request.state, "estimated_cost", None)
         if estimated_cost is not None:

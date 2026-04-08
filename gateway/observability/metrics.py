@@ -73,6 +73,11 @@ RETRY_TOTAL = Counter(
     ["backend", "status_code"],
 )
 
+COALESCED_TOTAL = Counter(
+    "gateway_coalesced_total",
+    "Total coalesced (deduplicated) requests",
+)
+
 # --- Concurrency metrics ---
 
 ACTIVE_REQUESTS = Gauge(

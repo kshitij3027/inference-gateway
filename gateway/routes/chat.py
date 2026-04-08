@@ -27,6 +27,7 @@ from gateway.models import (
 from gateway.observability.metrics import (
     ACTIVE_REQUESTS,
     CACHE_OPERATIONS,
+    COALESCED_TOTAL,
     GENERATION_DURATION,
     ITL,
     QUEUE_DEPTH,
@@ -665,6 +666,27 @@ async def chat_completions(
             )
         return StreamingResponse(wrapped_gen, media_type="text/event-stream")
 
+    # Request coalescing (non-streaming only)
+    coalescer = getattr(request.app.state, "coalescer", None)
+    request_hash = None
+    if coalescer is not None:
+        request_hash = coalescer.hash_request(chat_request.model_dump_json())
+        existing_future = coalescer.check(request_hash)
+        if existing_future is not None:
+            try:
+                result = await existing_future
+                request.state.coalesced = True
+                COALESCED_TOTAL.inc()
+                logger.info(
+                    "request_coalesced",
+                    model=chat_request.model,
+                    tenant_id=tenant.id,
+                )
+                return result
+            except Exception:
+                pass  # Leader failed — fall through to make our own request
+        coalescer.register(request_hash)
+
     # Non-streaming path with failover retry loop
     cb_registry = request.app.state.circuit_breakers
     exclude = cb_registry.get_open_backends()
@@ -988,6 +1010,8 @@ async def chat_completions(
                 })
 
             request.state.retry_count = retry_count
+            if coalescer is not None and request_hash is not None:
+                coalescer.resolve(request_hash, result)
             return result
 
         except HTTPException as e:
@@ -1057,6 +1081,11 @@ async def chat_completions(
             cache_hit=False,
             tokens_prompt=0,
             tokens_completion=0,
+        )
+    if coalescer is not None and request_hash is not None:
+        coalescer.reject(
+            request_hash,
+            last_error or HTTPException(status_code=503, detail="No backend available"),
         )
     if last_error:
         raise last_error
